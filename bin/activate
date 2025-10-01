@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+if [ -n "$BASH_VERSION" ]; then
+	paths=(
+		"/usr/local/bun-node-fallback-bin"
+		"$HOME/.cargo/bin"
+		"$HOME/bin"
+	)
+
+	for p in "${paths[@]}"; do
+		# affix colons on either side of $PATH to simplify matching
+		case ":${PATH}:" in
+		    *:"$p":*)
+			;;
+		    *)
+			# Prepend in path
+			export PATH="$p:$PATH"
+			;;
+		esac
+	done
+fi

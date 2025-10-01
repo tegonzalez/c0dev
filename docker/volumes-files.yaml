@@ -1,0 +1,7 @@
+x-volume-files: &files
+  volumes:
+    - ../.claude.json:/home/dev/.claude.json
+
+services:
+  c0-dev:
+    <<: *files

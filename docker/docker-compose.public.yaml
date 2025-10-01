@@ -1,0 +1,25 @@
+#version: "3.8"
+
+x-environment-base: &env-base
+  OLLAMA_HOST: http://host.docker.internal:11434
+  LLM_PROVIDER: ollama
+  OLLAMA_MODEL: gpt-oss:20b
+  CODEX_PORT: "1455"
+  TERM: ${TERM}
+
+services:
+  c0-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 127.0.0.1:1455:1455
+      - 3000:3000
+    working_dir: /home/dev
+    tty: true
+    environment:
+      <<: *env-base
+    entrypoint:
+      - /usr/local/bin/docker-entrypoint.sh
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

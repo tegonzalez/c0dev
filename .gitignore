@@ -1,0 +1,11 @@
+.claude
+*.bak
+.DS_Store
+projects
+rules
+.cargo
+.claude.json
+.config
+.local
+.rustup
+.terminfo

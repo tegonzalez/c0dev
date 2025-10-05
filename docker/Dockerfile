@@ -24,10 +24,13 @@ USER dev
 WORKDIR /home/dev
 
 # uv installs in ~/.local/
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 
 # cursor CLI installs in ~/.local/
-RUN curl https://cursor.com/install -fsS | bash
+RUN curl -fsSL https://cursor.com/install | bash
+
+# factory.ai droid installs in ~/.local/
+RUN curl -fsSL https://app.factory.ai/cli | sh
 
 # graph-code (code-graph-rag) installs in ~/.local/
 WORKDIR /home/dev/.local/shared/

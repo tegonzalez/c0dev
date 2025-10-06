@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Service management script for c0-dev environment
-# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cascade-stop|codex-auth|build [-f]]
+# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build [-f]]
 
 set -e
 
@@ -13,6 +13,8 @@ VOLUMES_FILES_FILE="$C0DEV_PATH/docker/volumes-files.yaml"
 COMPOSE_FILES="-f $VOLUMES_FOLDERS_FILE -f $VOLUMES_FILES_FILE -f $COMPOSE_PUBLIC_FILE"
 MAIN_SERVICE="c0-dev"
 CONTAINER_DEV_HOME="/home/dev"
+TSTAMP="$(date +%Y-%m-%d-%H%M%S)"
+#DEBUG="--progress plain"
 
 # Detect if running inside container
 # Check if we're in a Docker container by looking for .dockerenv or docker in cgroup
@@ -48,6 +50,20 @@ CYAN='\033[0;36m'
 WHITE='\033[0;37m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
+
+cp_tools() {
+    local src_folder="$1"
+    local dest_folder="$2"
+    local dot_folder="$3"
+
+    if [[ -d "$dest_folder/.$dot_folder" ]]; then
+        echo "🧹 Backup existing tool folder $dot_folder.bak.$TSTAMP ..."
+        mv "$dest_folder/.$dot_folder" "$dest_folder/$dot_folder.bak.$TSTAMP"
+    fi
+    echo "📦 Extracting $src_folder tools..."
+    mkdir -p "$dest_folder/.$dot_folder"
+    docker cp "$src_folder/.$dot_folder/." "$dest_folder/.$dot_folder/"
+}
 
 # Parse volumes-folders.yaml and volumes-files.yaml for volume mappings
 # Calls callback function for each volume mapping with: abs_host_path container_path is_file display_host_path exists
@@ -225,7 +241,7 @@ show_usage() {
         echo "Note: You are running inside the c0-dev container."
         echo "      Use 'exit' to return to host, then run 'c0 stop' to stop services."
     else
-        echo "Usage: $0 {start|stop|restart|logs|sh|root|status|codex-auth|build}"
+        echo "Usage: $0 {start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build}"
         echo ""
         echo "Commands:"
         echo "  start             - Start all services"
@@ -235,6 +251,7 @@ show_usage() {
         echo "  status            - Show service status"
         echo "  sh                - Connect as dev user (uid 1000) with proper shell init (-l)"
         echo "  root              - Connect as root (uid 0)"
+        echo "  cp-term           - Copy term info into container env"
         echo "  codex-auth        - Start Codex authentication proxy on port 1455"
         echo "  build [-f]        - Extract tools to host + build image (use -f to force rebuild)"
         echo ""
@@ -397,6 +414,17 @@ case "$1" in
         fi
         ;;
 
+    "cp-term")
+        if [[ "$IN_CONTAINER" == "true" ]]; then
+            echo "❌ Cannot copy terminfo from inside container"
+            echo "   Exit the container and run 'c0 cp-term' from the host"
+            exit 1
+        fi
+        for term in xterm-256color $TERM; do
+            infocmp -xa $term | docker exec -u 0 -i "docker-$MAIN_SERVICE" tic -x -o /usr/share/terminfo/ -
+            echo "✅ Term info $term copied to /usr/share/terminfo/"
+        done
+        ;;
 
     "codex-auth")
         echo "🔐 Starting Codex authentication proxy..."
@@ -432,7 +460,7 @@ case "$1" in
         echo "📦 Building and extracting tools..."
 
         # Ensure tool directories exist
-        mkdir -p "$C0DEV_PATH/.local" "$C0DEV_PATH/.cargo" "$C0DEV_PATH/.rustup" "$C0DEV_PATH/.terminfo"
+        mkdir -p "$C0DEV_PATH/.local" "$C0DEV_PATH/.cargo" "$C0DEV_PATH/.rustup"
 
         # Check if tools already exist (unless force rebuild)
         TOOLS_EXIST=true
@@ -458,17 +486,9 @@ case "$1" in
             # Set up cleanup trap in case of failure or interruption
             trap "docker rm -f $MAIN_SERVICE-tools-build 2>/dev/null || true" EXIT
 
-            # Extract uv tools
-            echo "📦 Extracting uv tools..."
-            docker cp $MAIN_SERVICE-tools-build:$CONTAINER_DEV_HOME/.local/. "$C0DEV_PATH/.local/"
-
-            # Extract cargo tools
-            echo "📦 Extracting cargo tools..."
-            docker cp $MAIN_SERVICE-tools-build:$CONTAINER_DEV_HOME/.cargo/. "$C0DEV_PATH/.cargo/"
-
-            # Extract rustup tools
-            echo "📦 Extracting rustup tools..."
-            docker cp $MAIN_SERVICE-tools-build:$CONTAINER_DEV_HOME/.rustup/. "$C0DEV_PATH/.rustup/"
+            for dot_folder in local cargo rustup; do
+                cp_tools "$MAIN_SERVICE-tools-build:$CONTAINER_DEV_HOME" "$C0DEV_PATH" $dot_folder
+            done
 
             # Clean up
             docker rm -f $MAIN_SERVICE-tools-build
@@ -481,18 +501,20 @@ case "$1" in
         fi
 
         # _proxy_build
-        echo "🏗️  Building final Docker image..."
-        docker-compose $COMPOSE_FILES build $NOCACHE "$MAIN_SERVICE"
 
-        # Install terminfo (like build.sh does)
-        echo "📄 Installing terminfo..."
-        #infocmp -a $TERM 2>/dev/null | docker-compose run --rm --no-deps -v "$C0DEV_PATH/.terminfo:$CONTAINER_DEV_HOME/.terminfo" -u 1000 -it "$MAIN_SERVICE" tic -x -o ~/.terminfo -
-        #infocmp -a $TERM 2>/dev/null | docker run --rm -v "$C0DEV_PATH/.terminfo:$CONTAINER_DEV_HOME/.terminfo" -u 1000 "docker-$MAIN_SERVICE" tic -x -o ~/.terminfo -
-        infocmp -a $TERM 2>/dev/null | tic -x -o "$C0DEV_PATH/.terminfo" -
+        # Prepare terminfo
+        echo "📄 Preparing terminfo..."
+        mkdir -p "$C0DEV_PATH/docker/.terminfo"
+        for term in xterm-256color $TERM; do
+            infocmp -xa $term > "$C0DEV_PATH/docker/.terminfo/$term"
+        done
+
+        echo "🏗️  Building final Docker image..."
+        docker-compose $COMPOSE_FILES build $NOCACHE $DEBUG "$MAIN_SERVICE"
 
         echo "✅ Build complete!"
         echo "🛠️ Builder tools deployed to host-shared folder: $C0DEV_PATH"
-        find . -type f -perm +111 -maxdepth 4 -not -path './.git/*' -not -path './bin/*' -mindepth 2 | while read t; do echo "   - $t"; done
+        find . -type f -perm +111 -maxdepth 4 -not -path './.git/*' -not -path './.claude/*' -not -path './bin/*' -not -path './projects/*' -mindepth 2 | while read t; do echo "   - $t"; done
         echo ""
         ;;
 

@@ -108,6 +108,10 @@ EXPOSE 1455
 # dev http
 EXPOSE 3000
 
+# Copy terminfo
+COPY .terminfo /tmp/.terminfo
+RUN for term in /tmp/.terminfo/*; do tic -x -o /usr/share/terminfo $term; done
+
 # Copy entrypoint script before switching user
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

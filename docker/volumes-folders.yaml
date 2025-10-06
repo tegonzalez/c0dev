@@ -5,7 +5,6 @@ x-volume-folders: &folders
     - ../.cargo:/home/dev/.cargo
     - ../.local:/home/dev/.local
     - ../.rustup:/home/dev/.rustup
-    - ../.terminfo:/home/dev/.terminfo
     - ../rules:/home/dev/rules
     - ../projects:/home/dev/projects
     - ../bin:/home/dev/bin

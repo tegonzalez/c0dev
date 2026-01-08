@@ -1,21 +1,28 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
-if [ -n "$BASH_VERSION" ]; then
-	paths=(
-		"/usr/local/bun-node-fallback-bin"
-		"$HOME/.cargo/bin"
-		"$HOME/bin"
-	)
+# Intended to be sourced (POSIX): `. ./activate`
+# Works in sh and bash; avoids bash arrays and `source`.
 
-	for p in "${paths[@]}"; do
-		# affix colons on either side of $PATH to simplify matching
-		case ":${PATH}:" in
-		    *:"$p":*)
-			;;
-		    *)
-			# Prepend in path
-			export PATH="$p:$PATH"
-			;;
-		esac
-	done
-fi
+prepend_path() {
+	p=$1
+	[ -n "$p" ] || return 0
+	[ -d "$p" ] || return 0
+	case ":${PATH}:" in
+	*:"$p":*)
+		;;
+	*)
+		if [ -n "${PATH}" ]; then
+			PATH="$p:$PATH"
+		else
+			PATH="$p"
+		fi
+		;;
+	esac
+}
+
+prepend_path "/usr/local/bun-node-fallback-bin"
+prepend_path "$HOME/.cargo/bin"
+prepend_path "$HOME/.local/bin"
+prepend_path "$HOME/bin"
+
+export PATH

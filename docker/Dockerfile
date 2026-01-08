@@ -49,8 +49,13 @@ LOCAL_MODEL_API_KEY=ollama
 EOF
 RUN make build-grammars
 RUN . ".venv/bin/activate" && python3 build_binary.py
+
 # graph-code-linux-arm64
 RUN cp dist/* ../../bin/graph-code
+
+# semgrep
+RUN ~/.local/bin/uv tool install semgrep
+
 WORKDIR /home/dev
 
 # Install rustup and cargo
@@ -60,9 +65,9 @@ RUN rustup target add wasm32-unknown-unknown
 
 # Install additional cargo tools
 RUN cargo install --git https://github.com/sharkdp/fd --rev v10.3.0
-# RUN cargo install --git https://github.com/BurntSushi/ripgrep --rev 14.1.1
+# RUN cargo install --git https://github.com/BurntSushi/ripgrep --rev 15.1.0
 RUN cargo install --locked ripgrep
-# RUN cargo install --git https://github.com/ast-grep/ast-grep.git --rev 0.39.4 ast-grep
+# RUN cargo install --git https://github.com/ast-grep/ast-grep.git --rev 0.40.0 ast-grep
 RUN cargo install --locked ast-grep
 #RUN cargo install --git https://github.com/zellij-org/zellij.git --rev v0.43.1
 RUN cargo install --locked zellij
@@ -76,8 +81,9 @@ RUN apt install -y \
     locales procps \
     bc fzf jq yq \
     iproute2 iputils-ping net-tools socat netcat-traditional \
-    tmux vim \
-    wget bat btop
+    tmux vim neovim \
+    wget bat btop tree \
+    pandoc
 
 # && rm -rf /var/lib/apt/lists/*
 

@@ -1,6 +1,7 @@
 x-volume-files: &files
   volumes:
     - ../.claude.json:/home/dev/.claude.json
+    - ~/.gitconfig:/home/dev/.gitconfig
 
 services:
   c0-dev:

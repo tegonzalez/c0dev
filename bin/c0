@@ -65,6 +65,27 @@ cp_tools() {
     docker cp "$src_folder/.$dot_folder/." "$dest_folder/.$dot_folder/"
 }
 
+# Resolve a host path from a docker volume mapping into an absolute path.
+# Handles project-relative paths (../, ./) and user-home shorthand (~).
+resolve_volume_host_path() {
+    local host_path="$1"
+    local abs_host_path="$host_path"
+
+    if [[ "$abs_host_path" == "~" ]]; then
+        abs_host_path="$HOME"
+    elif [[ "$abs_host_path" == "~/"* ]]; then
+        abs_host_path="$HOME/${abs_host_path:2}"
+    fi
+
+    if [[ "$abs_host_path" =~ ^\.\. ]]; then
+        abs_host_path="$C0DEV_PATH/${abs_host_path#../}"
+    elif [[ "$abs_host_path" =~ ^\. ]]; then
+        abs_host_path="$C0DEV_PATH/docker/${abs_host_path#./}"
+    fi
+
+    echo "$abs_host_path"
+}
+
 # Parse volumes-folders.yaml and volumes-files.yaml for volume mappings
 # Calls callback function for each volume mapping with: abs_host_path container_path is_file display_host_path exists
 # Callback signature: callback_func "$abs_host_path" "$container_path" "$is_file" "$display_host_path" "$exists"
@@ -103,12 +124,8 @@ parse_volume_mappings() {
         local host_path="${volume_line%:*}"
         local container_path="${volume_line#*:}"
 
-        local abs_host_path="$host_path"
-        if [[ "$host_path" =~ ^\.\. ]]; then
-            abs_host_path="$C0DEV_PATH/${host_path#../}"
-        elif [[ "$host_path" =~ ^\. ]]; then
-            abs_host_path="$C0DEV_PATH/docker/${host_path#./}"
-        fi
+        local abs_host_path
+        abs_host_path="$(resolve_volume_host_path "$host_path")"
 
         local projects_dir="$(dirname "$C0DEV_PATH")"
         local display_host_path
@@ -149,12 +166,8 @@ parse_volume_mappings() {
                 local host_path="${volume_line%:*}"
                 local container_path="${volume_line#*:}"
 
-                local abs_host_path="$host_path"
-                if [[ "$host_path" =~ ^\.\. ]]; then
-                    abs_host_path="$C0DEV_PATH/${host_path#../}"
-                elif [[ "$host_path" =~ ^\. ]]; then
-                    abs_host_path="$C0DEV_PATH/docker/${host_path#./}"
-                fi
+                local abs_host_path
+                abs_host_path="$(resolve_volume_host_path "$host_path")"
 
                 local projects_dir="$(dirname "$C0DEV_PATH")"
                 local display_host_path
@@ -421,13 +434,14 @@ case "$1" in
             exit 1
         fi
         for term in xterm-256color $TERM; do
-            infocmp -xa $term | docker exec -u 0 -i "docker-$MAIN_SERVICE" tic -x -o /usr/share/terminfo/ -
+            infocmp -xa $term | docker exec -u 0 -i "docker-$MAIN_SERVICE-1" tic -x -o /usr/share/terminfo/ -
             echo "✅ Term info $term copied to /usr/share/terminfo/"
         done
         ;;
 
     "codex-auth")
         echo "🔐 Starting Codex authentication proxy..."
+        echo "from host: open $(pbpaste | tr -d '\n')"
         echo "Command: socat TCP-LISTEN:1455,bind=\$(ip route get 1 | awk '{print \$7}' | xargs),fork TCP:127.0.0.1:1455"
         if [[ "$IN_CONTAINER" == "true" ]]; then
             socat TCP-LISTEN:1455,bind=$(ip route get 1 | awk '{print $7}' | xargs),fork TCP:127.0.0.1:1455

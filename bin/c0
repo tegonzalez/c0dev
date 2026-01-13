@@ -1,46 +1,14 @@
 #!/bin/bash
 
 # Service management script for c0-dev environment
-# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build [-f]]
+# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build [-f]|clean|help]
 
 set -e
 
-C0DEV_PATH="$(realpath $(dirname $0)/..)"
-COMPOSE_PROXY_FILE="$C0DEV_PATH/docker/docker-compose.proxy.yaml"
-COMPOSE_PUBLIC_FILE="$C0DEV_PATH/docker/docker-compose.public.yaml"
-VOLUMES_FOLDERS_FILE="$C0DEV_PATH/docker/volumes-folders.yaml"
-VOLUMES_FILES_FILE="$C0DEV_PATH/docker/volumes-files.yaml"
-COMPOSE_FILES="-f $VOLUMES_FOLDERS_FILE -f $VOLUMES_FILES_FILE -f $COMPOSE_PUBLIC_FILE"
-MAIN_SERVICE="c0-dev"
-CONTAINER_DEV_HOME="/home/dev"
-TSTAMP="$(date +%Y-%m-%d-%H%M%S)"
-#DEBUG="--progress plain"
-
-# Detect if running inside container
-# Check if we're in a Docker container by looking for .dockerenv or docker in cgroup
-if [[ -f /.dockerenv ]] || grep -q docker /proc/1/cgroup 2>/dev/null; then
-    IN_CONTAINER=true
-else
-    IN_CONTAINER=false
-fi
-
-# Get project relative path
-get_project_path() {
-    # Get current working directory relative to projects
-    local current_dir="$(realpath $(pwd))"
-    local projects_dir="$C0DEV_PATH/projects"
-
-    # Check if we're in a project subdirectory
-    if [[ "$current_dir" == "$projects_dir" ]]; then
-        echo "."
-    elif [[ "$current_dir" == "$projects_dir"* ]]; then
-        echo "${current_dir#$projects_dir/}"
-    else
-        echo ""
-    fi
-}
-
+# =============================================================================
 # Colors for output
+# =============================================================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -51,22 +19,94 @@ WHITE='\033[0;37m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-cp_tools() {
-    local src_folder="$1"
-    local dest_folder="$2"
-    local dot_folder="$3"
+# =============================================================================
+# Preconditions (fail-fast)
+# =============================================================================
 
-    if [[ -d "$dest_folder/.$dot_folder" ]]; then
-        echo "🧹 Backup existing tool folder $dot_folder.bak.$TSTAMP ..."
-        mv "$dest_folder/.$dot_folder" "$dest_folder/$dot_folder.bak.$TSTAMP"
+C0ROOT="$(realpath "$(dirname "$0")/..")"
+
+# Required files - exit non-zero if any are missing
+REQUIRED_FILES=(
+    "$C0ROOT/docker/docker-compose.public.yaml"
+    "$C0ROOT/docker/volumes-folders.yaml"
+    "$C0ROOT/docker/volumes-files.yaml"
+    "$C0ROOT/docker/Dockerfile"
+)
+
+for f in "${REQUIRED_FILES[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "error: required file missing: $f" >&2
+        exit 1
     fi
-    echo "📦 Extracting $src_folder tools..."
-    mkdir -p "$dest_folder/.$dot_folder"
-    docker cp "$src_folder/.$dot_folder/." "$dest_folder/.$dot_folder/"
+done
+
+# Detect if running inside container
+if [[ -f /.dockerenv ]] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+    IN_CONTAINER=true
+else
+    IN_CONTAINER=false
+fi
+
+# =============================================================================
+# Mode and project naming
+# =============================================================================
+
+# C0_MODE validation: only "" (prod) or "dev" allowed
+if [[ -n "$C0_MODE" && "$C0_MODE" != "dev" ]]; then
+    echo "error: C0_MODE must be empty (production) or 'dev', got: '$C0_MODE'" >&2
+    exit 1
+fi
+
+# Short hash function (first 8 chars of sha256)
+short_hash() {
+    echo -n "$1" | shasum -a 256 | cut -c1-8
 }
 
+# Project naming based on mode
+if [[ "$C0_MODE" == "dev" ]]; then
+    PROJECT_NAME="c0dev-dev-$(short_hash "${C0ROOT}:dev")"
+    SHARED_TOOLS_VOLUME="c0dev-tools-shared-dev"
+else
+    PROJECT_NAME="c0dev-$(short_hash "$C0ROOT")"
+    SHARED_TOOLS_VOLUME="c0dev-tools-shared"
+fi
+
+# Dockerfile hash for tools prefix
+DOCKERFILE_HASH="$(shasum -a 256 "$C0ROOT/docker/Dockerfile" | cut -c1-64)"
+TOOLS_PREFIX="/tools/opt/$DOCKERFILE_HASH"
+
+# =============================================================================
+# Compose file paths
+# =============================================================================
+
+COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
+VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
+VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
+MAIN_SERVICE="c0-dev"
+CONTAINER_DEV_HOME="/home/dev"
+
+# =============================================================================
+# Helper: docker-compose wrapper with project isolation
+# =============================================================================
+
+dc() {
+    export SHARED_TOOLS_VOLUME
+    export TOOLS_PREFIX
+    export DOCKERFILE_HASH
+    export C0DEV_HOSTNAME="$PROJECT_NAME"
+    docker compose \
+        -p "$PROJECT_NAME" \
+        -f "$VOLUMES_FOLDERS_FILE" \
+        -f "$VOLUMES_FILES_FILE" \
+        -f "$COMPOSE_PUBLIC_FILE" \
+        "$@"
+}
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
 # Resolve a host path from a docker volume mapping into an absolute path.
-# Handles project-relative paths (../, ./) and user-home shorthand (~).
 resolve_volume_host_path() {
     local host_path="$1"
     local abs_host_path="$host_path"
@@ -78,22 +118,37 @@ resolve_volume_host_path() {
     fi
 
     if [[ "$abs_host_path" =~ ^\.\. ]]; then
-        abs_host_path="$C0DEV_PATH/${abs_host_path#../}"
+        abs_host_path="$C0ROOT/${abs_host_path#../}"
     elif [[ "$abs_host_path" =~ ^\. ]]; then
-        abs_host_path="$C0DEV_PATH/docker/${abs_host_path#./}"
+        abs_host_path="$C0ROOT/docker/${abs_host_path#./}"
     fi
 
     echo "$abs_host_path"
 }
 
-# Parse volumes-folders.yaml and volumes-files.yaml for volume mappings
-# Calls callback function for each volume mapping with: abs_host_path container_path is_file display_host_path exists
-# Callback signature: callback_func "$abs_host_path" "$container_path" "$is_file" "$display_host_path" "$exists"
-parse_volume_mappings() {
-    local callback_func="$1"
+# Check if path looks like a docker volume name (not a host path)
+is_docker_volume() {
+    local path="$1"
+    # Docker volumes don't start with /, ~, or .
+    [[ ! "$path" =~ ^[/~.] ]]
+}
 
-    # Collect folder mappings from volumes-folders.yaml
-    local folder_mappings=""
+# Convert absolute path to display path relative to C0ROOT
+to_display_path() {
+    local abs_path="$1"
+    if [[ "$abs_path" == "$C0ROOT"/* ]]; then
+        echo ".${abs_path#$C0ROOT}"
+    elif [[ "$abs_path" == "$HOME"/* ]]; then
+        echo "~${abs_path#$HOME}"
+    else
+        echo "$abs_path"
+    fi
+}
+
+# Parse volumes-folders.yaml for folder mappings
+# Calls callback: callback_func "$abs_host_path" "$container_path" "folder" "$display_host_path" "$ro"
+parse_folder_mappings() {
+    local callback_func="$1"
     local in_folders=false
 
     while IFS= read -r line; do
@@ -110,43 +165,31 @@ parse_volume_mappings() {
             local volume_line="${BASH_REMATCH[1]}"
             volume_line=$(echo "$volume_line" | sed 's/#.*//')
             volume_line=$(echo "$volume_line" | xargs)
+            [[ -z "$volume_line" ]] && continue
 
-            if [[ -n "$volume_line" ]]; then
-                folder_mappings="${folder_mappings}${volume_line}"$'\n'
+            local host_path container_path ro
+            # Parse host:container or host:container:ro
+            IFS=':' read -r host_path container_path ro <<< "$volume_line"
+
+            if is_docker_volume "$host_path"; then
+                # Docker volume, not a host path
+                "$callback_func" "" "$container_path" "docker-volume" "$host_path" "$ro"
+            else
+                local abs_host_path display_path
+                abs_host_path="$(resolve_volume_host_path "$host_path")"
+                display_path="$(to_display_path "$abs_host_path")"
+                "$callback_func" "$abs_host_path" "$container_path" "host-dir" "$display_path" "$ro"
             fi
         fi
     done < "$VOLUMES_FOLDERS_FILE"
+}
 
-    # Process folders
-    while IFS= read -r volume_line; do
-        [[ -z "$volume_line" ]] && continue
-
-        local host_path="${volume_line%:*}"
-        local container_path="${volume_line#*:}"
-
-        local abs_host_path
-        abs_host_path="$(resolve_volume_host_path "$host_path")"
-
-        local projects_dir="$(dirname "$C0DEV_PATH")"
-        local display_host_path
-        if [[ "$abs_host_path" == "$projects_dir" ]]; then
-            display_host_path="."
-        elif [[ "$abs_host_path" == "$projects_dir"* ]]; then
-            display_host_path="${abs_host_path#$projects_dir/}"
-        else
-            display_host_path="$host_path"
-        fi
-
-        local exists="false"
-        if [[ -e "$abs_host_path" ]]; then
-            exists="true"
-        fi
-
-        "$callback_func" "$abs_host_path" "$container_path" "false" "$display_host_path" "$exists"
-    done <<< "$folder_mappings"
-
-    # Process files from volumes-files.yaml
+# Parse volumes-files.yaml for file mappings
+# Calls callback: callback_func "$abs_host_path" "$container_path" "file" "$display_host_path" "$ro"
+parse_file_mappings() {
+    local callback_func="$1"
     local in_files=false
+
     while IFS= read -r line; do
         if [[ "$line" =~ ^x-volume-files:[[:space:]]*\&files ]]; then
             in_files=true
@@ -161,387 +204,548 @@ parse_volume_mappings() {
             local volume_line="${BASH_REMATCH[1]}"
             volume_line=$(echo "$volume_line" | sed 's/#.*//')
             volume_line=$(echo "$volume_line" | xargs)
+            [[ -z "$volume_line" ]] && continue
 
-            if [[ -n "$volume_line" ]]; then
-                local host_path="${volume_line%:*}"
-                local container_path="${volume_line#*:}"
+            local host_path container_path ro
+            IFS=':' read -r host_path container_path ro <<< "$volume_line"
 
-                local abs_host_path
+            if is_docker_volume "$host_path"; then
+                "$callback_func" "" "$container_path" "docker-volume" "$host_path" "$ro"
+            else
+                local abs_host_path display_path
                 abs_host_path="$(resolve_volume_host_path "$host_path")"
-
-                local projects_dir="$(dirname "$C0DEV_PATH")"
-                local display_host_path
-                if [[ "$abs_host_path" == "$projects_dir" ]]; then
-                    display_host_path="."
-                elif [[ "$abs_host_path" == "$projects_dir"* ]]; then
-                    display_host_path="${abs_host_path#$projects_dir/}"
-                else
-                    display_host_path="$host_path"
-                fi
-
-                local exists="false"
-                if [[ -e "$abs_host_path" ]]; then
-                    exists="true"
-                fi
-
-                "$callback_func" "$abs_host_path" "$container_path" "true" "$display_host_path" "$exists"
+                display_path="$(to_display_path "$abs_host_path")"
+                "$callback_func" "$abs_host_path" "$container_path" "host-file" "$display_path" "$ro"
             fi
         fi
     done < "$VOLUMES_FILES_FILE"
 }
 
-# Callback for showing volume mappings
-_show_volume_callback() {
+# Validate all host paths exist and are correct type
+# Returns 0 if valid, 1 if errors; prints errors to stderr
+validate_host_paths() {
+    local errors=()
+    local missing_dirs=()
+    local missing_files=()
+
+    _validate_folder_callback() {
     local abs_host_path="$1"
     local container_path="$2"
-    local is_file="$3"
-    local display_host_path="$4"
-    local exists="$5"
+        local type="$3"
+        local display_path="$4"
 
-    local type_indicator=""
-    if [[ "$is_file" == "true" ]]; then
-        type_indicator="${MAGENTA}[file]${NC} "
-    fi
-
-    if [[ "$exists" == "true" ]]; then
-        echo -e "  ${GREEN}✓${NC} ${type_indicator}${CYAN}$display_host_path${NC} → ${YELLOW}$container_path${NC}"
-    else
-        echo -e "  ${RED}✗${NC} ${type_indicator}${CYAN}$display_host_path${NC} → ${YELLOW}$container_path${NC} ${RED}(missing)${NC}"
-    fi
-}
-
-# Parse docker-compose.yaml and show volume mappings
-show_volume_mappings() {
-    echo -e "${BOLD}📁 Volume Mappings:${NC}"
-    parse_volume_mappings "_show_volume_callback"
-}
-
-# Callback for touching file mappings during build
-_touch_file_callback() {
-    local abs_host_path="$1"
-    local container_path="$2"
-    local is_file="$3"
-    local display_host_path="$4"
-    local exists="$5"
-
-    if [[ "$is_file" == "true" && "$exists" == "false" ]]; then
-        local parent_dir="$(dirname "$abs_host_path")"
-        if [[ ! -d "$parent_dir" ]]; then
-            echo "  📁 Creating parent directory: $display_host_path"
-            mkdir -p "$parent_dir"
-        fi
-        echo "  👉 Touching file mapping: $display_host_path"
-        touch "$abs_host_path"
-    fi
-}
-
-# Touch all file mappings to prevent Docker from creating directories
-ensure_file_mappings() {
-    echo "📝 Ensuring file mappings exist on host..."
-    parse_volume_mappings "_touch_file_callback"
-    echo "✅ File mappings prepared"
-}
-
-# Show usage/help
-show_usage() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        echo "Usage: $0 {codex-auth|help}"
-        echo ""
-        echo "Commands (inside container):"
-        echo "  codex-auth        - Start Codex authentication proxy on port 1455"
-        echo "  help              - Show this help message"
-        echo ""
-        echo "Note: You are running inside the c0-dev container."
-        echo "      Use 'exit' to return to host, then run 'c0 stop' to stop services."
-    else
-        echo "Usage: $0 {start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build}"
-        echo ""
-        echo "Commands:"
-        echo "  start             - Start all services"
-        echo "  stop              - Stop all services"
-        echo "  restart           - Restart all services"
-        echo "  logs [service]    - Show logs (default: $MAIN_SERVICE)"
-        echo "  status            - Show service status"
-        echo "  sh                - Connect as dev user (uid 1000) with proper shell init (-l)"
-        echo "  root              - Connect as root (uid 0)"
-        echo "  cp-term           - Copy term info into container env"
-        echo "  codex-auth        - Start Codex authentication proxy on port 1455"
-        echo "  build [-f]        - Extract tools to host + build image (use -f to force rebuild)"
-        echo ""
-        echo "Networking:"
-        echo "  Default: Public networking with host network (direct internet access)"
-        echo ""
-        echo "Project Navigation:"
-        echo "  When in a project subdirectory, 'c0 sh'/'c0 root' commands automatically"
-        echo "  navigate to the corresponding $CONTAINER_DEV_HOME/projects/ subdirectory"
-    fi
-}
-
-# Abbreviated status function
-_proxy_start() {
-    echo "🔧 Starting Aegis Proxy..."
-    cd "$C0DEV_PATH/proxy"
-    ./aegis-proxy serve -d
-    cd "$C0DEV_PATH/docker"
-
-    echo "🔗 Connecting Aegis Proxy to internal network..."
-    docker network connect docker_proxy-net aegis-proxy 2>/dev/null || true
-}
-
-_proxy_stop() {
-    echo "🛑 Stopping Aegis Proxy..."
-    cd "$C0DEV_PATH/proxy"
-    ./aegis-proxy stop 2>/dev/null || true
-    cd "$C0DEV_PATH/docker"
-}
-
-_proxy_build() {
-    echo "🔨 Building Aegis Proxy..."
-    cd "$C0DEV_PATH/proxy"
-    ./aegis-proxy build
-
-    echo "🔐 Exporting Aegis Proxy CA certificate..."
-    if ./aegis-proxy export-ca > "$C0DEV_PATH/docker/aegis-ca-cert.pem" 2>/dev/null; then
-        echo "✅ CA certificate exported to aegis-ca-cert.pem"
-    else
-        echo "⚠️  CA certificate not available - generating new certificate..."
-        ./aegis-proxy gen-ca
-        if ./aegis-proxy export-ca > "$C0DEV_PATH/docker/aegis-ca-cert.pem" 2>/dev/null; then
-            echo "✅ New CA certificate generated and exported"
-        else
-            echo "❌ Failed to generate CA certificate - creating empty file"
-            touch "$C0DEV_PATH/docker/aegis-ca-cert.pem"
-        fi
-    fi
-    cd "$C0DEV_PATH/docker"
-}
-
-show_abbreviated_status() {
-    local container_info=$(docker-compose $COMPOSE_FILES ps --format "{{.Name}}: {{.State}}" 2>/dev/null | head -1)
-
-    if [[ -n "$container_info" ]]; then
-        if [[ "$container_info" =~ Up ]]; then
-            echo -e "📊 ${GREEN}$container_info${NC}"
-        elif [[ "$container_info" =~ Exit ]]; then
-            echo -e "📊 ${RED}$container_info${NC}"
-        else
-            echo -e "📊 ${YELLOW}$container_info${NC}"
-        fi
-    else
-        echo -e "📊 ${YELLOW}No containers found${NC}"
-    fi
-
-    echo ""
-    show_volume_mappings
-}
-
-case "$1" in
-    "start")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot start services from inside container"
-            echo "   Exit the container and run 'c0 start' from the host"
-            exit 1
-        fi
-        echo "🚀 Starting all services..."
-        docker-compose $COMPOSE_FILES up -d
-        echo "✅ All services started. Main service: $MAIN_SERVICE"
-        # _proxy_start
-        echo "📊 Check status: docker-compose ps"
-        ;;
-
-    "stop")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot stop services from inside container"
-            echo "   Exit the container and run 'c0 stop' from the host"
-            exit 1
-        fi
-        echo "🛑 Stopping all services..."
-        docker-compose $COMPOSE_FILES down
-        # _proxy_stop
-        echo "✅ All services stopped"
-        ;;
-
-    "restart")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot restart services from inside container"
-            echo "   Exit the container and run 'c0 restart' from the host"
-            exit 1
-        fi
-        echo "🔄 Restarting all services..."
-        "$0" stop "$@"
-        "$0" start "$@"
-        ;;
-
-    "logs")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot view logs from inside container"
-            echo "   Exit the container and run 'c0 logs' from the host"
-            exit 1
-        fi
-        SERVICE="${2:-$MAIN_SERVICE}"
-        echo "📋 Showing logs for $SERVICE..."
-        docker-compose $COMPOSE_FILES logs -f "$SERVICE"
-        ;;
-
-    "status")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot check status from inside container"
-            echo "   Exit the container and run 'c0 status' from the host"
-            exit 1
-        fi
-        echo "📊 Service status:"
-        docker-compose $COMPOSE_FILES ps
-        ;;
-
-    "sh")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Already inside container"
-            echo "   Use 'exit' to return to host"
-            exit 1
-        fi
-        echo "🐚 Connecting to $MAIN_SERVICE shell as dev user (uid 1000)..."
-        PROJECT_PATH=$(get_project_path)
-        if [ -n "$PROJECT_PATH" ]; then
-            echo "📁 Changing to project: $PROJECT_PATH"
-            docker-compose $COMPOSE_FILES exec -u 1000 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$PROJECT_PATH && exec bash -l"
-        else
-            echo "📁 Not in a project directory, starting in $CONTAINER_DEV_HOME"
-            docker-compose $COMPOSE_FILES exec -u 1000 "$MAIN_SERVICE" bash -l
-        fi
-        ;;
-
-    "root")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot switch to root from inside container using c0"
-            echo "   Exit the container and run 'c0 root' from the host"
-            exit 1
-        fi
-        echo "🔧 Connecting to $MAIN_SERVICE shell as root (uid 0)..."
-        PROJECT_PATH=$(get_project_path)
-        if [ -n "$PROJECT_PATH" ]; then
-            echo "📁 Changing to project: $PROJECT_PATH"
-            docker-compose $COMPOSE_FILES exec -u 0 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$PROJECT_PATH && exec bash"
-        else
-            echo "📁 Not in a project directory, starting in $CONTAINER_DEV_HOME"
-            docker-compose $COMPOSE_FILES exec -u 0 "$MAIN_SERVICE" bash
-        fi
-        ;;
-
-    "cp-term")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot copy terminfo from inside container"
-            echo "   Exit the container and run 'c0 cp-term' from the host"
-            exit 1
-        fi
-        for term in xterm-256color $TERM; do
-            infocmp -xa $term | docker exec -u 0 -i "docker-$MAIN_SERVICE-1" tic -x -o /usr/share/terminfo/ -
-            echo "✅ Term info $term copied to /usr/share/terminfo/"
-        done
-        ;;
-
-    "codex-auth")
-        echo "🔐 Starting Codex authentication proxy..."
-        echo "from host: open $(pbpaste | tr -d '\n')"
-        echo "Command: socat TCP-LISTEN:1455,bind=\$(ip route get 1 | awk '{print \$7}' | xargs),fork TCP:127.0.0.1:1455"
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            socat TCP-LISTEN:1455,bind=$(ip route get 1 | awk '{print $7}' | xargs),fork TCP:127.0.0.1:1455
-        else
-            docker-compose $COMPOSE_FILES exec "$MAIN_SERVICE" bash -c "socat TCP-LISTEN:1455,bind=\$(ip route get 1 | awk '{print \$7}' | xargs),fork TCP:127.0.0.1:1455"
-        fi
-        ;;
-
-    "build")
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-            echo "❌ Cannot build from inside container"
-            echo "   Exit the container and run 'c0 build' from the host"
-            exit 1
-        fi
-        FORCE_REBUILD=false
-        if [[ "$2" == "-f" || "$2" == "--force" ]]; then
-            FORCE_REBUILD=true
-            NOCACHE="--no-cache"
-            echo "🔨 Force rebuilding tools and Docker image for $MAIN_SERVICE..."
-        else
-            echo "🔨 Building tools and Docker image for $MAIN_SERVICE..."
-            NOCACHE=""
-        fi
-
-        # Step 0: Ensure file mappings exist to prevent Docker from creating directories
-        ensure_file_mappings
-        echo ""
-
-        # Step 1: Build and extract tools to host directories
-        echo "📦 Building and extracting tools..."
-
-        # Ensure tool directories exist
-        mkdir -p "$C0DEV_PATH/.local" "$C0DEV_PATH/.cargo" "$C0DEV_PATH/.rustup"
-
-        # Check if tools already exist (unless force rebuild)
-        TOOLS_EXIST=true
-        if [[ ! -f "$C0DEV_PATH/.local/bin/uv" ]] || \
-           [[ ! -f "$C0DEV_PATH/.cargo/bin/cargo" ]] || \
-           [[ ! -f "$C0DEV_PATH/.cargo/bin/rustc" ]]; then
-            TOOLS_EXIST=false
-        fi
-
-        # Extract tools if they don't exist or if force rebuild is requested
-        if [[ "$TOOLS_EXIST" == "false" || "$FORCE_REBUILD" == "true" ]]; then
-            if [[ "$FORCE_REBUILD" == "true" ]]; then
-                echo "🧹 Force rebuild requested. Cleaning existing tools..."
-                rm -rf "$C0DEV_PATH/.local" "$C0DEV_PATH/.cargo" "$C0DEV_PATH/.rustup"
-                mkdir -p "$C0DEV_PATH/.local" "$C0DEV_PATH/.cargo" "$C0DEV_PATH/.rustup"
+        if [[ "$type" == "host-dir" && -n "$abs_host_path" ]]; then
+            if [[ ! -e "$abs_host_path" ]]; then
+                errors+=("missing: $display_path")
+                missing_dirs+=("$abs_host_path")
+            elif [[ ! -d "$abs_host_path" ]]; then
+                errors+=("not a directory (remove file first): $display_path")
             fi
+        fi
+    }
 
-            # Build tools-builder stage and extract tools
-            echo "🔧 Building tools-builder stage..."
-            docker build --target tools-builder -t $MAIN_SERVICE-tools "$C0DEV_PATH/docker"
-            docker create --name $MAIN_SERVICE-tools-build $MAIN_SERVICE-tools
+    _validate_file_callback() {
+        local abs_host_path="$1"
+        local container_path="$2"
+        local type="$3"
+        local display_path="$4"
 
-            # Set up cleanup trap in case of failure or interruption
-            trap "docker rm -f $MAIN_SERVICE-tools-build 2>/dev/null || true" EXIT
+        if [[ "$type" == "host-file" && -n "$abs_host_path" ]]; then
+            if [[ ! -e "$abs_host_path" ]]; then
+                errors+=("missing: $display_path")
+                missing_files+=("$abs_host_path")
+            elif [[ ! -f "$abs_host_path" ]]; then
+                errors+=("not a file: $display_path")
+            fi
+        fi
+    }
 
-            for dot_folder in local cargo rustup; do
-                cp_tools "$MAIN_SERVICE-tools-build:$CONTAINER_DEV_HOME" "$C0DEV_PATH" $dot_folder
+    parse_folder_mappings _validate_folder_callback
+    parse_file_mappings _validate_file_callback
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        echo "error: host path validation failed:" >&2
+        for err in "${errors[@]}"; do
+            echo "  - $err" >&2
+        done
+        # Suggest fix for missing paths
+        if [[ ${#missing_dirs[@]} -gt 0 || ${#missing_files[@]} -gt 0 ]]; then
+            echo "" >&2
+            echo "create missing paths:" >&2
+            for d in "${missing_dirs[@]}"; do
+                echo "  mkdir -p \"$d\"" >&2
             done
+            for f in "${missing_files[@]}"; do
+                echo "  touch \"$f\"" >&2
+            done
+        fi
+        return 1
+    fi
+    return 0
+}
 
-            # Clean up
-            docker rm -f $MAIN_SERVICE-tools-build
-            docker rmi $MAIN_SERVICE-tools
+# Check if shared tools volume exists and is valid for current Dockerfile hash
+tools_volume_valid() {
+    # Check if volume exists
+    if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
+        return 1
+    fi
 
-            # Remove trap since cleanup is complete
-            trap - EXIT
-        else
-            echo "✅ Tools already exist. Skipping extraction."
+    # Check if completeness marker exists
+    docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools:ro" alpine \
+        test -f "/tools/opt/$DOCKERFILE_HASH/.c0dev-complete" 2>/dev/null
+}
+
+# Get project relative path for shell navigation
+get_project_path() {
+    local current_dir="$(realpath "$(pwd)")"
+    local projects_dir="$C0ROOT/projects"
+
+    if [[ "$current_dir" == "$projects_dir" ]]; then
+        echo "."
+    elif [[ "$current_dir" == "$projects_dir"* ]]; then
+        echo "${current_dir#$projects_dir/}"
+    else
+        echo ""
+    fi
+}
+
+# Host-only guard
+require_host() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        echo "error: '$1' must be run from host, not inside container" >&2
+        exit 1
+    fi
+}
+
+# =============================================================================
+# Build: tools volume (transactional)
+# =============================================================================
+
+build_tools_volume() {
+    local force="${1:-false}"
+    local nocache="${2:-}"
+    local H="$DOCKERFILE_HASH"
+    local VOL="$SHARED_TOOLS_VOLUME"
+    local TAG="c0dev-tools-builder:$H"
+
+    # Check if rebuild needed
+    if [[ "$force" != "true" ]] && tools_volume_valid; then
+        echo -e "📦 Tools: ${GREEN}valid${NC}"
+        return 0
+    fi
+
+    echo -e "📦 Tools: building..."
+
+    # Clean up any leftover containers from previous/interrupted builds
+    docker rm -f "$MAIN_SERVICE-tools-build" 2>/dev/null || true
+    docker rm -f "$MAIN_SERVICE-tools" 2>/dev/null || true
+
+    # Cleanup function for interrupts
+    _build_cleanup() {
+        echo -e "\n${RED}build interrupted${NC}" >&2
+        docker rmi "$TAG" 2>/dev/null || true
+        # Remove partial temp dir
+        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        exit 130
+    }
+    trap _build_cleanup INT TERM
+
+    # 1) Ensure volume exists
+    docker volume create "$VOL" >/dev/null
+
+    # 2) Build tools image
+    echo -e "  🔧 Building tools-builder stage..."
+    if ! docker build $nocache --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
+        trap - INT TERM
+        return 1
+    fi
+
+    # 3) Stream tarball from tools image into volume temp dir
+    echo -e "  📤 Extracting to temp..."
+    if ! (docker run --rm "$TAG" sh -lc 'tar -C /home/dev -cf - .cargo .rustup .local' | \
+        docker run --rm -i -v "$VOL:/tools" alpine sh -c "
+            set -e
+            rm -rf '/tools/tmp/$H.partial'
+            mkdir -p '/tools/tmp/$H.partial'
+            tar -C '/tools/tmp/$H.partial' -xf -
+        "); then
+        trap - INT TERM
+        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        return 1
+    fi
+
+    # 4) Write completeness marker
+    echo -e "  ✓ Marking complete..."
+    if ! docker run --rm -v "$VOL:/tools" alpine touch "/tools/tmp/$H.partial/.c0dev-complete"; then
+        trap - INT TERM
+        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        return 1
+    fi
+
+    # 5) Atomic promotion
+    echo -e "  📥 Promoting..."
+    if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
+        set -e
+        mkdir -p /tools/opt
+        rm -rf '/tools/opt/$H.old'
+        if [ -d '/tools/opt/$H' ]; then
+            mv '/tools/opt/$H' '/tools/opt/$H.old'
+        fi
+        mv '/tools/tmp/$H.partial' '/tools/opt/$H'
+        rm -rf '/tools/opt/$H.old'
+        rm -rf '/tools/tmp/$H.partial'
+    "; then
+        trap - INT TERM
+        return 1
+    fi
+
+    # 6) Post-verify
+    if ! docker run --rm -v "$VOL:/tools:ro" alpine test -f "/tools/opt/$H/.c0dev-complete"; then
+        echo "error: tools build failed - completeness marker missing" >&2
+        trap - INT TERM
+        return 1
+    fi
+
+    # Cleanup builder image
+    docker rmi "$TAG" >/dev/null 2>&1 || true
+
+    # Clear trap
+    trap - INT TERM
+
+    echo -e "  ✅ Tools: ${GREEN}complete${NC}"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+cmd_start() {
+    require_host "start"
+
+    # Validate host paths
+    if ! validate_host_paths; then
+        echo "error: fix missing paths before starting" >&2
+            exit 1
         fi
 
-        # _proxy_build
+    # Check tools volume
+    if ! tools_volume_valid; then
+        echo "error: tools volume invalid or missing - run 'c0 build' first" >&2
+            exit 1
+        fi
 
-        # Prepare terminfo
-        echo "📄 Preparing terminfo..."
-        mkdir -p "$C0DEV_PATH/docker/.terminfo"
+    echo -e "🚀 Starting ${CYAN}$PROJECT_NAME${NC}..."
+    dc up -d
+    echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
+}
+
+cmd_stop() {
+    require_host "stop"
+    echo -e "🛑 Stopping ${CYAN}$PROJECT_NAME${NC}..."
+    dc down
+    echo -e "✅ Stopped"
+}
+
+cmd_restart() {
+    require_host "restart"
+    echo -e "🔄 Restarting ${CYAN}$PROJECT_NAME${NC}..."
+    dc down
+
+    # Validate before restart
+    if ! validate_host_paths; then
+        echo "error: fix missing paths before starting" >&2
+            exit 1
+        fi
+    if ! tools_volume_valid; then
+        echo "error: tools volume invalid - run 'c0 build' first" >&2
+            exit 1
+        fi
+
+    dc up -d
+    echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
+}
+
+cmd_logs() {
+    require_host "logs"
+    local service="${1:-$MAIN_SERVICE}"
+    dc logs -f "$service"
+}
+
+cmd_status() {
+    require_host "status"
+
+    if [[ -n "$C0_MODE" ]]; then
+        echo -e "${BOLD}mode:${NC} $C0_MODE"
+    fi
+    echo ""
+
+    # Container status
+    echo -e "${BOLD}running containers:${NC}"
+    local container_info
+    container_info=$(dc ps --format "{{.Name}}: {{.State}}" 2>/dev/null | head -1)
+    if [[ -n "$container_info" ]]; then
+        if [[ "$container_info" =~ running ]]; then
+            echo -e "  ${GREEN}$container_info${NC}"
+        elif [[ "$container_info" =~ exited ]]; then
+            echo -e "  ${RED}$container_info${NC}"
+        else
+            echo -e "  ${YELLOW}$container_info${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}(none)${NC}"
+    fi
+    echo ""
+
+    # Volume mappings
+    echo -e "${BOLD}volumes:${NC}"
+    _status_mapping() {
+        local abs_host_path="$1"
+        local container_path="$2"
+        local type="$3"
+        local display_path="$4"
+        local ro="$5"
+
+        local ro_flag=""
+        [[ "$ro" == "ro" ]] && ro_flag=" ${MAGENTA}[ro]${NC}"
+
+        local status="ok"
+        if [[ "$type" == "host-dir" && -n "$abs_host_path" ]]; then
+            if [[ ! -e "$abs_host_path" ]]; then
+                status="MISSING"
+            elif [[ ! -d "$abs_host_path" ]]; then
+                status="NOT-DIR"
+            fi
+        elif [[ "$type" == "host-file" && -n "$abs_host_path" ]]; then
+            if [[ ! -e "$abs_host_path" ]]; then
+                status="MISSING"
+            elif [[ ! -f "$abs_host_path" ]]; then
+                status="NOT-FILE"
+            fi
+        fi
+
+        local type_color="$BLUE"
+        [[ "$type" == "docker-volume" ]] && type_color="$MAGENTA"
+
+        if [[ "$status" == "ok" ]]; then
+            echo -e "  ${GREEN}✓${NC} ${type_color}[$type]${NC} ${CYAN}$display_path${NC} -> ${YELLOW}$container_path${NC}$ro_flag"
+        else
+            echo -e "  ${RED}✗${NC} ${type_color}[$type]${NC} ${CYAN}$display_path${NC} -> ${YELLOW}$container_path${NC} ${RED}($status)${NC}"
+        fi
+    }
+
+    parse_folder_mappings _status_mapping
+    parse_file_mappings _status_mapping
+    echo ""
+
+    # Shared tools volume
+    echo -e "${BOLD}tools:${NC}"
+    if tools_volume_valid; then
+        echo -e "  ${GREEN}✓${NC} ${CYAN}$SHARED_TOOLS_VOLUME${NC} (${YELLOW}${DOCKERFILE_HASH:0:12}...${NC})"
+    else
+        echo -e "  ${RED}✗${NC} ${CYAN}$SHARED_TOOLS_VOLUME${NC} (${YELLOW}${DOCKERFILE_HASH:0:12}...${NC}) - run 'c0 build'"
+    fi
+}
+
+cmd_sh() {
+    require_host "sh"
+    local project_path
+    project_path=$(get_project_path)
+    if [[ -n "$project_path" ]]; then
+        echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
+        dc exec -u 1000 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash -l"
+    else
+        echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev)"
+        dc exec -u 1000 "$MAIN_SERVICE" bash -l
+    fi
+}
+
+cmd_root() {
+    require_host "root"
+    local project_path
+    project_path=$(get_project_path)
+    if [[ -n "$project_path" ]]; then
+        echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC}) @ ${YELLOW}projects/$project_path${NC}"
+        dc exec -u 0 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash"
+    else
+        echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC})"
+        dc exec -u 0 "$MAIN_SERVICE" bash
+    fi
+}
+
+cmd_cp_term() {
+    require_host "cp-term"
+    local container_name
+    container_name=$(dc ps -q "$MAIN_SERVICE" 2>/dev/null)
+    if [[ -z "$container_name" ]]; then
+        echo "error: container not running" >&2
+            exit 1
+        fi
         for term in xterm-256color $TERM; do
-            infocmp -xa $term > "$C0DEV_PATH/docker/.terminfo/$term"
-        done
+        infocmp -xa "$term" | docker exec -u 0 -i "$container_name" tic -x -o /usr/share/terminfo/ -
+        echo -e "✅ Copied: ${CYAN}$term${NC}"
+    done
+}
 
-        echo "🏗️  Building final Docker image..."
-        docker-compose $COMPOSE_FILES build $NOCACHE $DEBUG "$MAIN_SERVICE"
+cmd_codex_auth() {
+    echo "codex-auth: starting proxy on port 1455..."
+    echo "from host: open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')"
+        if [[ "$IN_CONTAINER" == "true" ]]; then
+        socat TCP-LISTEN:1455,bind="$(ip route get 1 | awk '{print $7}' | xargs)",fork TCP:127.0.0.1:1455
+    else
+        dc exec "$MAIN_SERVICE" bash -c "socat TCP-LISTEN:1455,bind=\$(ip route get 1 | awk '{print \$7}' | xargs),fork TCP:127.0.0.1:1455"
+    fi
+}
 
-        echo "✅ Build complete!"
-        echo "🛠️ Builder tools deployed to host-shared folder: $C0DEV_PATH"
-        find . -type f -perm +111 -maxdepth 4 -not -path './.git/*' -not -path './.claude/*' -not -path './bin/*' -not -path './projects/*' -mindepth 2 | while read t; do echo "   - $t"; done
-        echo ""
-        ;;
+cmd_build() {
+    require_host "build"
 
-    "help"|"--help"|"-h")
-        show_usage
-        ;;
+    local force=false
+    local nocache=""
+    if [[ "$1" == "-f" || "$1" == "--force" ]]; then
+        force=true
+        nocache="--no-cache"
+        echo -e "🔨 ${YELLOW}Force rebuild${NC} requested"
+    fi
 
+    # Validate host paths (fail if missing, do not create)
+    if ! validate_host_paths; then
+        echo "error: fix missing paths before building" >&2
+            exit 1
+        fi
+
+    # Build/validate tools volume (has its own trap)
+    if ! build_tools_volume "$force" "$nocache"; then
+        echo "error: tools build failed" >&2
+        exit 1
+    fi
+
+    # Trap for image build phase
+    trap 'echo -e "\n${RED}build interrupted${NC}" >&2; exit 130' INT TERM
+
+    # Prepare terminfo
+    echo -e "📄 Preparing terminfo..."
+    mkdir -p "$C0ROOT/docker/.terminfo"
+    for term in xterm-256color $TERM; do
+        infocmp -xa "$term" > "$C0ROOT/docker/.terminfo/$term" 2>/dev/null || true
+    done
+
+    # Build service image
+    echo -e "🏗️  Building service image..."
+    if ! dc build $nocache "$MAIN_SERVICE"; then
+        echo "error: image build failed" >&2
+        exit 1
+    fi
+
+    trap - INT TERM
+    echo -e "✅ ${GREEN}Build complete${NC}"
+}
+
+cmd_clean() {
+    require_host "clean"
+
+    local clean_all=false
+    if [[ "$1" == "--all" || "$1" == "-a" ]]; then
+        clean_all=true
+    fi
+
+    if [[ "$clean_all" == "true" ]]; then
+        # Remove entire volume
+        local containers
+        containers=$(docker ps -aq --filter "volume=$SHARED_TOOLS_VOLUME" 2>/dev/null | tr '\n' ' ')
+        if [[ -n "$containers" ]]; then
+            echo -e "🛑 Removing containers using volume..."
+            docker rm -f $containers >/dev/null
+        fi
+
+        echo -e "🧹 Removing volume ${CYAN}$SHARED_TOOLS_VOLUME${NC}..."
+        if docker volume rm "$SHARED_TOOLS_VOLUME" >/dev/null 2>&1; then
+            echo -e "✅ Removed: ${GREEN}$SHARED_TOOLS_VOLUME${NC}"
+        else
+            if docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
+                echo "error: failed to remove $SHARED_TOOLS_VOLUME (in use?)" >&2
+                exit 1
+            else
+                echo -e "${YELLOW}$SHARED_TOOLS_VOLUME does not exist${NC}"
+            fi
+        fi
+    else
+        # Remove only current hash folder
+        local H="$DOCKERFILE_HASH"
+        echo -e "🧹 Removing tools for hash ${YELLOW}${H:0:12}...${NC}"
+
+        if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
+            echo -e "${YELLOW}volume $SHARED_TOOLS_VOLUME does not exist${NC}"
+            return 0
+        fi
+
+        if docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools" alpine rm -rf "/tools/opt/$H" 2>/dev/null; then
+            echo -e "✅ Removed: ${GREEN}/tools/opt/${H:0:12}...${NC}"
+        else
+            echo "error: failed to remove /tools/opt/$H" >&2
+            exit 1
+        fi
+    fi
+}
+
+cmd_help() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        cat <<EOF
+Usage: c0 {codex-auth|help}
+
+Commands (inside container):
+  codex-auth    Start Codex authentication proxy on port 1455
+  help          Show this help message
+
+Note: Running inside container. Use 'exit' to return to host.
+EOF
+    else
+        cat <<EOF
+Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|codex-auth|build|clean|help}
+
+Commands:
+  start         Start all services
+  stop          Stop all services
+  restart       Restart all services
+  logs [svc]    Show logs (default: $MAIN_SERVICE)
+  status        Show service status and volume mappings
+  sh            Shell as dev user (uid 1000)
+  root          Shell as root (uid 0)
+  cp-term       Copy terminfo into container
+  codex-auth    Start Codex authentication proxy on port 1455
+  build [-f]    Build tools and image (-f forces rebuild)
+  clean [-a]    Remove tools for current Dockerfile hash (-a removes shared volume)
+  help          Show this help message
+
+Environment:
+  C0_MODE       Set to 'dev' for dev mode (default: production)
+EOF
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+case "${1:-}" in
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    restart)    cmd_restart ;;
+    logs)       shift; cmd_logs "$@" ;;
+    status)     cmd_status ;;
+    sh)         cmd_sh ;;
+    root)       cmd_root ;;
+    cp-term)    cmd_cp_term ;;
+    codex-auth) cmd_codex_auth ;;
+    build)      shift; cmd_build "$@" ;;
+    clean)      shift; cmd_clean "$@" ;;
+    help|--help|-h)
+                cmd_help ;;
     *)
-        # Default: show abbreviated status and help when no command provided
         if [[ "$IN_CONTAINER" == "false" ]]; then
-            show_abbreviated_status
+            cmd_status
             echo ""
         fi
-        show_usage
+        cmd_help
         ;;
 esac

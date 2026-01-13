@@ -20,6 +20,7 @@ prepend_path() {
 	esac
 }
 
+# Standard tool locations (symlinked to shared volume in container)
 prepend_path "/usr/local/bun-node-fallback-bin"
 prepend_path "$HOME/.cargo/bin"
 prepend_path "$HOME/.local/bin"

@@ -6,12 +6,15 @@ x-environment-base: &env-base
   OLLAMA_MODEL: gpt-oss:20b
   CODEX_PORT: "1455"
   TERM: ${TERM}
+  # Shared tools prefix (symlinked to ~/.cargo etc. by entrypoint)
+  TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
 services:
   c0-dev:
     build:
       context: .
       dockerfile: Dockerfile
+    hostname: ${C0DEV_HOSTNAME:-c0dev}
     ports:
       - 127.0.0.1:1455:1455
       - 3000:3000

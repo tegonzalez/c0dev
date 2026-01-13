@@ -108,12 +108,6 @@ ARG TZ=America/Los_Angeles
 ENV TZ=${TZ}
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Expose ports
-# Codex server
-EXPOSE 1455
-# dev http
-EXPOSE 3000
-
 # Copy terminfo
 COPY .terminfo /tmp/.terminfo
 RUN for term in /tmp/.terminfo/*; do tic -x -o /usr/share/terminfo $term; done

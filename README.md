@@ -106,9 +106,7 @@ c0 build [-f]
 3. Wait for the CLI to confirm the token was stored under `/home/dev/.claude.json` (persisted via the host volume).
 
 ### Codex CLI
-1. Start the local redirect listener: `c0 codex-auth` (keeps port 1455 open while you log in).
-2. In a separate terminal, run `codex login` and complete the web-based OAuth flow.
-3. After the CLI reports success, return to the first terminal and press `Ctrl+C` to stop `c0 codex-auth`.
+Codex now supports device authentication; run `codex login --device-auth` and follow the prompts.
 
 ### OpenCode CLI
 1. Run `opencode auth login` to start the interactive login.
@@ -133,7 +131,7 @@ These mappings keep credentials, tool installs, and in-progress work outside the
 ## Environment Defaults
 - Locale: `en_US.UTF-8`
 - Timezone: `America/Los_Angeles` (`TZ` build arg overrides)
-- Exposed ports: `1455` (Codex auth), `3000` (general dev server)
+- Exposed ports: `3000` (general dev server)
 - LLM provider: Ollama at `http://host.docker.internal:11434`
 - Default model: `gpt-oss:20b`
 

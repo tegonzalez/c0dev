@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Service management script for c0-dev environment
-# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|codex-auth|build [-f]|clean|help]
+# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|build [-f]|clean|help]
 
 set -e
 
@@ -105,6 +105,122 @@ dc() {
 # =============================================================================
 # Helper functions
 # =============================================================================
+
+list_listening_tcp_ports() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP -sTCP:LISTEN -F n 2>/dev/null \
+            | sed -n 's/^n.*:\([0-9][0-9]*\) .*/\1/p; s/^n.*:\([0-9][0-9]*\)$/\1/p'
+        return 0
+    fi
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltn 2>/dev/null \
+            | awk '{print $4}' \
+            | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
+        return 0
+    fi
+
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -an 2>/dev/null \
+            | awk '$0 ~ /LISTEN/ {print $4}' \
+            | sed -n 's/.*[.:]\([0-9][0-9]*\)$/\1/p'
+        return 0
+    fi
+
+    echo "error: need one of: lsof, ss, netstat (to determine listening ports)" >&2
+    return 1
+}
+
+next_web_port() {
+    local start="${1:-3000}"
+    local end="${2:-4000}"
+
+    local ports
+    if ! ports="$(list_listening_tcp_ports)"; then
+        return 1
+    fi
+
+    local max_port
+    max_port="$(
+        printf '%s\n' "$ports" \
+            | awk -v s="$start" -v e="$end" '$1 ~ /^[0-9]+$/ && $1 >= s && $1 <= e {print $1}' \
+            | sort -n \
+            | tail -n 1
+    )"
+
+    if [[ -z "$max_port" ]]; then
+        echo "$start"
+        return 0
+    fi
+
+    local next=$((max_port + 1))
+    if [[ "$next" -gt "$end" ]]; then
+        echo "error: no ports left in range ${start}-${end} (max listening port is ${max_port})" >&2
+        return 1
+    fi
+
+    echo "$next"
+}
+
+get_mapped_web_port_from_container() {
+    local container_id="$1"
+    docker inspect -f '{{with (index .NetworkSettings.Ports "3000/tcp")}}{{(index . 0).HostPort}}{{end}}' "$container_id" 2>/dev/null || true
+}
+
+get_current_web_port() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local container_id
+    container_id="$(dc ps -aq "$MAIN_SERVICE" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$container_id" ]]; then
+        local mapped
+        mapped="$(get_mapped_web_port_from_container "$container_id")"
+        if [[ -n "$mapped" ]]; then
+            echo "$mapped"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${C0DEV_WEB_PORT:-}" ]]; then
+        echo "$C0DEV_WEB_PORT"
+        return 0
+    fi
+}
+
+ensure_web_port() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${C0DEV_WEB_PORT:-}" ]]; then
+        return 0
+    fi
+
+    local existing
+    existing="$(get_current_web_port || true)"
+    if [[ -n "$existing" ]]; then
+        C0DEV_WEB_PORT="$existing"
+        export C0DEV_WEB_PORT
+        return 0
+    fi
+
+    C0DEV_WEB_PORT="$(next_web_port 3000 4000)"
+    export C0DEV_WEB_PORT
+}
+
+print_web_port_mapping() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local port
+    port="$(get_current_web_port || true)"
+    if [[ -n "$port" ]]; then
+        echo -e "🌐 Port: ${YELLOW}host:${port}${NC} -> ${YELLOW}guest:3000${NC}"
+    fi
+}
 
 # Resolve a host path from a docker volume mapping into an absolute path.
 resolve_volume_host_path() {
@@ -423,6 +539,8 @@ build_tools_volume() {
 cmd_start() {
     require_host "start"
 
+    ensure_web_port
+
     # Validate host paths
     if ! validate_host_paths; then
         echo "error: fix missing paths before starting" >&2
@@ -437,6 +555,7 @@ cmd_start() {
 
     echo -e "🚀 Starting ${CYAN}$PROJECT_NAME${NC}..."
     dc up -d
+    print_web_port_mapping
     echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
 }
 
@@ -449,6 +568,7 @@ cmd_stop() {
 
 cmd_restart() {
     require_host "restart"
+    ensure_web_port
     echo -e "🔄 Restarting ${CYAN}$PROJECT_NAME${NC}..."
     dc down
 
@@ -463,6 +583,7 @@ cmd_restart() {
         fi
 
     dc up -d
+    print_web_port_mapping
     echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
 }
 
@@ -477,6 +598,17 @@ cmd_status() {
 
     if [[ -n "$C0_MODE" ]]; then
         echo -e "${BOLD}mode:${NC} $C0_MODE"
+    fi
+    echo ""
+
+    # Port mapping (if container exists)
+    echo -e "${BOLD}ports:${NC}"
+    local mapped_port
+    mapped_port="$(get_current_web_port || true)"
+    if [[ -n "$mapped_port" ]]; then
+        echo -e "  🌐 ${YELLOW}host:${mapped_port}${NC} -> ${YELLOW}guest:3000${NC}"
+    else
+        echo -e "  ${YELLOW}(none)${NC}"
     fi
     echo ""
 
@@ -549,12 +681,15 @@ cmd_status() {
 
 cmd_sh() {
     require_host "sh"
+    ensure_web_port
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
+        print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
         dc exec -u 1000 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash -l"
     else
+        print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev)"
         dc exec -u 1000 "$MAIN_SERVICE" bash -l
     fi
@@ -562,12 +697,15 @@ cmd_sh() {
 
 cmd_root() {
     require_host "root"
+    ensure_web_port
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
+        print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC}) @ ${YELLOW}projects/$project_path${NC}"
         dc exec -u 0 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash"
     else
+        print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC})"
         dc exec -u 0 "$MAIN_SERVICE" bash
     fi
@@ -585,16 +723,6 @@ cmd_cp_term() {
         infocmp -xa "$term" | docker exec -u 0 -i "$container_name" tic -x -o /usr/share/terminfo/ -
         echo -e "✅ Copied: ${CYAN}$term${NC}"
     done
-}
-
-cmd_codex_auth() {
-    echo "codex-auth: starting proxy on port 1455..."
-    echo "from host: open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')"
-        if [[ "$IN_CONTAINER" == "true" ]]; then
-        socat TCP-LISTEN:1455,bind="$(ip route get 1 | awk '{print $7}' | xargs)",fork TCP:127.0.0.1:1455
-    else
-        dc exec "$MAIN_SERVICE" bash -c "socat TCP-LISTEN:1455,bind=\$(ip route get 1 | awk '{print \$7}' | xargs),fork TCP:127.0.0.1:1455"
-    fi
 }
 
 cmd_build() {
@@ -691,17 +819,16 @@ cmd_clean() {
 cmd_help() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         cat <<EOF
-Usage: c0 {codex-auth|help}
+Usage: c0 {help}
 
 Commands (inside container):
-  codex-auth    Start Codex authentication proxy on port 1455
   help          Show this help message
 
 Note: Running inside container. Use 'exit' to return to host.
 EOF
     else
         cat <<EOF
-Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|codex-auth|build|clean|help}
+Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|help}
 
 Commands:
   start         Start all services
@@ -712,7 +839,6 @@ Commands:
   sh            Shell as dev user (uid 1000)
   root          Shell as root (uid 0)
   cp-term       Copy terminfo into container
-  codex-auth    Start Codex authentication proxy on port 1455
   build [-f]    Build tools and image (-f forces rebuild)
   clean [-a]    Remove tools for current Dockerfile hash (-a removes shared volume)
   help          Show this help message
@@ -736,7 +862,6 @@ case "${1:-}" in
     sh)         cmd_sh ;;
     root)       cmd_root ;;
     cp-term)    cmd_cp_term ;;
-    codex-auth) cmd_codex_auth ;;
     build)      shift; cmd_build "$@" ;;
     clean)      shift; cmd_clean "$@" ;;
     help|--help|-h)

@@ -4,7 +4,6 @@ x-environment-base: &env-base
   OLLAMA_HOST: http://host.docker.internal:11434
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
-  CODEX_PORT: "1455"
   TERM: ${TERM}
   # Shared tools prefix (symlinked to ~/.cargo etc. by entrypoint)
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
@@ -16,8 +15,7 @@ services:
       dockerfile: Dockerfile
     hostname: ${C0DEV_HOSTNAME:-c0dev}
     ports:
-      - 127.0.0.1:1455:1455
-      - 3000:3000
+      - "${C0DEV_WEB_PORT:-3000}:3000"
     working_dir: /home/dev
     tty: true
     environment:

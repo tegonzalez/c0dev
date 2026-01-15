@@ -4,7 +4,6 @@ x-environment-base: &env-base
   OLLAMA_HOST: http://host.docker.internal:11434
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
-  CODEX_PORT: "1455"
   TERM: ${TERM}
 
 services:
@@ -15,8 +14,7 @@ services:
     networks:
       - proxy-net
     ports:
-      - 127.0.0.1:1455:1455
-      - 3000:3000
+      - "${C0DEV_WEB_PORT:-3000}:3000"
     working_dir: /home/dev
     tty: true
     environment:
@@ -37,4 +35,3 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/16
-

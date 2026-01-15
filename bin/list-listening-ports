@@ -1,0 +1,63 @@
+#!/usr/bin/env sh
+set -eu
+
+usage() {
+  cat <<'EOF' >&2
+Usage: list-listening-ports [start] [end]
+
+Prints TCP listening ports in the inclusive range [start, end], one per line.
+
+Examples:
+  list-listening-ports 3000 4000
+  list-listening-ports            # defaults to 3000 4000
+EOF
+}
+
+start="${1:-3000}"
+end="${2:-4000}"
+
+case "$start" in
+  ''|*[!0-9]*) echo "error: start must be an integer, got: '$start'" >&2; usage; exit 2 ;;
+esac
+case "$end" in
+  ''|*[!0-9]*) echo "error: end must be an integer, got: '$end'" >&2; usage; exit 2 ;;
+esac
+
+if [ "$start" -gt "$end" ]; then
+  echo "error: start must be <= end, got: $start > $end" >&2
+  exit 2
+fi
+
+list_with_lsof() {
+  lsof -nP -iTCP -sTCP:LISTEN -F n 2>/dev/null \
+    | sed -n 's/^n.*:\([0-9][0-9]*\) .*/\1/p; s/^n.*:\([0-9][0-9]*\)$/\1/p'
+}
+
+list_with_ss() {
+  ss -H -ltn 2>/dev/null \
+    | awk '{print $4}' \
+    | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
+}
+
+list_with_netstat() {
+  netstat -an 2>/dev/null \
+    | awk '$0 ~ /LISTEN/ {print $4}' \
+    | sed -n 's/.*[.:]\([0-9][0-9]*\)$/\1/p'
+}
+
+if command -v lsof >/dev/null 2>&1; then
+  ports="$(list_with_lsof)"
+elif command -v ss >/dev/null 2>&1; then
+  ports="$(list_with_ss)"
+elif command -v netstat >/dev/null 2>&1; then
+  ports="$(list_with_netstat)"
+else
+  echo "error: need one of: lsof, ss, netstat" >&2
+  exit 1
+fi
+
+printf '%s\n' "$ports" \
+  | awk -v s="$start" -v e="$end" '$1 ~ /^[0-9]+$/ && $1 >= s && $1 <= e {print $1}' \
+  | sort -n \
+  | uniq
+

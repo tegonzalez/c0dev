@@ -51,6 +51,14 @@ fi
 # Mode and project naming
 # =============================================================================
 
+# =============================================================================
+# Web port allocation
+# =============================================================================
+
+# Host port range used to map guest:3000 -> host:<port>
+C0DEV_WEB_PORT_MIN=3000
+C0DEV_WEB_PORT_MAX=4000
+
 # C0_MODE validation: only "" (prod) or "dev" allowed
 if [[ -n "$C0_MODE" && "$C0_MODE" != "dev" ]]; then
     echo "error: C0_MODE must be empty (production) or 'dev', got: '$C0_MODE'" >&2
@@ -106,62 +114,6 @@ dc() {
 # Helper functions
 # =============================================================================
 
-list_listening_tcp_ports() {
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP -sTCP:LISTEN -F n 2>/dev/null \
-            | sed -n 's/^n.*:\([0-9][0-9]*\) .*/\1/p; s/^n.*:\([0-9][0-9]*\)$/\1/p'
-        return 0
-    fi
-
-    if command -v ss >/dev/null 2>&1; then
-        ss -H -ltn 2>/dev/null \
-            | awk '{print $4}' \
-            | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
-        return 0
-    fi
-
-    if command -v netstat >/dev/null 2>&1; then
-        netstat -an 2>/dev/null \
-            | awk '$0 ~ /LISTEN/ {print $4}' \
-            | sed -n 's/.*[.:]\([0-9][0-9]*\)$/\1/p'
-        return 0
-    fi
-
-    echo "error: need one of: lsof, ss, netstat (to determine listening ports)" >&2
-    return 1
-}
-
-next_web_port() {
-    local start="${1:-3000}"
-    local end="${2:-4000}"
-
-    local ports
-    if ! ports="$(list_listening_tcp_ports)"; then
-        return 1
-    fi
-
-    local max_port
-    max_port="$(
-        printf '%s\n' "$ports" \
-            | awk -v s="$start" -v e="$end" '$1 ~ /^[0-9]+$/ && $1 >= s && $1 <= e {print $1}' \
-            | sort -n \
-            | tail -n 1
-    )"
-
-    if [[ -z "$max_port" ]]; then
-        echo "$start"
-        return 0
-    fi
-
-    local next=$((max_port + 1))
-    if [[ "$next" -gt "$end" ]]; then
-        echo "error: no ports left in range ${start}-${end} (max listening port is ${max_port})" >&2
-        return 1
-    fi
-
-    echo "$next"
-}
-
 get_mapped_web_port_from_container() {
     local container_id="$1"
     docker inspect -f '{{with (index .NetworkSettings.Ports "3000/tcp")}}{{(index . 0).HostPort}}{{end}}' "$container_id" 2>/dev/null || true
@@ -198,15 +150,68 @@ ensure_web_port() {
         return 0
     fi
 
-    local existing
-    existing="$(get_current_web_port || true)"
-    if [[ -n "$existing" ]]; then
-        C0DEV_WEB_PORT="$existing"
-        export C0DEV_WEB_PORT
-        return 0
+    local start="$C0DEV_WEB_PORT_MIN"
+    local end="$C0DEV_WEB_PORT_MAX"
+    local ports_cmd="$C0ROOT/bin/list-listening-ports"
+    if [[ ! -x "$ports_cmd" ]]; then
+        echo "error: missing required helper: $ports_cmd" >&2
+        return 1
     fi
 
-    C0DEV_WEB_PORT="$(next_web_port 3000 4000)"
+    # Finds the first integer >= start that is not present in the provided set.
+    # Signature: first_gap_port <start> [ports...]
+    # Assumes the list is sorted ascending (as produced by bin/list-listening-ports).
+    first_gap_port() {
+        local start="$1"
+        shift
+
+        local candidate="$start"
+        local port
+        for port in "$@"; do
+            case "$port" in
+                ''|*[!0-9]*) continue ;;
+            esac
+
+            if [[ "$port" -lt "$candidate" ]]; then
+                continue
+            fi
+            if [[ "$port" -eq "$candidate" ]]; then
+                candidate=$((candidate + 1))
+                continue
+            fi
+
+            # port > candidate means candidate is a gap
+            echo "$candidate"
+            return 0
+        done
+
+        echo "$candidate"
+        return 0
+    }
+
+    local ports
+    if ! ports="$("$ports_cmd" "$start" "$end")"; then
+        return 1
+    fi
+
+    local next
+    local -a port_list=()
+    if [[ -n "$ports" ]]; then
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            port_list+=("$line")
+        done <<<"$ports"
+    fi
+
+    next="$(first_gap_port "$start" "${port_list[@]}")"
+
+    if [[ "$next" -gt "$end" ]]; then
+        echo "error: no ports left in range ${start}-${end}" >&2
+        return 1
+    fi
+
+    C0DEV_WEB_PORT="$next"
     export C0DEV_WEB_PORT
 }
 
@@ -554,7 +559,11 @@ cmd_start() {
         fi
 
     echo -e "🚀 Starting ${CYAN}$PROJECT_NAME${NC}..."
-    dc up -d
+    if ! dc up -d; then
+        echo "error: failed to start containers (port may already be in use)" >&2
+        echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
+        exit 1
+    fi
     print_web_port_mapping
     echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -582,7 +591,11 @@ cmd_restart() {
             exit 1
         fi
 
-    dc up -d
+    if ! dc up -d; then
+        echo "error: failed to restart containers (port may already be in use)" >&2
+        echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
+        exit 1
+    fi
     print_web_port_mapping
     echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -681,7 +694,6 @@ cmd_status() {
 
 cmd_sh() {
     require_host "sh"
-    ensure_web_port
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
@@ -697,7 +709,6 @@ cmd_sh() {
 
 cmd_root() {
     require_host "root"
-    ensure_web_port
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then

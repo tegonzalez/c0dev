@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF' >&2
 Usage: list-listening-ports [start] [end]
 
-Prints TCP listening ports in the inclusive range [start, end], one per line.
+Prints TCP ports in use (any TCP state) in the inclusive range [start, end], one per line.
 
 Examples:
   list-listening-ports 3000 4000
@@ -29,19 +29,19 @@ if [ "$start" -gt "$end" ]; then
 fi
 
 list_with_lsof() {
-  lsof -nP -iTCP -sTCP:LISTEN -F n 2>/dev/null \
+  lsof -nP -iTCP -F n 2>/dev/null \
     | sed -n 's/^n.*:\([0-9][0-9]*\) .*/\1/p; s/^n.*:\([0-9][0-9]*\)$/\1/p'
 }
 
 list_with_ss() {
-  ss -H -ltn 2>/dev/null \
+  ss -H -tn 2>/dev/null \
     | awk '{print $4}' \
     | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p'
 }
 
 list_with_netstat() {
   netstat -an 2>/dev/null \
-    | awk '$0 ~ /LISTEN/ {print $4}' \
+    | awk '$1 ~ /^tcp/ {print $4}' \
     | sed -n 's/.*[.:]\([0-9][0-9]*\)$/\1/p'
 }
 
@@ -60,4 +60,3 @@ printf '%s\n' "$ports" \
   | awk -v s="$start" -v e="$end" '$1 ~ /^[0-9]+$/ && $1 >= s && $1 <= e {print $1}' \
   | sort -n \
   | uniq
-

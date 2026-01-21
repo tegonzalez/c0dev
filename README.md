@@ -98,6 +98,12 @@ c0 status
 c0 build [-f]
 ```
 
+### Web Port Mapping
+- The container listens on `guest:3000`. The host port is auto-selected per `c0dev` checkout.
+- Auto-selection range: `3000–4000`. Allocation rule: first available port in the range (fills gaps).
+- The selected mapping is printed on `c0 start`, `c0 restart`, and `c0 status` as `host:<port> -> guest:3000`.
+- Override: `C0DEV_WEB_PORT=3001 c0 start`
+
 ## Authenticate Assistants
 
 ### Claude Code
@@ -131,7 +137,7 @@ These mappings keep credentials, tool installs, and in-progress work outside the
 ## Environment Defaults
 - Locale: `en_US.UTF-8`
 - Timezone: `America/Los_Angeles` (`TZ` build arg overrides)
-- Exposed ports: `3000` (general dev server)
+- Exposed ports: `host:<auto> -> guest:3000` (auto-selected in range `3000–4000`, override with `C0DEV_WEB_PORT`)
 - LLM provider: Ollama at `http://host.docker.internal:11434`
 - Default model: `gpt-oss:20b`
 

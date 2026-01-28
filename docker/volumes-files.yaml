@@ -4,5 +4,5 @@ x-volume-files: &files
     - ~/.gitconfig:/home/dev/.gitconfig
 
 services:
-  c0-dev:
+  c0dev:
     <<: *files

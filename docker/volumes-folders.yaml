@@ -8,7 +8,7 @@ x-volume-folders: &folders
     - tools-shared:/tools
 
 services:
-  c0-dev:
+  c0dev:
     <<: *folders
 
 volumes:

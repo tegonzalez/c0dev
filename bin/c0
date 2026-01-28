@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Service management script for c0-dev environment
+# Service management script for c0dev environment
 # Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|build [-f]|clean|help]
 
 set -e
@@ -90,7 +90,7 @@ TOOLS_PREFIX="/tools/opt/$DOCKERFILE_HASH"
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
 VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
-MAIN_SERVICE="c0-dev"
+MAIN_SERVICE="c0dev"
 CONTAINER_DEV_HOME="/home/dev"
 
 # =============================================================================
@@ -1018,12 +1018,73 @@ cmd_status() {
     parse_file_mappings _status_mapping
     echo ""
 
-    # Shared tools volume
-    echo -e "${BOLD}tools:${NC}"
-    if tools_volume_valid; then
-        echo -e "  ${GREEN}✓${NC} ${CYAN}$SHARED_TOOLS_VOLUME${NC} (${YELLOW}${DOCKERFILE_HASH:0:12}...${NC})"
+    # Workspaces (grouped by tools hash)
+    echo -e "${BOLD}workspaces:${NC}"
+    if tools_volume_exists; then
+        local pins_list
+        pins_list="$(list_all_pins)"
+        if [[ -n "$pins_list" ]]; then
+            local current_folder_id
+            current_folder_id="$(compute_folder_id 2>/dev/null || true)"
+
+            # Get unique hashes
+            local unique_hashes
+            unique_hashes="$(echo "$pins_list" | awk '{print $2}' | sort -u)"
+
+            # Display each hash group
+            while IFS= read -r hash; do
+                [[ -z "$hash" ]] && continue
+                echo -e "  📦 ${YELLOW}${hash:0:12}...${NC}"
+
+                # Display workspaces for this hash
+                while IFS=' ' read -r folder_id pin_hash c0root; do
+                    [[ "$pin_hash" != "$hash" ]] && continue
+                    [[ -z "$c0root" ]] && continue
+
+                    # Compute project name for this workspace
+                    local ws_mode=""
+                    if [[ "$folder_id" == *":dev" ]]; then
+                        ws_mode="dev"
+                    fi
+                    local ws_project_name
+                    if [[ "$ws_mode" == "dev" ]]; then
+                        ws_project_name="c0dev-dev-$(short_hash "${c0root}:dev")"
+                    else
+                        ws_project_name="c0dev-$(short_hash "$c0root")"
+                    fi
+
+                    # Check if running and get port
+                    local container_name="${ws_project_name}-${MAIN_SERVICE}"
+                    local is_running=false
+                    local port_info=""
+                    if docker ps --format "{{.Names}}" 2>/dev/null | grep -qF "$container_name"; then
+                        is_running=true
+                        local port
+                        port=$(docker ps --filter "name=$container_name" --format "{{.Ports}}" 2>/dev/null | sed -n 's/.*0\.0\.0\.0:\([0-9]*\).*/\1/p' | head -1)
+                        [[ -n "$port" ]] && port_info=", :$port"
+                    fi
+
+                    # Build status indicators
+                    local indicators=""
+                    if [[ "$is_running" == "true" ]]; then
+                        indicators="${GREEN}⚡${NC} "
+                    else
+                        indicators="   "
+                    fi
+                    if [[ -n "$current_folder_id" && "$folder_id" == "$current_folder_id" ]]; then
+                        indicators+="${BOLD}*${NC} "
+                    else
+                        indicators+="  "
+                    fi
+
+                    echo -e "    $indicators${CYAN}$c0root${NC} ${YELLOW}($container_name$port_info)${NC}"
+                done <<<"$pins_list"
+            done <<<"$unique_hashes"
+        else
+            echo -e "  ${YELLOW}(none)${NC}"
+        fi
     else
-        echo -e "  ${RED}✗${NC} ${CYAN}$SHARED_TOOLS_VOLUME${NC} (${YELLOW}${DOCKERFILE_HASH:0:12}...${NC}) - run 'c0 build'"
+        echo -e "  ${YELLOW}(none)${NC}"
     fi
 }
 
@@ -1222,7 +1283,7 @@ Commands:
   stop          Stop all services
   restart       Restart all services
   logs [svc]    Show logs (default: $MAIN_SERVICE)
-  status        Show service status and volume mappings
+  status        Show service status, volume mappings, and workspaces
   sh            Shell as dev user (uid 1000)
   root          Shell as root (uid 0)
   cp-term       Copy terminfo into container

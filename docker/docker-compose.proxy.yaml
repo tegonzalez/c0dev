@@ -7,7 +7,7 @@ x-environment-base: &env-base
   TERM: ${TERM}
 
 services:
-  c0-dev:
+  c0dev:
     build:
       context: .
       dockerfile: Dockerfile

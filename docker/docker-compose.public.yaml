@@ -9,7 +9,7 @@ x-environment-base: &env-base
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
 services:
-  c0-dev:
+  c0dev:
     build:
       context: .
       dockerfile: Dockerfile

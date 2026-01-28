@@ -109,6 +109,7 @@ c0 build [-f]
 ### Claude Code
 1. Run `claude setup-token` inside the container.
 2. Follow the browser prompt (Ghostty users can CMD+click the URL) and approve long-term access.
+ - from host: `open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')`
 3. Wait for the CLI to confirm the token was stored under `/home/dev/.claude.json` (persisted via the host volume).
 
 ### Codex CLI
@@ -155,3 +156,65 @@ These mappings keep credentials, tool installs, and in-progress work outside the
 ## Troubleshooting
 - Build failures: confirm Xcode is available for `infocmp`, rerun with `c0 build -f` to force rebuild
 - Volume issues: ensure host directories exist and remain writable before running `c0 build`
+
+## Debug: Tools Garbage Collection
+
+The c0dev tool implements automatic garbage collection for shared tools volume hashes to prevent unbounded growth while maintaining safety for running containers.
+
+### Key Concepts
+
+**Active Hashes**: Tool hashes currently used by running containers (detected via container labels). Never deleted.
+
+**Pinned Hashes**: Each folder's "latest successful build" hash, stored in `/tools/pins/<folder-id>.pin` within the shared volume. Persists until:
+- `c0 clean` is run in that folder
+- The folder is deleted from disk (becomes orphaned)
+- A new successful `c0 build` updates the pin
+
+**Garbage Collection**: Automatically removes hash directories from `/tools/opt/<hash>/` that are neither active nor pinned. Triggered only on:
+- Successful `c0 build` completion
+- `c0 clean` execution
+
+### Staged Rebuilds
+
+When forcing a rebuild (`c0 build -f`) of a hash currently active in running containers:
+- Tools are built and staged to `/tools/tmp/<hash>.next` instead of `/tools/opt/<hash>`
+- Promotion to `/tools/opt/<hash>` happens automatically when no instances use that hash
+- Promotion is checked at the start of `c0 build` and `c0 clean`
+
+### Inspecting State
+
+View active hashes from running containers:
+```bash
+# List running container IDs using tools volume
+docker ps -q --filter "volume=c0dev-tools-shared"
+
+# Check hash label from a container
+docker inspect <container-id> --format '{{ index .Config.Labels "c0dev.tools_hash" }}'
+```
+
+View pinned hashes in shared volume:
+```bash
+# List all pins
+docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
+
+# Read a specific pin
+docker run --rm -v c0dev-tools-shared:/tools alpine cat /tools/pins/<folder-id>.pin
+```
+
+View hash directories:
+```bash
+# List tool hash directories
+docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/opt
+
+# List staged .next builds
+docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/tmp
+```
+
+### Safety Guarantees
+
+- **Never deletes active hashes**: Running containers always protected
+- **Never modifies pins from containers**: Pin operations are host-only
+- **Never promotes staged builds while active**: Waits for instances to stop
+- **Never triggers GC on build failure**: Only successful builds clean up
+- **Never updates pins on build failure**: Pins represent last known good state
+- **Atomic operations**: Uses `.partial` → rename pattern for all promotions

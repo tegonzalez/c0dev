@@ -24,3 +24,7 @@ services:
       - /usr/local/bin/docker-entrypoint.sh
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    labels:
+      c0dev.tools_hash: ${DOCKERFILE_HASH}
+      c0dev.tools_volume: ${SHARED_TOOLS_VOLUME}
+      c0dev.project: ${C0DEV_HOSTNAME}

@@ -440,8 +440,313 @@ require_host() {
 }
 
 # =============================================================================
-# Build: tools volume (transactional)
+# Tools volume and runtime identity helpers (Phase 1)
 # =============================================================================
+
+# Check if tools volume exists
+tools_volume_exists() {
+    docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null
+}
+
+# Execute shell command in tools volume using alpine container
+tools_volume_sh() {
+    docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools" alpine sh -c "$*"
+}
+
+# List running container IDs using the shared tools volume
+list_running_container_ids_using_tools_volume() {
+    docker ps -q --filter "volume=$SHARED_TOOLS_VOLUME" 2>/dev/null || true
+}
+
+# Get tools hash label from a container
+get_tools_hash_label() {
+    local container_id="$1"
+    docker inspect "$container_id" --format '{{ index .Config.Labels "c0dev.tools_hash" }}' 2>/dev/null || true
+}
+
+# Get unique active hashes from running containers
+get_active_hashes() {
+    local -a hashes=()
+    local container_id hash
+
+    while IFS= read -r container_id; do
+        [[ -z "$container_id" ]] && continue
+        hash="$(get_tools_hash_label "$container_id")"
+        [[ -n "$hash" ]] && hashes+=("$hash")
+    done < <(list_running_container_ids_using_tools_volume)
+
+    # Return unique hashes (sorted)
+    if [[ ${#hashes[@]} -gt 0 ]]; then
+        printf '%s\n' "${hashes[@]}" | sort -u
+    fi
+}
+
+# =============================================================================
+# Pin management helpers (Phase 2)
+# =============================================================================
+
+# Compute folder identity (sha256 of C0ROOT:C0_MODE)
+compute_folder_id() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 1
+    fi
+    echo -n "${C0ROOT}:${C0_MODE}" | shasum -a 256 | cut -c1-64
+}
+
+# Get pin path for a folder ID
+pin_path_for_folder_id() {
+    local folder_id="$1"
+    echo "/tools/pins/${folder_id}.pin"
+}
+
+# Read pin for current folder (returns hash or empty)
+read_pin_for_folder_id() {
+    local folder_id="$1"
+    local pin_path
+    pin_path="$(pin_path_for_folder_id "$folder_id")"
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    local content
+    content="$(tools_volume_sh "cat '$pin_path' 2>/dev/null || true")"
+    if [[ -n "$content" ]]; then
+        echo "$content" | grep '^hash=' | cut -d= -f2
+    fi
+}
+
+# Write pin for current folder
+write_pin_for_folder_id() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local folder_id="$1"
+    local hash="$2"
+    local c0root="$3"
+    local mode="$4"
+    local pin_path
+    pin_path="$(pin_path_for_folder_id "$folder_id")"
+
+    local updated_at
+    updated_at="$(date +%s)"
+
+    tools_volume_sh "
+        mkdir -p /tools/pins
+        cat > '$pin_path' <<EOF
+hash=$hash
+c0root=$c0root
+mode=$mode
+updated_at=$updated_at
+EOF
+    " >/dev/null
+}
+
+# Delete pin for current folder
+delete_pin_for_folder_id() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local folder_id="$1"
+    local pin_path
+    pin_path="$(pin_path_for_folder_id "$folder_id")"
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    tools_volume_sh "rm -f '$pin_path'" >/dev/null 2>&1 || true
+}
+
+# List all pins (outputs: folder_id hash c0root on each line)
+list_all_pins() {
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    local pins_list
+    pins_list="$(tools_volume_sh "ls /tools/pins/*.pin 2>/dev/null || true")"
+    [[ -z "$pins_list" ]] && return 0
+
+    local pin_file
+    while IFS= read -r pin_file; do
+        [[ -z "$pin_file" ]] && continue
+        local folder_id
+        folder_id="$(basename "$pin_file" .pin)"
+        local content
+        content="$(tools_volume_sh "cat '$pin_file' 2>/dev/null || true")"
+        if [[ -n "$content" ]]; then
+            local hash c0root
+            hash="$(echo "$content" | grep '^hash=' | cut -d= -f2)"
+            c0root="$(echo "$content" | grep '^c0root=' | cut -d= -f2-)"
+            if [[ -n "$hash" && -n "$c0root" ]]; then
+                echo "$folder_id $hash $c0root"
+            fi
+        fi
+    done <<<"$pins_list"
+}
+
+# =============================================================================
+# Garbage collection helpers (Phase 5)
+# =============================================================================
+
+# Clean up orphan pins (pins for folders deleted from disk)
+cleanup_orphan_pins() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    local pin_info folder_id hash c0root
+    while read -r folder_id hash c0root; do
+        [[ -z "$folder_id" ]] && continue
+        if [[ ! -d "$c0root" ]]; then
+            # Folder deleted, remove orphan pin
+            delete_pin_for_folder_id "$folder_id"
+        fi
+    done < <(list_all_pins)
+}
+
+# Get all pinned hashes (from valid pins only)
+get_pinned_hashes() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    local -a hashes=()
+    local pin_info folder_id hash c0root
+    while read -r folder_id hash c0root; do
+        [[ -z "$folder_id" ]] && continue
+        if [[ -d "$c0root" ]]; then
+            hashes+=("$hash")
+        fi
+    done < <(list_all_pins)
+
+    # Return unique hashes (sorted)
+    if [[ ${#hashes[@]} -gt 0 ]]; then
+        printf '%s\n' "${hashes[@]}" | sort -u
+    fi
+}
+
+# Garbage collect unprotected hash directories
+gc_tools_hashes() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    # First, clean up orphan pins
+    cleanup_orphan_pins
+
+    # Compute protected set: active ∪ pinned
+    local active_hashes pinned_hashes
+    active_hashes="$(get_active_hashes)"
+    pinned_hashes="$(get_pinned_hashes)"
+
+    local -a protected=()
+    if [[ -n "$active_hashes" ]]; then
+        while IFS= read -r hash; do
+            [[ -n "$hash" ]] && protected+=("$hash")
+        done <<<"$active_hashes"
+    fi
+    if [[ -n "$pinned_hashes" ]]; then
+        while IFS= read -r hash; do
+            [[ -n "$hash" ]] && protected+=("$hash")
+        done <<<"$pinned_hashes"
+    fi
+
+    # Get unique protected hashes
+    local protected_set
+    if [[ ${#protected[@]} -gt 0 ]]; then
+        protected_set="$(printf '%s\n' "${protected[@]}" | sort -u)"
+    fi
+
+    # List existing hash dirs in /tools/opt
+    local hash_dirs
+    hash_dirs="$(tools_volume_sh "ls -1 /tools/opt 2>/dev/null || true")"
+    [[ -z "$hash_dirs" ]] && return 0
+
+    local hash
+    while IFS= read -r hash; do
+        [[ -z "$hash" ]] && continue
+
+        # Skip if not 64-hex hash
+        if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            continue
+        fi
+
+        # Skip if no completeness marker (weird/partial dir)
+        if ! tools_volume_sh "test -f '/tools/opt/$hash/.c0dev-complete'" 2>/dev/null; then
+            continue
+        fi
+
+        # Skip if protected (active or pinned)
+        if [[ -n "$protected_set" ]] && echo "$protected_set" | grep -qx "$hash"; then
+            continue
+        fi
+
+        # Not protected - remove it
+        if tools_volume_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
+            echo -e "  🗑️  GC: ${YELLOW}${hash:0:12}...${NC}"
+        fi
+    done <<<"$hash_dirs"
+}
+
+# =============================================================================
+# Build: tools volume (transactional) with staged rebuild support (Phase 4)
+# =============================================================================
+
+# Promote staged .next build to final location (if safe)
+maybe_promote_staged_next() {
+    local hash="$1"
+    local VOL="$SHARED_TOOLS_VOLUME"
+
+    if ! tools_volume_exists; then
+        return 0
+    fi
+
+    # Check if .next staging exists
+    if ! tools_volume_sh "test -d '/tools/tmp/$hash.next'" 2>/dev/null; then
+        return 0
+    fi
+
+    # Check if hash is still active
+    local active_hashes
+    active_hashes="$(get_active_hashes)"
+    if echo "$active_hashes" | grep -qx "$hash"; then
+        # Still active, cannot promote yet
+        return 0
+    fi
+
+    # Safe to promote
+    echo -e "  📥 Promoting staged build..."
+    if tools_volume_sh "
+        set -e
+        mkdir -p /tools/opt
+        rm -rf '/tools/opt/$hash.old'
+        if [ -d '/tools/opt/$hash' ]; then
+            mv '/tools/opt/$hash' '/tools/opt/$hash.old'
+        fi
+        mv '/tools/tmp/$hash.next' '/tools/opt/$hash'
+        rm -rf '/tools/opt/$hash.old'
+    " 2>/dev/null; then
+        echo -e "  ✅ Promoted: ${GREEN}/tools/opt/${hash:0:12}...${NC}"
+    else
+        echo "warning: failed to promote staged build" >&2
+    fi
+}
 
 build_tools_volume() {
     local force="${1:-false}"
@@ -449,6 +754,9 @@ build_tools_volume() {
     local H="$DOCKERFILE_HASH"
     local VOL="$SHARED_TOOLS_VOLUME"
     local TAG="c0dev-tools-builder:$H"
+
+    # Try to promote any staged .next build for this hash (Phase 4)
+    maybe_promote_staged_next "$H"
 
     # Check if rebuild needed
     if [[ "$force" != "true" ]] && tools_volume_valid; then
@@ -504,21 +812,48 @@ build_tools_volume() {
         return 1
     fi
 
-    # 5) Atomic promotion
-    echo -e "  📥 Promoting..."
-    if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
-        set -e
-        mkdir -p /tools/opt
-        rm -rf '/tools/opt/$H.old'
-        if [ -d '/tools/opt/$H' ]; then
-            mv '/tools/opt/$H' '/tools/opt/$H.old'
+    # 5) Check if hash is active - if so, stage instead of promoting (Phase 4)
+    local active_hashes
+    active_hashes="$(get_active_hashes)"
+    local is_active=false
+    if echo "$active_hashes" | grep -qx "$H"; then
+        is_active=true
+    fi
+
+    if [[ "$is_active" == "true" && "$force" == "true" ]]; then
+        # Stage to .next instead of promoting
+        echo -e "  📦 Staging (hash is active)..."
+        if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
+            set -e
+            mkdir -p /tools/tmp
+            rm -rf '/tools/tmp/$H.next.old'
+            if [ -d '/tools/tmp/$H.next' ]; then
+                mv '/tools/tmp/$H.next' '/tools/tmp/$H.next.old'
+            fi
+            mv '/tools/tmp/$H.partial' '/tools/tmp/$H.next'
+            rm -rf '/tools/tmp/$H.next.old'
+        "; then
+            trap - INT TERM
+            return 1
         fi
-        mv '/tools/tmp/$H.partial' '/tools/opt/$H'
-        rm -rf '/tools/opt/$H.old'
-        rm -rf '/tools/tmp/$H.partial'
-    "; then
-        trap - INT TERM
-        return 1
+        echo -e "  ⏸️  Staged: will promote after instances stop"
+    else
+        # Safe to promote directly
+        echo -e "  📥 Promoting..."
+        if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
+            set -e
+            mkdir -p /tools/opt
+            rm -rf '/tools/opt/$H.old'
+            if [ -d '/tools/opt/$H' ]; then
+                mv '/tools/opt/$H' '/tools/opt/$H.old'
+            fi
+            mv '/tools/tmp/$H.partial' '/tools/opt/$H'
+            rm -rf '/tools/opt/$H.old'
+            rm -rf '/tools/tmp/$H.partial'
+        "; then
+            trap - INT TERM
+            return 1
+        fi
     fi
 
     # 6) Post-verify
@@ -777,11 +1112,27 @@ cmd_build() {
     fi
 
     trap - INT TERM
+
+    # Update pin on successful build (Phase 3)
+    if [[ "$IN_CONTAINER" == "false" ]]; then
+        local folder_id
+        folder_id="$(compute_folder_id)"
+        if [[ -n "$folder_id" ]]; then
+            write_pin_for_folder_id "$folder_id" "$DOCKERFILE_HASH" "$C0ROOT" "$C0_MODE"
+        fi
+    fi
+
+    # Run garbage collection after successful build (Phase 5)
+    gc_tools_hashes
+
     echo -e "✅ ${GREEN}Build complete${NC}"
 }
 
 cmd_clean() {
     require_host "clean"
+
+    # Try to promote any staged .next build for current hash (Phase 4)
+    maybe_promote_staged_next "$DOCKERFILE_HASH"
 
     local clean_all=false
     if [[ "$1" == "--all" || "$1" == "-a" ]]; then
@@ -809,21 +1160,46 @@ cmd_clean() {
             fi
         fi
     else
-        # Remove only current hash folder
-        local H="$DOCKERFILE_HASH"
-        echo -e "🧹 Removing tools for hash ${YELLOW}${H:0:12}...${NC}"
-
+        # Remove current + pinned hash folders and unpin (Phase 3)
         if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
             echo -e "${YELLOW}volume $SHARED_TOOLS_VOLUME does not exist${NC}"
             return 0
         fi
 
-        if docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools" alpine rm -rf "/tools/opt/$H" 2>/dev/null; then
-            echo -e "✅ Removed: ${GREEN}/tools/opt/${H:0:12}...${NC}"
-        else
-            echo "error: failed to remove /tools/opt/$H" >&2
-            exit 1
+        local current_hash="$DOCKERFILE_HASH"
+        local pinned_hash=""
+        local folder_id
+        folder_id="$(compute_folder_id)"
+        if [[ -n "$folder_id" ]]; then
+            pinned_hash="$(read_pin_for_folder_id "$folder_id")"
         fi
+
+        # Collect unique hashes to remove
+        local -a hashes_to_remove=("$current_hash")
+        if [[ -n "$pinned_hash" && "$pinned_hash" != "$current_hash" ]]; then
+            hashes_to_remove+=("$pinned_hash")
+        fi
+
+        echo -e "🧹 Cleaning tools for this folder..."
+        for hash in "${hashes_to_remove[@]}"; do
+            if tools_volume_sh "test -d '/tools/opt/$hash'" 2>/dev/null; then
+                if tools_volume_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
+                    echo -e "  ✅ Removed: ${GREEN}/tools/opt/${hash:0:12}...${NC}"
+                else
+                    echo "error: failed to remove /tools/opt/$hash" >&2
+                    exit 1
+                fi
+            fi
+        done
+
+        # Delete pin file
+        if [[ -n "$folder_id" ]]; then
+            delete_pin_for_folder_id "$folder_id"
+            echo -e "  ✅ Removed pin"
+        fi
+
+        # Run garbage collection after clean (Phase 5)
+        gc_tools_hashes
     fi
 }
 
@@ -851,11 +1227,19 @@ Commands:
   root          Shell as root (uid 0)
   cp-term       Copy terminfo into container
   build [-f]    Build tools and image (-f forces rebuild)
-  clean [-a]    Remove tools for current Dockerfile hash (-a removes shared volume)
+                Pins current Dockerfile hash on success for this folder.
+                Triggers automatic cleanup of unpinned/inactive hashes.
+  clean [-a]    Remove tools for current + pinned hashes; unpins this folder.
+                Runs garbage collection. (-a removes entire shared volume)
   help          Show this help message
 
 Environment:
   C0_MODE       Set to 'dev' for dev mode (default: production)
+
+Notes:
+  - Each folder pins its latest successful build hash
+  - Active hashes (from running containers) are never garbage collected
+  - Force rebuild of active hash stages to .next, promotes after stop
 EOF
     fi
 }

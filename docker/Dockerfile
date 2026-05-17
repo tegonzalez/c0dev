@@ -27,31 +27,31 @@ WORKDIR /home/dev
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 
 # cursor CLI installs in ~/.local/
-RUN curl -fsSL https://cursor.com/install | bash
+RUN curl -fsS https://cursor.com/install | bash
 
 # factory.ai droid installs in ~/.local/
 RUN curl -fsSL https://app.factory.ai/cli | sh
 
 # graph-code (code-graph-rag) installs in ~/.local/
-WORKDIR /home/dev/.local/shared/
-RUN mkdir code-graph-rag
-WORKDIR /home/dev/.local/shared/code-graph-rag
-RUN git init
-RUN git fetch --depth=1 https://github.com/vitali87/code-graph-rag.git 0037ad482657995048540497db14776a2371c21f
-RUN git checkout FETCH_HEAD
-RUN ~/.local/bin/uv sync --extra treesitter-full
-RUN <<EOF cat >> .env
+# WORKDIR /home/dev/.local/shared/
+# RUN mkdir code-graph-rag
+# WORKDIR /home/dev/.local/shared/code-graph-rag
+# RUN git init
+# RUN git fetch --depth=1 https://github.com/vitali87/code-graph-rag.git 0037ad482657995048540497db14776a2371c21f
+# RUN git checkout FETCH_HEAD
+# RUN ~/.local/bin/uv sync --extra treesitter-full
+# RUN <<EOF cat >> .env
 # code-graph-rag env uses local ollama
-LOCAL_MODEL_ENDPOINT=http://host.docker.internal:11434/v1
-LOCAL_ORCHESTRATOR_MODEL_ID=gpt-oss:20b
-LOCAL_CYPHER_MODEL_ID=gpt-oss:20b
-LOCAL_MODEL_API_KEY=ollama
-EOF
-RUN make build-grammars
-RUN . ".venv/bin/activate" && python3 build_binary.py
+# LOCAL_MODEL_ENDPOINT=http://host.docker.internal:11434/v1
+# LOCAL_ORCHESTRATOR_MODEL_ID=gpt-oss:20b
+# LOCAL_CYPHER_MODEL_ID=gpt-oss:20b
+# LOCAL_MODEL_API_KEY=ollama
+# EOF
+# RUN make build-grammars
+# RUN . ".venv/bin/activate" && python3 build_binary.py
 
 # graph-code-linux-arm64
-RUN cp dist/* ../../bin/graph-code
+# RUN cp dist/* ../../bin/graph-code
 
 # semgrep
 RUN ~/.local/bin/uv tool install semgrep
@@ -64,13 +64,13 @@ ENV PATH="/home/dev/.cargo/bin:$PATH"
 RUN rustup target add wasm32-unknown-unknown
 
 # Install additional cargo tools
-RUN cargo install --git https://github.com/sharkdp/fd --rev v10.3.0
-# RUN cargo install --git https://github.com/BurntSushi/ripgrep --rev 15.1.0
+RUN cargo install --locked fd-find
 RUN cargo install --locked ripgrep
-# RUN cargo install --git https://github.com/ast-grep/ast-grep.git --rev 0.40.0 ast-grep
 RUN cargo install --locked ast-grep
-#RUN cargo install --git https://github.com/zellij-org/zellij.git --rev v0.43.1
 RUN cargo install --locked zellij
+RUN cargo install --locked nu
+
+# clean up cargo
 RUN cargo install --locked cargo-cache
 RUN cargo cache --remove-dir registry
 
@@ -83,7 +83,7 @@ RUN apt install -y \
     iproute2 iputils-ping net-tools socat netcat-traditional \
     tmux vim neovim \
     wget bat btop tree \
-    pandoc
+    pandoc poppler-utils
 
 # && rm -rf /var/lib/apt/lists/*
 
@@ -121,7 +121,7 @@ USER dev
 WORKDIR /home/dev
 
 # Add activation to profile
-RUN echo 'if [ -n "$BASH_VERSION" ]; then . "$HOME/bin/activate"; fi' >> ~/.profile
+RUN echo '. "$HOME/bin/activate"' >> ~/.profile
 
 # Ensure bash is available and set proper shell
 ENV SHELL=/bin/bash

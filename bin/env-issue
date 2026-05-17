@@ -1,0 +1,76 @@
+#!/bin/sh
+
+file=$(dirname $0)/../rules/env-issues.md
+
+usage() {
+	cat <<'EOF'
+Usage: env-issue [help|issues|resolve <id>]
+
+Commands:
+  usage        Print this help
+  help         Print header/instructions (everything before "## Issues")
+  issues       Print issue headers with line numbers + `[sig]` lines
+  resolve <id> Print resolution text for issue header at line <id>
+
+EOF
+}
+
+die() {
+	printf '%s\n' "$*" >&2
+	exit 2
+}
+
+require_cmd() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		die "env-issue: missing dependency: $1"
+	fi
+}
+
+require_file() {
+	if [ ! -r "$file" ]; then
+		die "env-issue: missing or unreadable env-errata.md in cwd"
+	fi
+}
+
+cmd=${1:-usage}
+
+case "$cmd" in
+	"" | usage | -h | --help)
+		usage
+		exit 0
+		;;
+	help)
+		require_cmd blk
+		require_file
+		blk -e '^## Issues$' "$file"
+		;;
+	issues)
+		require_cmd egrep
+		require_cmd awk
+		require_cmd blk
+		require_file
+		egrep -n "^## Issues|^### Issue: |\[sig\]" "$file" | blk -s "^[0-9]+:## Issues$" \
+			| awk '{ if ($0 ~ /^[0-9]+:### Issue: /) print; else { sub(/^[0-9]+:/, ""); print } }'
+		;;
+	resolve)
+		H=${2-}
+		case "$H" in
+			"" | *[!0-9]*)
+				die "env-issue: resolve requires a positive integer <id>"
+				;;
+		esac
+		if [ "$H" -le 0 ]; then
+			die "env-issue: resolve requires a positive integer <id>"
+		fi
+
+		require_cmd tail
+		require_cmd blk
+		require_file
+		tail -n +"$H" "$file" | blk -s '^### Issue:' | blk -s '^\*\*Resolution ' -e '^### Issue: '
+		;;
+	*)
+		usage
+		printf '%s\n' "env-issue: unknown command: $cmd" >&2
+		exit 2
+		;;
+esac

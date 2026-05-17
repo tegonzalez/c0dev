@@ -1,6 +1,8 @@
 x-volume-folders: &folders
   volumes:
     - ../.claude:/home/dev/.claude
+    - ../.cache:/home/dev/.cache
+    - ../.codex:/home/dev/.codex
     - ../.config:/home/dev/.config
     - ../rules:/home/dev/rules
     - ../projects:/home/dev/projects

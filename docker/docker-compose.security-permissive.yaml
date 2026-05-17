@@ -1,0 +1,13 @@
+# Default runtime security: cap_drop ALL with minimal cap_add for apt (c0 root).
+services:
+  c0dev:
+    privileged: false
+    security_opt:
+      - seccomp:seccomp/moby-default-seccomp.json
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID

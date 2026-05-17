@@ -152,6 +152,7 @@ These mappings keep credentials, tool installs, and in-progress work outside the
 ## Networking Notes
 - Container has public network access with host bridging
 - `host.docker.internal` resolves to the host for local services (e.g., Ollama)
+- **SSH agent:** if your shell has `SSH_AUTH_SOCK` set, `c0 start` forwards it automatically (guest path `/home/dev/.ssh-auth.sock`). On macOS/OrbStack the relay `/run/host-services/ssh-auth.sock` is used instead of the launchd path. Verify in the container: `test -S "$SSH_AUTH_SOCK" && ssh-add -l`.
 
 ## Troubleshooting
 - Build failures: confirm Xcode is available for `infocmp`, rerun with `c0 build -f` to force rebuild

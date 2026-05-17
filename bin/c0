@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Service management script for c0dev environment
-# Usage: ./c0 [start|stop|restart|logs|sh|root|status|cp-term|build [-f]|clean|help]
+# Usage: ./c0 [start [--cap-drop-all]|stop|restart [--cap-drop-all]|...|help]
 
 set -e
 
@@ -31,6 +31,11 @@ REQUIRED_FILES=(
     "$C0ROOT/docker/volumes-folders.yaml"
     "$C0ROOT/docker/volumes-files.yaml"
     "$C0ROOT/docker/Dockerfile"
+    "$C0ROOT/docker/seccomp/moby-default-seccomp.json"
+    "$C0ROOT/docker/seccomp/moby-default-seccomp.sha256"
+    "$C0ROOT/docker/seccomp/moby-seccomp.tag"
+    "$C0ROOT/docker/docker-compose.security-permissive.yaml"
+    "$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -88,26 +93,494 @@ TOOLS_PREFIX="/tools/opt/$DOCKERFILE_HASH"
 # =============================================================================
 
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
+COMPOSE_SECURITY_PERMISSIVE="$C0ROOT/docker/docker-compose.security-permissive.yaml"
+COMPOSE_SECURITY_CAP_DROP_ALL="$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
+COMPOSE_SSH_AUTH_FILE="$C0ROOT/docker/.compose.ssh-auth.yaml"
+C0_SSH_AUTH_SOCK_GUEST="/home/dev/.ssh-auth.sock"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
 VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
 MAIN_SERVICE="c0dev"
 CONTAINER_DEV_HOME="/home/dev"
+
+# Vendored Moby reference seccomp (tag in docker/seccomp/moby-seccomp.tag)
+SECCOMP_DIR="$C0ROOT/docker/seccomp"
+SECCOMP_PROFILE_JSON="$SECCOMP_DIR/moby-default-seccomp.json"
+SECCOMP_PROFILE_SHA="$SECCOMP_DIR/moby-default-seccomp.sha256"
+SECCOMP_LOCAL_TAG_FILE="$SECCOMP_DIR/moby-seccomp.tag"
+MOBY_PROFILES_GIT_URL="${MOBY_PROFILES_GIT_URL:-https://github.com/moby/profiles.git}"
+# Cache remote "latest" probe (git ls-remote + raw profile sha256); TTL limits network (seconds)
+C0_SECCOMP_REMOTE_CACHE_TTL="${C0_SECCOMP_REMOTE_CACHE_TTL:-21600}"
+C0_SECCOMP_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/c0dev"
+C0_SECCOMP_REMOTE_CACHE="$C0_SECCOMP_CACHE_DIR/moby-seccomp-remote.cache"
+
+# Ephemeral docker run helpers (tools volume I/O, unpack): align with least-privilege posture.
+# Runtime service hardening: docker-compose.security-*.yaml (selected via C0_SECURITY).
+c0_docker_run() {
+    docker run --rm \
+        --security-opt no-new-privileges:true \
+        --cap-drop ALL \
+        "$@"
+}
+
+# Refuse start/build if vendored seccomp was tampered with or removed.
+verify_moby_seccomp_profile() {
+    if [[ ! -f "$SECCOMP_PROFILE_JSON" ]]; then
+        echo "error: seccomp profile missing: $SECCOMP_PROFILE_JSON" >&2
+        return 1
+    fi
+    if [[ ! -f "$SECCOMP_PROFILE_SHA" ]]; then
+        echo "error: seccomp checksum file missing: $SECCOMP_PROFILE_SHA" >&2
+        return 1
+    fi
+    if ! (cd "$SECCOMP_DIR" && shasum -a 256 -c "moby-default-seccomp.sha256"); then
+        echo "error: seccomp profile failed checksum verification" >&2
+        return 1
+    fi
+    return 0
+}
+
+# --- Moby seccomp: query upstream, optional cache, user-driven upgrade (see cmd_seccomp_upgrade) ---
+
+read_local_seccomp_tag() {
+    if [[ ! -f "$SECCOMP_LOCAL_TAG_FILE" ]]; then
+        echo ""
+        return 0
+    fi
+    tr -d ' \t\r\n' <"$SECCOMP_LOCAL_TAG_FILE" | head -c 200
+}
+
+read_local_seccomp_profile_sha256() {
+    if [[ ! -f "$SECCOMP_PROFILE_SHA" ]]; then
+        echo ""
+        return 0
+    fi
+    awk '{print $1; exit}' "$SECCOMP_PROFILE_SHA"
+}
+
+# Resolve latest seccomp/vM.m.p on upstream using git ls-remote (TLS to GitHub).
+# Annotated tags: use peeled refs/tags/...^{}; lightweight: single ref line.
+# Prints: remote_tag<TAB>commit_oid on stdout; return 1 if none or git missing.
+moby_seccomp_resolve_upstream_latest() {
+    if ! command -v git &>/dev/null; then
+        return 1
+    fi
+    local lsout
+    lsout="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags "$MOBY_PROFILES_GIT_URL" 2>/dev/null)" || return 1
+    [[ -z "$lsout" ]] && return 1
+
+    local pairs
+    pairs="$(echo "$lsout" | awk '
+    $2 ~ /^refs\/tags\/seccomp\/v[0-9]+\.[0-9]+\.[0-9]+\^\{\}$/ {
+      n = $2
+      sub(/^refs\/tags\//,"",n)
+      sub(/\^\{\}$/,"",n)
+      pe[n] = $1
+      next
+    }
+    $2 ~ /^refs\/tags\/seccomp\/v[0-9]+\.[0-9]+\.[0-9]+$/ {
+      n = $2
+      sub(/^refs\/tags\//,"",n)
+      lw[n] = $1
+      next
+    }
+    END {
+      for (n in lw) {
+        if (n in pe) print n "\t" pe[n]
+        else print n "\t" lw[n]
+      }
+    }')" || true
+    [[ -z "$pairs" ]] && return 1
+
+    local best_line
+    best_line="$(
+        while IFS=$'\t' read -r tag commit; do
+            [[ -z "$tag" || -z "$commit" ]] && continue
+            local ver="${tag#seccomp/v}"
+            [[ "$ver" == "$tag" ]] && continue
+            printf '%s\t%s\t%s\n' "$ver" "$tag" "$commit"
+        done <<<"$pairs" | sort -t$'\t' -k1,1V | tail -1
+    )" || true
+    [[ -z "$best_line" ]] && return 1
+
+    local remote_tag remote_commit
+    remote_tag="$(echo "$best_line" | cut -f2)"
+    remote_commit="$(echo "$best_line" | cut -f3)"
+    [[ -z "$remote_tag" || -z "$remote_commit" ]] && return 1
+    printf '%s\t%s\n' "$remote_tag" "$remote_commit"
+}
+
+# Exit 0 if $1 is semver-newer than $2 (both seccomp/vM.m.p); else 1.
+moby_seccomp_tag_a_gt_b() {
+    local a="${1#seccomp/v}"
+    local b="${2#seccomp/v}"
+    if [[ "$a" == "$1" || "$b" == "$2" ]]; then
+        return 1
+    fi
+    if [[ "$(printf '%s\n' "$b" "$a" | sort -V | tail -1)" == "$a" ]] && [[ "$a" != "$b" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# sha256 of default.json body for a tag (hex only).
+moby_seccomp_profile_sha256_for_tag() {
+    local tag="$1"
+    local url="https://raw.githubusercontent.com/moby/profiles/refs/tags/${tag}/seccomp/default.json"
+    curl -fsSL --connect-timeout 5 --max-time 45 \
+        -H "User-Agent: c0dev-seccomp-check" \
+        "$url" 2>/dev/null | shasum -a 256 | awk '{print $1}'
+}
+
+moby_seccomp_remote_cache_read_field() {
+    local key="$1"
+    [[ ! -f "$C0_SECCOMP_REMOTE_CACHE" ]] && return 0
+    grep "^${key}=" "$C0_SECCOMP_REMOTE_CACHE" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+moby_seccomp_remote_cache_write() {
+    local latest_tag="$1"
+    local commit_sha="$2"
+    local profile_sha="$3"
+    mkdir -p "$C0_SECCOMP_CACHE_DIR"
+    local now
+    now="$(date +%s)"
+    cat >"$C0_SECCOMP_REMOTE_CACHE" <<EOF
+checked_epoch=$now
+latest_tag=$latest_tag
+commit_sha=$commit_sha
+profile_sha256=$profile_sha
+EOF
+}
+
+moby_seccomp_remote_cache_valid() {
+    [[ ! -f "$C0_SECCOMP_REMOTE_CACHE" ]] && return 1
+    local checked
+    checked="$(moby_seccomp_remote_cache_read_field checked_epoch)"
+    [[ -z "$checked" ]] && return 1
+    local now age
+    now="$(date +%s)"
+    age=$((now - checked))
+    [[ "$age" -lt "$C0_SECCOMP_REMOTE_CACHE_TTL" ]]
+}
+
+# After verify_moby: optionally notify if upstream has a newer seccomp tag than vendored.
+# Set C0_SECCOMP_NOTIFY=0 to skip. Uses git ls-remote + curl (no JSON parser); failures are silent.
+maybe_notify_seccomp_update_available() {
+    if [[ "${C0_SECCOMP_NOTIFY:-1}" == "0" ]]; then
+        return 0
+    fi
+    if ! command -v git &>/dev/null; then
+        return 0
+    fi
+
+    local local_tag profile_local
+    local_tag="$(read_local_seccomp_tag)"
+    profile_local="$(read_local_seccomp_profile_sha256)"
+    if [[ -z "$local_tag" ]]; then
+        return 0
+    fi
+
+    local remote_tag remote_commit remote_profile use_cache=false
+    if moby_seccomp_remote_cache_valid; then
+        remote_tag="$(moby_seccomp_remote_cache_read_field latest_tag)"
+        remote_commit="$(moby_seccomp_remote_cache_read_field commit_sha)"
+        remote_profile="$(moby_seccomp_remote_cache_read_field profile_sha256)"
+        if [[ -n "$remote_tag" && -n "$remote_profile" ]]; then
+            use_cache=true
+        fi
+    fi
+
+    if [[ "$use_cache" != true ]]; then
+        local pair
+        if ! pair="$(moby_seccomp_resolve_upstream_latest)"; then
+            return 0
+        fi
+        remote_tag="$(echo "$pair" | cut -f1)"
+        remote_commit="$(echo "$pair" | cut -f2)"
+        [[ -z "$remote_tag" ]] && return 0
+        remote_profile="$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
+        [[ -z "$remote_profile" ]] && return 0
+        moby_seccomp_remote_cache_write "$remote_tag" "$remote_commit" "$remote_profile"
+    fi
+
+    if ! moby_seccomp_tag_a_gt_b "$remote_tag" "$local_tag"; then
+        return 0
+    fi
+
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "" >&2
+    echo -e "${YELLOW}${BOLD}c0 seccomp:${NC} newer Moby profile available than vendored copy." >&2
+    echo -e "  ${BOLD}upstream tag:${NC}           ${CYAN}$remote_tag${NC}" >&2
+    echo -e "  ${BOLD}upstream commit (git):${NC}    ${CYAN}$remote_commit${NC}" >&2
+    echo -e "  ${BOLD}upstream profile sha256:${NC} ${CYAN}$remote_profile${NC}" >&2
+    echo -e "  ${BOLD}vendored tag:${NC}            ${MAGENTA}$local_tag${NC}" >&2
+    echo -e "  ${BOLD}vendored profile sha256:${NC} ${MAGENTA}$profile_local${NC}" >&2
+    echo -e "  ${BOLD}notice generated (UTC):${NC}   $ts" >&2
+    echo -e "  Run ${GREEN}c0 seccomp-upgrade${NC} to download and replace ${CYAN}docker/seccomp/*${NC} (optional: ${GREEN}--dry-run${NC})." >&2
+    echo "" >&2
+    return 0
+}
+
+cmd_seccomp_upgrade() {
+    require_host "seccomp-upgrade"
+
+    if ! command -v git &>/dev/null; then
+        echo "error: git is required for seccomp-upgrade (git ls-remote to moby/profiles)" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$SECCOMP_LOCAL_TAG_FILE" ]] || [[ -z "$(read_local_seccomp_tag)" ]]; then
+        echo "error: missing or empty $SECCOMP_LOCAL_TAG_FILE" >&2
+        exit 1
+    fi
+
+    local dry_run=false
+    if [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]]; then
+        dry_run=true
+    fi
+
+    local pair remote_tag remote_commit
+    if ! pair="$(moby_seccomp_resolve_upstream_latest)"; then
+        echo "error: git ls-remote failed or no seccomp/vM.m.p tags (network, auth, or repo URL)" >&2
+        exit 1
+    fi
+    remote_tag="$(echo "$pair" | cut -f1)"
+    remote_commit="$(echo "$pair" | cut -f2)"
+
+    local local_tag
+    local_tag="$(read_local_seccomp_tag)"
+
+    if [[ "$remote_tag" == "$local_tag" ]]; then
+        echo -e "${GREEN}seccomp:${NC} already on latest Moby tag ${CYAN}$remote_tag${NC}"
+        moby_seccomp_remote_cache_write "$remote_tag" "$remote_commit" "$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
+        exit 0
+    fi
+
+    if ! moby_seccomp_tag_a_gt_b "$remote_tag" "$local_tag"; then
+        echo -e "${YELLOW}seccomp:${NC} vendored tag ${MAGENTA}$local_tag${NC} is newer than upstream latest ${CYAN}$remote_tag${NC} (no downgrade)." >&2
+        exit 0
+    fi
+
+    local remote_profile url
+    remote_profile="$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
+    if [[ -z "$remote_profile" ]]; then
+        echo "error: failed to download or hash profile for $remote_tag" >&2
+        exit 1
+    fi
+    url="https://raw.githubusercontent.com/moby/profiles/refs/tags/${remote_tag}/seccomp/default.json"
+
+    echo -e "${BOLD}Moby seccomp upgrade${NC}"
+    echo -e "  from: ${MAGENTA}$local_tag${NC} (profile sha256 $(read_local_seccomp_profile_sha256))"
+    echo -e "  to:   ${CYAN}$remote_tag${NC}"
+    echo -e "  commit (git peeled ref): ${CYAN}$remote_commit${NC}"
+    echo -e "  new profile sha256: ${CYAN}$remote_profile${NC}"
+    echo -e "  url: ${BLUE}$url${NC}"
+
+    if [[ "$dry_run" == true ]]; then
+        echo -e "${YELLOW}dry-run:${NC} no files written. Remove --dry-run to apply."
+        exit 0
+    fi
+
+    local tmpjson
+    tmpjson="$(mktemp "${TMPDIR:-/tmp}/c0-seccomp-json.XXXXXX")"
+    if ! curl -fsSL --connect-timeout 5 --max-time 60 \
+        -H "User-Agent: c0dev-seccomp-check" \
+        "$url" -o "$tmpjson"; then
+        rm -f "$tmpjson"
+        echo "error: failed to download profile" >&2
+        exit 1
+    fi
+    local gotsha
+    gotsha="$(shasum -a 256 "$tmpjson" | awk '{print $1}')"
+    if [[ "$gotsha" != "$remote_profile" ]]; then
+        rm -f "$tmpjson"
+        echo "error: downloaded profile sha256 mismatch (expected $remote_profile got $gotsha)" >&2
+        exit 1
+    fi
+
+    mv "$tmpjson" "$SECCOMP_PROFILE_JSON"
+    (
+        cd "$SECCOMP_DIR" || exit 1
+        shasum -a 256 moby-default-seccomp.json >moby-default-seccomp.sha256.tmp
+        mv moby-default-seccomp.sha256.tmp moby-default-seccomp.sha256
+    )
+    printf '%s\n' "$remote_tag" >"$SECCOMP_LOCAL_TAG_FILE"
+    rm -f "$C0_SECCOMP_REMOTE_CACHE" 2>/dev/null || true
+
+    if ! verify_moby_seccomp_profile; then
+        echo "error: upgraded files failed verification (restore from git)" >&2
+        exit 1
+    fi
+
+    echo -e "${GREEN}seccomp:${NC} wrote ${CYAN}$SECCOMP_PROFILE_JSON${NC}, checksum, and ${CYAN}$SECCOMP_LOCAL_TAG_FILE${NC}"
+    exit 0
+}
+
+# =============================================================================
+# C0_SECURITY: permissive (default) | cap-drop-all — env or start/restart --cap-drop-all
+# =============================================================================
+
+validate_c0_security_value() {
+    case "$1" in
+        permissive|cap-drop-all) return 0 ;;
+        *)
+            echo "error: C0_SECURITY must be 'permissive' or 'cap-drop-all', got: '$1'" >&2
+            return 1
+            ;;
+    esac
+}
+
+c0_security_compose_file() {
+    case "$C0_SECURITY" in
+        permissive) echo "$COMPOSE_SECURITY_PERMISSIVE" ;;
+        cap-drop-all) echo "$COMPOSE_SECURITY_CAP_DROP_ALL" ;;
+        *)
+            echo "error: internal: unknown C0_SECURITY=$C0_SECURITY" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Running container label (docker inspect; does not use compose).
+get_running_container_security_mode() {
+    local cid
+    cid="$(docker ps -aq -f "label=c0dev.project=${PROJECT_NAME}" 2>/dev/null | head -n 1 || true)"
+    [[ -z "$cid" ]] && return 0
+    docker inspect "$cid" --format '{{ index .Config.Labels "c0dev.security_mode" }}' 2>/dev/null || true
+}
+
+# For dc and display when not starting: match running container, else env, else permissive.
+ensure_c0_security_resolved() {
+    if [[ -n "${C0_SECURITY_RESOLVED:-}" ]]; then
+        return 0
+    fi
+
+    local from_container
+    from_container="$(get_running_container_security_mode)"
+    if [[ -n "$from_container" ]]; then
+        if ! validate_c0_security_value "$from_container"; then
+            return 1
+        fi
+        C0_SECURITY="$from_container"
+    elif [[ -n "${C0_SECURITY:-}" ]]; then
+        if ! validate_c0_security_value "$C0_SECURITY"; then
+            return 1
+        fi
+    else
+        C0_SECURITY="permissive"
+    fi
+    export C0_SECURITY
+}
+
+# start/restart only: --cap-drop-all overrides env; default permissive.
+resolve_c0_security_for_start() {
+    local cli_cap_drop_all=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --cap-drop-all) cli_cap_drop_all=true ;;
+            *)
+                echo "error: unknown option: $arg (try --cap-drop-all)" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ "$cli_cap_drop_all" == true ]]; then
+        C0_SECURITY="cap-drop-all"
+    elif [[ -n "${C0_SECURITY:-}" ]]; then
+        if ! validate_c0_security_value "$C0_SECURITY"; then
+            return 1
+        fi
+    else
+        C0_SECURITY="permissive"
+    fi
+    export C0_SECURITY
+    export C0_SECURITY_RESOLVED=1
+}
+
+print_security_mode() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+    ensure_c0_security_resolved || return 0
+    echo -e "🔒 Security: ${YELLOW}${C0_SECURITY}${NC}"
+}
+
+# =============================================================================
+# SSH agent: use shell SSH_AUTH_SOCK; macOS/OrbStack uses VM relay (not launchd path)
+# =============================================================================
+
+# Darwin + OrbStack/Docker Desktop: bind relay, not $SSH_AUTH_SOCK (launchd path → guest directory).
+resolve_ssh_auth_sock_bind_source() {
+    C0_SSH_AUTH_SOCK_BIND_SOURCE=""
+    [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        C0_SSH_AUTH_SOCK_BIND_SOURCE="/run/host-services/ssh-auth.sock"
+    elif [[ -S "$SSH_AUTH_SOCK" ]]; then
+        C0_SSH_AUTH_SOCK_BIND_SOURCE="$SSH_AUTH_SOCK"
+    else
+        echo -e "${YELLOW}warning:${NC} SSH_AUTH_SOCK is set but not a socket: ${SSH_AUTH_SOCK}" >&2
+        echo -e "  SSH agent will not be available in the container (ssh/git may prompt)." >&2
+        return 0
+    fi
+    export C0_SSH_AUTH_SOCK_BIND_SOURCE
+}
+
+ensure_ssh_auth_compose_fragment() {
+    resolve_ssh_auth_sock_bind_source
+    if [[ -z "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
+        rm -f "$COMPOSE_SSH_AUTH_FILE"
+        return 0
+    fi
+    cat >"$COMPOSE_SSH_AUTH_FILE" <<EOF
+services:
+  c0dev:
+    volumes:
+      - ${C0_SSH_AUTH_SOCK_BIND_SOURCE}:${C0_SSH_AUTH_SOCK_GUEST}
+EOF
+}
+
+print_ssh_auth_mapping() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+    [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
+    resolve_ssh_auth_sock_bind_source
+    if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
+        echo -e "🔑 SSH agent: ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+    fi
+}
 
 # =============================================================================
 # Helper: docker-compose wrapper with project isolation
 # =============================================================================
 
 dc() {
+    ensure_c0_security_resolved || return 1
+    local security_file
+    security_file="$(c0_security_compose_file)" || return 1
+    ensure_ssh_auth_compose_fragment
+
     export SHARED_TOOLS_VOLUME
     export TOOLS_PREFIX
     export DOCKERFILE_HASH
     export C0DEV_HOSTNAME="$PROJECT_NAME"
-    docker compose \
-        -p "$PROJECT_NAME" \
-        -f "$VOLUMES_FOLDERS_FILE" \
-        -f "$VOLUMES_FILES_FILE" \
-        -f "$COMPOSE_PUBLIC_FILE" \
-        "$@"
+    export C0_SECURITY
+
+    local -a compose_files=(
+        -f "$VOLUMES_FOLDERS_FILE"
+        -f "$VOLUMES_FILES_FILE"
+        -f "$COMPOSE_PUBLIC_FILE"
+        -f "$security_file"
+    )
+    if [[ -f "$COMPOSE_SSH_AUTH_FILE" ]]; then
+        compose_files+=(-f "$COMPOSE_SSH_AUTH_FILE")
+    fi
+
+    docker compose -p "$PROJECT_NAME" "${compose_files[@]}" "$@"
 }
 
 # =============================================================================
@@ -413,7 +886,7 @@ tools_volume_valid() {
     fi
 
     # Check if completeness marker exists
-    docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools:ro" alpine \
+    c0_docker_run -v "$SHARED_TOOLS_VOLUME:/tools:ro" alpine \
         test -f "/tools/opt/$DOCKERFILE_HASH/.c0dev-complete" 2>/dev/null
 }
 
@@ -450,7 +923,7 @@ tools_volume_exists() {
 
 # Execute shell command in tools volume using alpine container
 tools_volume_sh() {
-    docker run --rm -v "$SHARED_TOOLS_VOLUME:/tools" alpine sh -c "$*"
+    c0_docker_run -v "$SHARED_TOOLS_VOLUME:/tools" alpine sh -c "$*"
 }
 
 # List running container IDs using the shared tools volume
@@ -755,6 +1228,10 @@ build_tools_volume() {
     local VOL="$SHARED_TOOLS_VOLUME"
     local TAG="c0dev-tools-builder:$H"
 
+    if ! verify_moby_seccomp_profile; then
+        return 1
+    fi
+
     # Try to promote any staged .next build for this hash (Phase 4)
     maybe_promote_staged_next "$H"
 
@@ -775,7 +1252,7 @@ build_tools_volume() {
         echo -e "\n${RED}build interrupted${NC}" >&2
         docker rmi "$TAG" 2>/dev/null || true
         # Remove partial temp dir
-        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
         exit 130
     }
     trap _build_cleanup INT TERM
@@ -783,8 +1260,9 @@ build_tools_volume() {
     # 1) Ensure volume exists
     docker volume create "$VOL" >/dev/null
 
-    # 2) Build tools image
+    # 2) Build tools image (BuildKit builder is short-lived; service hardening is in compose at runtime)
     echo -e "  🔧 Building tools-builder stage..."
+    export DOCKER_BUILDKIT=1
     if ! docker build $nocache --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
         trap - INT TERM
         return 1
@@ -792,23 +1270,23 @@ build_tools_volume() {
 
     # 3) Stream tarball from tools image into volume temp dir
     echo -e "  📤 Extracting to temp..."
-    if ! (docker run --rm "$TAG" sh -lc 'tar -C /home/dev -cf - .cargo .rustup .local' | \
-        docker run --rm -i -v "$VOL:/tools" alpine sh -c "
+    if ! (c0_docker_run "$TAG" sh -lc 'tar -C /home/dev -cf - .cargo .rustup .local' | \
+        c0_docker_run -i -v "$VOL:/tools" alpine sh -c "
             set -e
             rm -rf '/tools/tmp/$H.partial'
             mkdir -p '/tools/tmp/$H.partial'
             tar -C '/tools/tmp/$H.partial' -xf -
         "); then
         trap - INT TERM
-        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
         return 1
     fi
 
     # 4) Write completeness marker
     echo -e "  ✓ Marking complete..."
-    if ! docker run --rm -v "$VOL:/tools" alpine touch "/tools/tmp/$H.partial/.c0dev-complete"; then
+    if ! c0_docker_run -v "$VOL:/tools" alpine touch "/tools/tmp/$H.partial/.c0dev-complete"; then
         trap - INT TERM
-        docker run --rm -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
         return 1
     fi
 
@@ -823,7 +1301,7 @@ build_tools_volume() {
     if [[ "$is_active" == "true" && "$force" == "true" ]]; then
         # Stage to .next instead of promoting
         echo -e "  📦 Staging (hash is active)..."
-        if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
+        if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
             set -e
             mkdir -p /tools/tmp
             rm -rf '/tools/tmp/$H.next.old'
@@ -840,7 +1318,7 @@ build_tools_volume() {
     else
         # Safe to promote directly
         echo -e "  📥 Promoting..."
-        if ! docker run --rm -v "$VOL:/tools" alpine sh -c "
+        if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
             set -e
             mkdir -p /tools/opt
             rm -rf '/tools/opt/$H.old'
@@ -857,7 +1335,7 @@ build_tools_volume() {
     fi
 
     # 6) Post-verify
-    if ! docker run --rm -v "$VOL:/tools:ro" alpine test -f "/tools/opt/$H/.c0dev-complete"; then
+    if ! c0_docker_run -v "$VOL:/tools:ro" alpine test -f "/tools/opt/$H/.c0dev-complete"; then
         echo "error: tools build failed - completeness marker missing" >&2
         trap - INT TERM
         return 1
@@ -879,13 +1357,21 @@ build_tools_volume() {
 cmd_start() {
     require_host "start"
 
+    resolve_c0_security_for_start "$@" || exit 1
+
     ensure_web_port
+
+    if ! verify_moby_seccomp_profile; then
+        echo "error: seccomp profile verification failed" >&2
+        exit 1
+    fi
+    maybe_notify_seccomp_update_available || true
 
     # Validate host paths
     if ! validate_host_paths; then
         echo "error: fix missing paths before starting" >&2
-            exit 1
-        fi
+        exit 1
+    fi
 
     # Check tools volume
     if ! tools_volume_valid; then
@@ -899,6 +1385,8 @@ cmd_start() {
         echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
         exit 1
     fi
+    print_security_mode
+    print_ssh_auth_mapping
     print_web_port_mapping
     echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -912,11 +1400,19 @@ cmd_stop() {
 
 cmd_restart() {
     require_host "restart"
+
+    resolve_c0_security_for_start "$@" || exit 1
+
     ensure_web_port
     echo -e "🔄 Restarting ${CYAN}$PROJECT_NAME${NC}..."
     dc down
 
     # Validate before restart
+    if ! verify_moby_seccomp_profile; then
+        echo "error: seccomp profile verification failed" >&2
+        exit 1
+    fi
+    maybe_notify_seccomp_update_available || true
     if ! validate_host_paths; then
         echo "error: fix missing paths before starting" >&2
             exit 1
@@ -931,6 +1427,8 @@ cmd_restart() {
         echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
         exit 1
     fi
+    print_security_mode
+    print_ssh_auth_mapping
     print_web_port_mapping
     echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -959,6 +1457,32 @@ cmd_status() {
         echo -e "  ${YELLOW}(none)${NC}"
     fi
     echo ""
+
+    echo -e "${BOLD}security:${NC}"
+    local running_security configured_security
+    running_security="$(get_running_container_security_mode)"
+    if [[ -n "$running_security" ]]; then
+        echo -e "  🔒 ${YELLOW}${running_security}${NC} (running)"
+        if [[ -n "${C0_SECURITY:-}" && "${C0_SECURITY}" != "$running_security" ]]; then
+            echo -e "  ${YELLOW}note:${NC} shell C0_SECURITY=${C0_SECURITY} differs; use matching flag on restart"
+        fi
+    else
+        ensure_c0_security_resolved || true
+        configured_security="${C0_SECURITY:-permissive}"
+        echo -e "  🔒 ${YELLOW}${configured_security}${NC} (next start; default permissive)"
+    fi
+    echo ""
+
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+        echo -e "${BOLD}ssh agent:${NC}"
+        resolve_ssh_auth_sock_bind_source
+        if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
+            echo -e "  🔑 ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+        else
+            echo -e "  ${YELLOW}(unavailable — see warning above)${NC}"
+        fi
+        echo ""
+    fi
 
     # Container status
     echo -e "${BOLD}running containers:${NC}"
@@ -1143,7 +1667,11 @@ cmd_build() {
         echo -e "🔨 ${YELLOW}Force rebuild${NC} requested"
     fi
 
-    # Validate host paths (fail if missing, do not create)
+    if ! verify_moby_seccomp_profile; then
+        echo "error: seccomp profile verification failed" >&2
+        exit 1
+    fi
+    maybe_notify_seccomp_update_available || true
     if ! validate_host_paths; then
         echo "error: fix missing paths before building" >&2
             exit 1
@@ -1167,6 +1695,7 @@ cmd_build() {
 
     # Build service image
     echo -e "🏗️  Building service image..."
+    export DOCKER_BUILDKIT=1
     if ! dc build $nocache "$MAIN_SERVICE"; then
         echo "error: image build failed" >&2
         exit 1
@@ -1276,12 +1805,14 @@ Note: Running inside container. Use 'exit' to return to host.
 EOF
     else
         cat <<EOF
-Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|help}
+Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|seccomp-upgrade|help}
 
 Commands:
-  start         Start all services
+  start [--cap-drop-all]
+                Start all services (default security: permissive)
   stop          Stop all services
-  restart       Restart all services
+  restart [--cap-drop-all]
+                Restart all services
   logs [svc]    Show logs (default: $MAIN_SERVICE)
   status        Show service status, volume mappings, and workspaces
   sh            Shell as dev user (uid 1000)
@@ -1290,17 +1821,30 @@ Commands:
   build [-f]    Build tools and image (-f forces rebuild)
                 Pins current Dockerfile hash on success for this folder.
                 Triggers automatic cleanup of unpinned/inactive hashes.
+  seccomp-upgrade [--dry-run]
+                Use git ls-remote on moby/profiles, pick latest seccomp/vM.m.p tag,
+                curl raw default.json, verify sha256, then rewrite docker/seccomp when newer.
+                --dry-run shows target tag, peeled commit OID, profile sha256; no writes.
   clean [-a]    Remove tools for current + pinned hashes; unpins this folder.
                 Runs garbage collection. (-a removes entire shared volume)
   help          Show this help message
 
 Environment:
   C0_MODE       Set to 'dev' for dev mode (default: production)
+  C0_SECURITY   permissive (default) or cap-drop-all; overridden by start --cap-drop-all
+  C0_SECCOMP_NOTIFY=0  Skip upstream seccomp "newer available" notices on build/start
+  C0_SECCOMP_REMOTE_CACHE_TTL  Seconds to cache git ls-remote + profile hash (default 21600)
+  MOBY_PROFILES_GIT_URL  Override moby/profiles.git URL (default https://github.com/moby/profiles.git)
 
 Notes:
   - Each folder pins its latest successful build hash
   - Active hashes (from running containers) are never garbage collected
   - Force rebuild of active hash stages to .next, promotes after stop
+  - Ephemeral docker runs during build use --cap-drop ALL and no-new-privileges
+  - Default start: permissive (cap_drop ALL + CHOWN/SETUID/SETGID for apt as root)
+  - Strict Codex: c0 start --cap-drop-all or C0_SECURITY=cap-drop-all
+  - Moby seccomp updates: notices on build/start if upstream tag is newer; run seccomp-upgrade to apply
+  - SSH agent: set SSH_AUTH_SOCK in your shell before c0 start (no extra c0 env vars)
 EOF
     fi
 }
@@ -1310,9 +1854,9 @@ EOF
 # =============================================================================
 
 case "${1:-}" in
-    start)      cmd_start ;;
+    start)      shift; cmd_start "$@" ;;
     stop)       cmd_stop ;;
-    restart)    cmd_restart ;;
+    restart)    shift; cmd_restart "$@" ;;
     logs)       shift; cmd_logs "$@" ;;
     status)     cmd_status ;;
     sh)         cmd_sh ;;
@@ -1320,6 +1864,7 @@ case "${1:-}" in
     cp-term)    cmd_cp_term ;;
     build)      shift; cmd_build "$@" ;;
     clean)      shift; cmd_clean "$@" ;;
+    seccomp-upgrade) shift; cmd_seccomp_upgrade "$@" ;;
     help|--help|-h)
                 cmd_help ;;
     *)

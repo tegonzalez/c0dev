@@ -1,0 +1,170 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat >&2 <<'EOF'
+blk: extract first slice from a stream/file
+usage: blk [-n] [-s START_RE] [-e END_RE] [FILE|-]
+  -s START_RE  start marker regex (POSIX ERE; awk)
+  -e END_RE    end marker regex (POSIX ERE; awk)
+  -n           prefix emitted start line with "<lineno>:"
+  input        FILE path, "-" or stdin
+
+output:     lines from start (incl) or BOF up to end (excl) or EOF
+exit codes: 0=emitted, 1=emitted nothing, 2=usage/file error
+EOF
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  usage
+  exit 0
+fi
+
+show_n=0
+start_re=""
+end_re=""
+
+while getopts "ns:e:" opt; do
+  case "$opt" in
+    n) show_n=1 ;;
+    s) start_re=$OPTARG ;;
+    e) end_re=$OPTARG ;;
+    *) usage; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ -z "$start_re" ] && [ -z "$end_re" ]; then
+  usage
+  exit 2
+fi
+
+if [ "$#" -gt 1 ]; then
+  usage
+  exit 2
+fi
+
+input="${1:-"-"}"
+if [ "$input" != "-" ] && [ ! -r "$input" ]; then
+  echo "blk: unreadable file: $input" >&2
+  exit 2
+fi
+
+if [ "$input" = "-" ]; then
+  awk -v start_re="$start_re" -v end_re="$end_re" -v show_n="$show_n" '
+function is_start() { return (start_re != "" && ($0 ~ start_re)) }
+function is_end()   { return (end_re   != "" && ($0 ~ end_re)) }
+function emit_line(is_start_line) {
+  if (show_n && is_start_line) print NR ":" $0
+  else print $0
+  printed_any = 1
+}
+
+BEGIN {
+  started = 0
+  start_nr = 0
+  printed_any = 0
+  mode_start = (start_re != "")
+  mode_end = (end_re != "")
+  status = -1
+}
+
+{
+  if (!mode_start && mode_end) {
+    if (is_end()) { status = (printed_any ? 0 : 1); exit }
+    emit_line(0)
+    next
+  }
+
+  if (mode_start && !mode_end) {
+    if (!started) {
+      if (is_start()) {
+        started = 1
+        emit_line(1)
+      }
+      next
+    }
+    emit_line(0)
+    next
+  }
+
+  # both markers present
+  if (!started) {
+    if (is_start()) {
+      started = 1
+      start_nr = NR
+      emit_line(1)
+    }
+    next
+  }
+
+  if (is_end() && NR > start_nr) { status = 0; exit }
+  emit_line(0)
+}
+
+END {
+  if (status != -1) exit status
+  if (!printed_any) exit 1
+  exit 0
+}
+'
+else
+  awk -v start_re="$start_re" -v end_re="$end_re" -v show_n="$show_n" '
+function is_start() { return (start_re != "" && ($0 ~ start_re)) }
+function is_end()   { return (end_re   != "" && ($0 ~ end_re)) }
+function emit_line(is_start_line) {
+  if (show_n && is_start_line) print NR ":" $0
+  else print $0
+  printed_any = 1
+}
+
+BEGIN {
+  started = 0
+  start_nr = 0
+  printed_any = 0
+  mode_start = (start_re != "")
+  mode_end = (end_re != "")
+  status = -1
+}
+
+{
+  if (!mode_start && mode_end) {
+    if (is_end()) { status = (printed_any ? 0 : 1); exit }
+    emit_line(0)
+    next
+  }
+
+  if (mode_start && !mode_end) {
+    if (!started) {
+      if (is_start()) {
+        started = 1
+        emit_line(1)
+      }
+      next
+    }
+    emit_line(0)
+    next
+  }
+
+  # both markers present
+  if (!started) {
+    if (is_start()) {
+      started = 1
+      start_nr = NR
+      emit_line(1)
+    }
+    next
+  }
+
+  if (is_end() && NR > start_nr) { status = 0; exit }
+  emit_line(0)
+}
+
+END {
+  if (status != -1) exit status
+  if (!printed_any) exit 1
+  exit 0
+}
+' "$input"
+fi
+

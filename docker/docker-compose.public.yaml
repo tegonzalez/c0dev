@@ -5,6 +5,8 @@ x-environment-base: &env-base
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
   TERM: ${TERM}
+  # Guest path; host bind is added by c0 when shell SSH_AUTH_SOCK is set (see bin/c0).
+  SSH_AUTH_SOCK: /home/dev/.ssh-auth.sock
   # Shared tools prefix (symlinked to ~/.cargo etc. by entrypoint)
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
@@ -28,3 +30,4 @@ services:
       c0dev.tools_hash: ${DOCKERFILE_HASH}
       c0dev.tools_volume: ${SHARED_TOOLS_VOLUME}
       c0dev.project: ${C0DEV_HOSTNAME}
+      c0dev.security_mode: ${C0_SECURITY:-permissive}

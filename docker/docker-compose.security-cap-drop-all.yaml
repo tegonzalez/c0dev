@@ -1,0 +1,9 @@
+# Strict runtime security for Codex/Cursor as dev (c0 start --cap-drop-all).
+services:
+  c0dev:
+    privileged: false
+    security_opt:
+      - seccomp:seccomp/moby-default-seccomp.json
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

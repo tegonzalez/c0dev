@@ -115,6 +115,8 @@ c0 build [-f]
 ### Codex CLI
 Codex now supports device authentication; run `codex login --device-auth` and follow the prompts.
 
+For Codex desktop app navigation, see [Codex Desktop App Shortcuts](docs/codex-desktop-app-shortcuts.md). These are app UI shortcuts, not `codex` CLI commands.
+
 ### OpenCode CLI
 1. Run `opencode auth login` to start the interactive login.
 2. Choose your provider (or supply a URL) and finish the browser flow when prompted.

@@ -1,0 +1,12 @@
+services:
+  c0dev:
+    environment:
+      SSH_AUTH_SOCK: /home/dev/.ssh-auth.sock
+    group_add:
+      - "${C0_SSH_AUTH_SOCK_GID:-67278}"
+    volumes:
+      - type: bind
+        source: ${C0_SSH_AUTH_SOCK_BIND_SOURCE}
+        target: /home/dev/.ssh-auth.sock
+        bind:
+          create_host_path: false

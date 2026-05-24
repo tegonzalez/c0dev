@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Docker entrypoint script that handles both interactive and daemon modes
-# This script runs as the dev user (set by USER directive in Dockerfile)
+DEV_HOME="${DEV_HOME:-/home/dev}"
 
 # Validate and set up tools symlinks from TOOLS_PREFIX (injected by c0)
 if [ -n "$TOOLS_PREFIX" ]; then
@@ -21,21 +20,24 @@ if [ -n "$TOOLS_PREFIX" ]; then
     # Create symlinks so tools appear at expected locations (~/.cargo, etc.)
     for dir in .cargo .rustup .local; do
         if [ -d "$TOOLS_PREFIX/$dir" ]; then
-            rm -rf "$HOME/$dir" 2>/dev/null
-            ln -sfn "$TOOLS_PREFIX/$dir" "$HOME/$dir"
+            dst="$DEV_HOME/$dir"
+            src="$TOOLS_PREFIX/$dir"
+            if [ -L "$dst" ]; then
+                rm -f "$dst"
+            elif [ -e "$dst" ]; then
+                echo "error: refusing to replace non-symlink: $dst" >&2
+                echo "Remove or move it, then restart c0dev." >&2
+                exit 1
+            fi
+            ln -s "$src" "$dst"
         fi
     done
 
     # Set env vars as fallback
-    export CARGO_HOME="$HOME/.cargo"
-    export RUSTUP_HOME="$HOME/.rustup"
+    export CARGO_HOME="$DEV_HOME/.cargo"
+    export RUSTUP_HOME="$DEV_HOME/.rustup"
 else
     echo "warning: TOOLS_PREFIX not set, tools may be missing" >&2
-fi
-
-# Source profile for environment setup
-if [ -f ~/.profile ]; then
-    source ~/.profile
 fi
 
 # Check if we're running interactively (tty attached)

@@ -5,8 +5,6 @@ x-environment-base: &env-base
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
   TERM: ${TERM}
-  # Guest path; host bind is added by c0 when shell SSH_AUTH_SOCK is set (see bin/c0).
-  SSH_AUTH_SOCK: /home/dev/.ssh-auth.sock
   # Shared tools prefix (symlinked to ~/.cargo etc. by entrypoint)
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
@@ -22,8 +20,6 @@ services:
     tty: true
     environment:
       <<: *env-base
-    entrypoint:
-      - /usr/local/bin/docker-entrypoint.sh
     extra_hosts:
       - "host.docker.internal:host-gateway"
     labels:

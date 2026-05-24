@@ -28,7 +28,7 @@ A containerized development environment for AI-assisted coding and full-stack wo
 - `cargo-cache` – cargo cache management
 
 ### Installed via Package Managers
-- Python: `uv`, `code-graph-rag` (commit 0037ad4)
+- Python: `uv`
 - Bun globals: `@anthropic-ai/claude-code`, `@openai/codex`, `opencode-ai`
 - System utilities: `build-essential`, `cmake`, `git`, `curl`, `wget`, `fzf`, `jq`, `yq`, `bc`, `bat`, `btop`, `iproute2`, `iputils-ping`, `net-tools`, `socat`, `netcat`, `vim`, `tmux`
 - Rust toolchain: `rustup` with `wasm32-unknown-unknown` target (registry cache cleaned post-build)
@@ -38,7 +38,9 @@ A containerized development environment for AI-assisted coding and full-stack wo
 1. Clone the repo: `git clone https://github.com/tegonzalez/c0dev.git`
 2. Enter the project: `cd c0dev`
 3. Load helper scripts into `PATH`: `./env.sh`
-4. Build the image: `c0 build` (first build takes ~10 minutes)
+4. See available commands: `make help`
+5. Run onboarding checks: `make fix`
+6. Build the image: `c0 build` (first build takes ~10 minutes)
 
 ### Launch and Access the Container
 - Start services: `c0 start`
@@ -54,6 +56,9 @@ cd c0dev
 # Enter sub-shell for c0dev PATH
 ./env.sh
 
+# Create missing repo-local host mount directories and check Docker
+make fix
+
 # Build the Docker image (~10 minutes)
 c0 build
 ```
@@ -61,13 +66,28 @@ c0 build
 **Build Time**: Approximately 10 minutes for full build including Rust toolchain installation.
 
 ### What `c0 build` Does
-1. Ensures file mappings exist on host (prevents Docker from creating directories)
-2. Builds `tools-builder` stage with uv, Cursor CLI, code-graph-rag, and Rust tools
-3. Extracts built tools to host directories (`.local`, `.cargo`, `.rustup`)
+1. Creates missing repo-local host mount directories and validates file mappings
+2. Builds `tools-builder` stage with uv, Cursor CLI, and Rust tools
+3. Extracts built tools into the shared Docker tools volume
 4. Builds final Docker image with system packages and global tools
 5. Installs terminfo for proper terminal emulation
 
 ## Usage
+
+### Beginner Entrypoints
+
+```bash
+# Show the common workflow commands
+make help
+
+# Makefile targets are beginner-friendly wrappers around c0 commands
+make build
+
+# Compatibility wrappers for common c0 commands
+c0-sh
+c0-root
+c0-status
+```
 
 ### Service Management
 
@@ -96,6 +116,9 @@ c0 status
 
 # Rebuild (force with -f flag)
 c0 build [-f]
+
+# Check onboarding prerequisites; --fix creates missing repo-local host dirs
+c0 doctor [--fix]
 ```
 
 ### Web Port Mapping
@@ -103,6 +126,11 @@ c0 build [-f]
 - Auto-selection range: `3000–4000`. Allocation rule: first available port in the range (fills gaps).
 - The selected mapping is printed on `c0 start`, `c0 restart`, and `c0 status` as `host:<port> -> guest:3000`.
 - Override: `C0DEV_WEB_PORT=3001 c0 start`
+
+### Local Compose Overrides
+- Optional local Docker Compose overrides can live in `docker/docker-compose.local.yaml`.
+- This file is ignored by git and is loaded after the public, security, and SSH-agent compose files.
+- Use it for machine-specific mounts, environment variables, or service tweaks that should not be committed.
 
 ## Authenticate Assistants
 
@@ -124,14 +152,14 @@ Codex now supports device authentication; run `codex login --device-auth` and fo
 Persistent host ↔ container paths for credentials, tooling, and projects:
 - `.claude/` → `/home/dev/.claude`
 - `.config/` → `/home/dev/.config`
-- `.cargo/` → `/home/dev/.cargo`
-- `.local/` → `/home/dev/.local`
-- `.rustup/` → `/home/dev/.rustup`
-- `.terminfo/` → `/home/dev/.terminfo`
+- `.codex/` → `/home/dev/.codex`
+- `.cache/` → `/home/dev/.cache`
 - `rules/` → `/home/dev/rules`
 - `projects/` → `/home/dev/projects`
 - `bin/` → `/home/dev/bin`
 - `.claude.json` → `/home/dev/.claude.json`
+- `~/.gitconfig` → `/home/dev/.gitconfig`
+- `c0dev-tools-shared` Docker volume → `/tools`
 
 These mappings keep credentials, tool installs, and in-progress work outside the ephemeral container filesystem.
 
@@ -143,20 +171,23 @@ These mappings keep credentials, tool installs, and in-progress work outside the
 - Default model: `gpt-oss:20b`
 
 ## Build Pipeline Highlights
-1. Verify host directories exist before mounting volumes
-2. Build `tools-builder` stage (uv, Cursor CLI, code-graph-rag, Rust tools)
-3. Extract tool artifacts to host (`.local`, `.cargo`, `.rustup`)
+1. Create missing repo-local host mount directories, then verify host files exist
+2. Build `tools-builder` stage (uv, Cursor CLI, Rust tools)
+3. Extract tool artifacts to the shared Docker tools volume
 4. Assemble final runtime image with system packages and global CLIs
 5. Install terminfo database for accurate terminal emulation
 
 ## Networking Notes
 - Container has public network access with host bridging
 - `host.docker.internal` resolves to the host for local services (e.g., Ollama)
-- **SSH agent:** if your shell has `SSH_AUTH_SOCK` set, `c0 start` forwards it automatically (guest path `/home/dev/.ssh-auth.sock`). On macOS/OrbStack the relay `/run/host-services/ssh-auth.sock` is used instead of the launchd path. Verify in the container: `test -S "$SSH_AUTH_SOCK" && ssh-add -l`.
+- **SSH agent:** if your shell has `SSH_AUTH_SOCK` set, `c0 start` forwards it automatically. On macOS Docker VM contexts such as OrbStack, the relay `/run/host-services/ssh-auth.sock` is mounted directly at `/home/dev/.ssh-auth.sock`, which is also the in-container `SSH_AUTH_SOCK`; the SSH compose overlay adds the socket group so the dev user can connect without a proxy. If your Docker VM uses a nonstandard socket group, set `C0_SSH_AUTH_SOCK_GID`. Verify with `c0 status` or, inside the container, `test -S "$SSH_AUTH_SOCK" && ssh-add -l`.
 
 ## Troubleshooting
+- First-run checks: run `c0 doctor --fix`
+- Docker failures: `c0` auto-starts OrbStack on macOS when the Docker endpoint is OrbStack and the daemon is unavailable. Set `C0_DOCKER_AUTOSTART=0` to disable.
+- SSH agent unavailable: confirm `SSH_AUTH_SOCK` is set in the host shell, restart (`c0 restart`), then run `c0 status` to confirm the container agent is reachable.
 - Build failures: confirm Xcode is available for `infocmp`, rerun with `c0 build -f` to force rebuild
-- Volume issues: ensure host directories exist and remain writable before running `c0 build`
+- Volume issues: repo-local directories are created automatically; missing host files still require explicit user action
 
 ## Debug: Tools Garbage Collection
 

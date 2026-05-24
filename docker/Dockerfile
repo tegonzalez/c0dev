@@ -116,16 +116,17 @@ RUN for term in /tmp/.terminfo/*; do tic -x -o /usr/share/terminfo $term; done
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Set up dev user
-USER dev
+ENV HOME=/home/dev
 WORKDIR /home/dev
 
-# Add activation to profile
-RUN echo '. "$HOME/bin/activate"' >> ~/.profile
+# Add activation to profile while still root during image build.
+RUN echo '. "$HOME/bin/activate"' >> /home/dev/.profile && chown dev:dev /home/dev/.profile
+
+# Runtime defaults to the dev user; use `c0 root` for explicit root shells.
+USER dev
 
 # Ensure bash is available and set proper shell
 ENV SHELL=/bin/bash
 
-# Use entrypoint script that handles both interactive and daemon modes
-#ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-ENTRYPOINT [""]
+# Use entrypoint script that handles both interactive and daemon modes.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

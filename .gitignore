@@ -17,3 +17,4 @@ rules
 .rustup
 .terminfo
 docker/.compose.ssh-auth.yaml
+docker/docker-compose.local.yaml

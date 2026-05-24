@@ -47,4 +47,9 @@ prepend_path "$(resolve_path "$root_dir/.cargo/bin")"
 prepend_path "$(resolve_path "$root_dir/.local/bin")"
 prepend_path "$(resolve_path "$root_dir/bin")"
 
+local_activate="$root_dir/bin/activate.local"
+if [ -f "$local_activate" ]; then
+	. "$local_activate"
+fi
+
 export PATH

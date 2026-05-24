@@ -15,7 +15,6 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
-WHITE='\033[0;37m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
@@ -28,6 +27,7 @@ C0ROOT="$(realpath "$(dirname "$0")/..")"
 # Required files - exit non-zero if any are missing
 REQUIRED_FILES=(
     "$C0ROOT/docker/docker-compose.public.yaml"
+    "$C0ROOT/docker/docker-compose.ssh-auth.yaml"
     "$C0ROOT/docker/volumes-folders.yaml"
     "$C0ROOT/docker/volumes-files.yaml"
     "$C0ROOT/docker/Dockerfile"
@@ -95,8 +95,10 @@ TOOLS_PREFIX="/tools/opt/$DOCKERFILE_HASH"
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
 COMPOSE_SECURITY_PERMISSIVE="$C0ROOT/docker/docker-compose.security-permissive.yaml"
 COMPOSE_SECURITY_CAP_DROP_ALL="$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
-COMPOSE_SSH_AUTH_FILE="$C0ROOT/docker/.compose.ssh-auth.yaml"
+COMPOSE_SSH_AUTH_FILE="$C0ROOT/docker/docker-compose.ssh-auth.yaml"
+COMPOSE_LOCAL_FILE="$C0ROOT/docker/docker-compose.local.yaml"
 C0_SSH_AUTH_SOCK_GUEST="/home/dev/.ssh-auth.sock"
+C0_SSH_AUTH_SOCK_GID_DEFAULT="67278"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
 VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
 MAIN_SERVICE="c0dev"
@@ -112,6 +114,8 @@ MOBY_PROFILES_GIT_URL="${MOBY_PROFILES_GIT_URL:-https://github.com/moby/profiles
 C0_SECCOMP_REMOTE_CACHE_TTL="${C0_SECCOMP_REMOTE_CACHE_TTL:-21600}"
 C0_SECCOMP_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/c0dev"
 C0_SECCOMP_REMOTE_CACHE="$C0_SECCOMP_CACHE_DIR/moby-seccomp-remote.cache"
+C0_DOCKER_AUTOSTART="${C0_DOCKER_AUTOSTART:-1}"
+C0_DOCKER_START_TIMEOUT="${C0_DOCKER_START_TIMEOUT:-60}"
 
 # Ephemeral docker run helpers (tools volume I/O, unpack): align with least-privilege posture.
 # Runtime service hardening: docker-compose.security-*.yaml (selected via C0_SECURITY).
@@ -509,10 +513,9 @@ print_security_mode() {
 }
 
 # =============================================================================
-# SSH agent: use shell SSH_AUTH_SOCK; macOS/OrbStack uses VM relay (not launchd path)
+# SSH agent: use shell SSH_AUTH_SOCK; macOS Docker VMs use the host relay.
 # =============================================================================
 
-# Darwin + OrbStack/Docker Desktop: bind relay, not $SSH_AUTH_SOCK (launchd path → guest directory).
 resolve_ssh_auth_sock_bind_source() {
     C0_SSH_AUTH_SOCK_BIND_SOURCE=""
     [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
@@ -527,20 +530,32 @@ resolve_ssh_auth_sock_bind_source() {
         return 0
     fi
     export C0_SSH_AUTH_SOCK_BIND_SOURCE
+    resolve_ssh_auth_sock_gid
 }
 
-ensure_ssh_auth_compose_fragment() {
-    resolve_ssh_auth_sock_bind_source
-    if [[ -z "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
-        rm -f "$COMPOSE_SSH_AUTH_FILE"
-        return 0
+host_path_gid() {
+    local path="$1"
+    stat -c '%g' "$path" 2>/dev/null || stat -f '%g' "$path" 2>/dev/null || true
+}
+
+resolve_ssh_auth_sock_gid() {
+    [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]] || return 0
+    [[ -n "${C0_SSH_AUTH_SOCK_GID:-}" ]] && return 0
+
+    local gid=""
+    if [[ -S "$C0_SSH_AUTH_SOCK_BIND_SOURCE" ]]; then
+        gid="$(host_path_gid "$C0_SSH_AUTH_SOCK_BIND_SOURCE")"
     fi
-    cat >"$COMPOSE_SSH_AUTH_FILE" <<EOF
-services:
-  c0dev:
-    volumes:
-      - ${C0_SSH_AUTH_SOCK_BIND_SOURCE}:${C0_SSH_AUTH_SOCK_GUEST}
-EOF
+
+    case "$gid" in
+        ''|*[!0-9]*)
+            C0_SSH_AUTH_SOCK_GID="$C0_SSH_AUTH_SOCK_GID_DEFAULT"
+            ;;
+        *)
+            C0_SSH_AUTH_SOCK_GID="$gid"
+            ;;
+    esac
+    export C0_SSH_AUTH_SOCK_GID
 }
 
 print_ssh_auth_mapping() {
@@ -550,8 +565,113 @@ print_ssh_auth_mapping() {
     [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
     resolve_ssh_auth_sock_bind_source
     if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
-        echo -e "🔑 SSH agent: ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+        echo -e "🔑 SSH agent: ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE} (gid ${C0_SSH_AUTH_SOCK_GID:-$C0_SSH_AUTH_SOCK_GID_DEFAULT})"
     fi
+}
+
+probe_host_ssh_agent() {
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+        echo "disabled"
+        return 0
+    fi
+    if ! command -v ssh-add &>/dev/null; then
+        echo "unknown:ssh-add not found"
+        return 0
+    fi
+
+    local output
+    if output="$(ssh-add -l 2>&1)"; then
+        echo "ok:$output"
+        return 0
+    fi
+
+    case "$output" in
+        *"The agent has no identities."*)
+            echo "empty:$output"
+            ;;
+        *)
+            echo "error:$output"
+            ;;
+    esac
+}
+
+probe_container_ssh_agent() {
+    local output
+    if output="$(dc exec -T -u 1000 "$MAIN_SERVICE" sh -lc '
+        if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+            echo "disabled:no SSH_AUTH_SOCK"
+            exit 0
+        fi
+        if [ ! -S "$SSH_AUTH_SOCK" ]; then
+            echo "missing:$SSH_AUTH_SOCK"
+            exit 0
+        fi
+        out="$(ssh-add -l 2>&1)"
+        code="$?"
+        if [ "$code" -eq 0 ]; then
+            echo "ok:$out"
+            exit 0
+        fi
+        case "$out" in
+            *"The agent has no identities."*) echo "empty:$out" ;;
+            *) echo "error:$out" ;;
+        esac
+    ' 2>&1)"; then
+        echo "$output"
+    else
+        echo "unknown:$output"
+    fi
+}
+
+print_ssh_probe_line() {
+    local label="$1"
+    local result="$2"
+    local kind="$result"
+    local detail=""
+
+    if [[ "$result" == *:* ]]; then
+        kind="${result%%:*}"
+        detail="${result#*:}"
+    fi
+
+    case "$kind" in
+        disabled)
+            echo -e "  ${YELLOW}${label}:${NC} disabled"
+            ;;
+        ok)
+            echo -e "  ${GREEN}${label}:${NC} reachable"
+            ;;
+        empty)
+            echo -e "  ${YELLOW}${label}:${NC} reachable, no identities loaded"
+            ;;
+        missing)
+            echo -e "  ${RED}${label}:${NC} missing socket ${detail}"
+            ;;
+        error)
+            echo -e "  ${RED}${label}:${NC} ${detail}"
+            ;;
+        *)
+            echo -e "  ${YELLOW}${label}:${NC} ${detail:-unknown}"
+            ;;
+    esac
+}
+
+ssh_probe_failed() {
+    local result="$1"
+    local kind="$result"
+
+    if [[ "$result" == *:* ]]; then
+        kind="${result%%:*}"
+    fi
+
+    case "$kind" in
+        error|missing|unknown)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -562,13 +682,15 @@ dc() {
     ensure_c0_security_resolved || return 1
     local security_file
     security_file="$(c0_security_compose_file)" || return 1
-    ensure_ssh_auth_compose_fragment
+    resolve_ssh_auth_sock_bind_source
 
     export SHARED_TOOLS_VOLUME
     export TOOLS_PREFIX
     export DOCKERFILE_HASH
     export C0DEV_HOSTNAME="$PROJECT_NAME"
     export C0_SECURITY
+    export C0_SSH_AUTH_SOCK_BIND_SOURCE
+    export C0_SSH_AUTH_SOCK_GID
 
     local -a compose_files=(
         -f "$VOLUMES_FOLDERS_FILE"
@@ -576,8 +698,11 @@ dc() {
         -f "$COMPOSE_PUBLIC_FILE"
         -f "$security_file"
     )
-    if [[ -f "$COMPOSE_SSH_AUTH_FILE" ]]; then
+    if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" && -f "$COMPOSE_SSH_AUTH_FILE" ]]; then
         compose_files+=(-f "$COMPOSE_SSH_AUTH_FILE")
+    fi
+    if [[ -f "$COMPOSE_LOCAL_FILE" ]]; then
+        compose_files+=(-f "$COMPOSE_LOCAL_FILE")
     fi
 
     docker compose -p "$PROJECT_NAME" "${compose_files[@]}" "$@"
@@ -707,7 +832,7 @@ resolve_volume_host_path() {
 
     if [[ "$abs_host_path" == "~" ]]; then
         abs_host_path="$HOME"
-    elif [[ "$abs_host_path" == "~/"* ]]; then
+    elif [[ "$abs_host_path" == \~/* ]]; then
         abs_host_path="$HOME/${abs_host_path:2}"
     fi
 
@@ -731,9 +856,9 @@ is_docker_volume() {
 to_display_path() {
     local abs_path="$1"
     if [[ "$abs_path" == "$C0ROOT"/* ]]; then
-        echo ".${abs_path#$C0ROOT}"
+        echo ".${abs_path#"$C0ROOT"}"
     elif [[ "$abs_path" == "$HOME"/* ]]; then
-        echo "~${abs_path#$HOME}"
+        echo "~${abs_path#"$HOME"}"
     else
         echo "$abs_path"
     fi
@@ -757,7 +882,7 @@ parse_folder_mappings() {
 
         if [[ "$in_folders" == true && "$line" =~ ^[[:space:]]+-[[:space:]]*(.+)$ ]]; then
             local volume_line="${BASH_REMATCH[1]}"
-            volume_line=$(echo "$volume_line" | sed 's/#.*//')
+            volume_line="${volume_line%%#*}"
             volume_line=$(echo "$volume_line" | xargs)
             [[ -z "$volume_line" ]] && continue
 
@@ -796,7 +921,7 @@ parse_file_mappings() {
 
         if [[ "$in_files" == true && "$line" =~ ^[[:space:]]+-[[:space:]]*(.+)$ ]]; then
             local volume_line="${BASH_REMATCH[1]}"
-            volume_line=$(echo "$volume_line" | sed 's/#.*//')
+            volume_line="${volume_line%%#*}"
             volume_line=$(echo "$volume_line" | xargs)
             [[ -z "$volume_line" ]] && continue
 
@@ -878,6 +1003,65 @@ validate_host_paths() {
     return 0
 }
 
+host_path_safe_to_create() {
+    local abs_host_path="$1"
+
+    [[ "$abs_host_path" == "$C0ROOT"/* ]] || return 1
+    [[ "$abs_host_path" != *"/../"* ]] || return 1
+    [[ "$abs_host_path" != *"/.." ]] || return 1
+}
+
+# Create missing host directories from volume mappings.
+# Host files remain explicit: c0 will not invent credential/config files.
+ensure_host_dirs() {
+    local created=()
+    local errors=()
+
+    _ensure_folder_callback() {
+        local abs_host_path="$1"
+        local container_path="$2"
+        local type="$3"
+        local display_path="$4"
+
+        if [[ "$type" == "host-dir" && -n "$abs_host_path" && ! -e "$abs_host_path" ]]; then
+            if ! host_path_safe_to_create "$abs_host_path"; then
+                errors+=("$display_path (outside c0 root)")
+                return 0
+            fi
+            if mkdir -p "$abs_host_path"; then
+                created+=("$display_path")
+            else
+                errors+=("$display_path")
+            fi
+        fi
+    }
+
+    parse_folder_mappings _ensure_folder_callback
+
+    if [[ ${#created[@]} -gt 0 ]]; then
+        echo -e "🧭 Host paths: created missing directories"
+        local d
+        for d in "${created[@]}"; do
+            echo -e "  ${GREEN}+${NC} $d"
+        done
+    fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        echo "error: failed to create host directories:" >&2
+        local err
+        for err in "${errors[@]}"; do
+            echo "  - $err" >&2
+        done
+        return 1
+    fi
+    return 0
+}
+
+ensure_host_paths() {
+    ensure_host_dirs || return 1
+    validate_host_paths
+}
+
 # Check if shared tools volume exists and is valid for current Dockerfile hash
 tools_volume_valid() {
     # Check if volume exists
@@ -892,13 +1076,14 @@ tools_volume_valid() {
 
 # Get project relative path for shell navigation
 get_project_path() {
-    local current_dir="$(realpath "$(pwd)")"
+    local current_dir
+    current_dir="$(realpath "$(pwd)")"
     local projects_dir="$C0ROOT/projects"
 
     if [[ "$current_dir" == "$projects_dir" ]]; then
         echo "."
     elif [[ "$current_dir" == "$projects_dir"* ]]; then
-        echo "${current_dir#$projects_dir/}"
+        echo "${current_dir#"$projects_dir"/}"
     else
         echo ""
     fi
@@ -910,6 +1095,90 @@ require_host() {
         echo "error: '$1' must be run from host, not inside container" >&2
         exit 1
     fi
+}
+
+# =============================================================================
+# Host Docker daemon preflight
+# =============================================================================
+
+docker_endpoint_hint() {
+    if [[ -n "${DOCKER_HOST:-}" ]]; then
+        echo "$DOCKER_HOST"
+        return 0
+    fi
+    if ! command -v docker &>/dev/null; then
+        return 0
+    fi
+    docker context inspect --format '{{ with (index .Endpoints "docker") }}{{ .Host }}{{ end }}' 2>/dev/null | head -1 || true
+}
+
+orbstack_app_available() {
+    [[ -d "/Applications/OrbStack.app" || -d "$HOME/Applications/OrbStack.app" ]]
+}
+
+docker_endpoint_looks_orbstack() {
+    local endpoint
+    endpoint="$(docker_endpoint_hint)"
+    [[ "$endpoint" == *orbstack* || "$endpoint" == *OrbStack* ]]
+}
+
+maybe_start_orbstack() {
+    [[ "$C0_DOCKER_AUTOSTART" != "0" ]] || return 1
+    [[ -z "${CI:-}" ]] || return 1
+    [[ "$(uname -s)" == "Darwin" ]] || return 1
+    command -v open &>/dev/null || return 1
+    if ! docker_endpoint_looks_orbstack && ! orbstack_app_available; then
+        return 1
+    fi
+    echo -e "🐳 Docker: unavailable; starting ${CYAN}OrbStack${NC}..."
+    open -a OrbStack >/dev/null 2>&1
+}
+
+wait_for_docker_daemon() {
+    local timeout="${1:-$C0_DOCKER_START_TIMEOUT}"
+    local deadline=$((SECONDS + timeout))
+
+    while (( SECONDS < deadline )); do
+        if docker info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    docker info >/dev/null 2>&1
+}
+
+ensure_docker_daemon() {
+    if ! command -v docker &>/dev/null; then
+        echo "error: docker CLI not found in PATH" >&2
+        return 1
+    fi
+
+    if docker info >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local endpoint
+    endpoint="$(docker_endpoint_hint)"
+
+    if maybe_start_orbstack; then
+        if wait_for_docker_daemon "$C0_DOCKER_START_TIMEOUT"; then
+            echo -e "🐳 Docker: ${GREEN}ready${NC}"
+            return 0
+        fi
+        echo "error: Docker daemon did not become ready within ${C0_DOCKER_START_TIMEOUT}s" >&2
+    else
+        echo "error: Docker daemon unavailable" >&2
+    fi
+
+    if [[ -n "$endpoint" ]]; then
+        echo "  endpoint: $endpoint" >&2
+    fi
+    if [[ "$endpoint" == *orbstack* || "$endpoint" == *OrbStack* ]]; then
+        echo "  hint: open OrbStack, or set C0_DOCKER_AUTOSTART=1 to let c0 start it" >&2
+    else
+        echo "  hint: start Docker/OrbStack, then retry" >&2
+    fi
+    return 1
 }
 
 # =============================================================================
@@ -1075,7 +1344,7 @@ cleanup_orphan_pins() {
         return 0
     fi
 
-    local pin_info folder_id hash c0root
+    local folder_id hash c0root
     while read -r folder_id hash c0root; do
         [[ -z "$folder_id" ]] && continue
         if [[ ! -d "$c0root" ]]; then
@@ -1096,7 +1365,7 @@ get_pinned_hashes() {
     fi
 
     local -a hashes=()
-    local pin_info folder_id hash c0root
+    local folder_id hash c0root
     while read -r folder_id hash c0root; do
         [[ -z "$folder_id" ]] && continue
         if [[ -d "$c0root" ]]; then
@@ -1263,7 +1532,9 @@ build_tools_volume() {
     # 2) Build tools image (BuildKit builder is short-lived; service hardening is in compose at runtime)
     echo -e "  🔧 Building tools-builder stage..."
     export DOCKER_BUILDKIT=1
-    if ! docker build $nocache --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
+    local -a build_args=()
+    [[ -n "$nocache" ]] && build_args+=("$nocache")
+    if ! docker build "${build_args[@]}" --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
         trap - INT TERM
         return 1
     fi
@@ -1361,17 +1632,18 @@ cmd_start() {
 
     ensure_web_port
 
+    if ! ensure_host_paths; then
+        echo "error: fix missing paths before starting" >&2
+        exit 1
+    fi
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     if ! verify_moby_seccomp_profile; then
         echo "error: seccomp profile verification failed" >&2
         exit 1
     fi
     maybe_notify_seccomp_update_available || true
-
-    # Validate host paths
-    if ! validate_host_paths; then
-        echo "error: fix missing paths before starting" >&2
-        exit 1
-    fi
 
     # Check tools volume
     if ! tools_volume_valid; then
@@ -1393,6 +1665,9 @@ cmd_start() {
 
 cmd_stop() {
     require_host "stop"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     echo -e "🛑 Stopping ${CYAN}$PROJECT_NAME${NC}..."
     dc down
     echo -e "✅ Stopped"
@@ -1404,6 +1679,13 @@ cmd_restart() {
     resolve_c0_security_for_start "$@" || exit 1
 
     ensure_web_port
+    if ! ensure_host_paths; then
+        echo "error: fix missing paths before starting" >&2
+        exit 1
+    fi
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     echo -e "🔄 Restarting ${CYAN}$PROJECT_NAME${NC}..."
     dc down
 
@@ -1413,10 +1695,6 @@ cmd_restart() {
         exit 1
     fi
     maybe_notify_seccomp_update_available || true
-    if ! validate_host_paths; then
-        echo "error: fix missing paths before starting" >&2
-            exit 1
-        fi
     if ! tools_volume_valid; then
         echo "error: tools volume invalid - run 'c0 build' first" >&2
             exit 1
@@ -1435,6 +1713,9 @@ cmd_restart() {
 
 cmd_logs() {
     require_host "logs"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     local service="${1:-$MAIN_SERVICE}"
     dc logs -f "$service"
 }
@@ -1473,16 +1754,26 @@ cmd_status() {
     fi
     echo ""
 
+    echo -e "${BOLD}ssh agent:${NC}"
     if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
-        echo -e "${BOLD}ssh agent:${NC}"
         resolve_ssh_auth_sock_bind_source
         if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
-            echo -e "  🔑 ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+            echo -e "  🔑 ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE} (gid ${C0_SSH_AUTH_SOCK_GID:-$C0_SSH_AUTH_SOCK_GID_DEFAULT})"
         else
-            echo -e "  ${YELLOW}(unavailable — see warning above)${NC}"
+            echo -e "  ${YELLOW}(host socket unavailable; see warning above)${NC}"
         fi
-        echo ""
+    else
+        echo -e "  ${YELLOW}(disabled; set SSH_AUTH_SOCK before c0 start)${NC}"
     fi
+    print_ssh_probe_line "host" "$(probe_host_ssh_agent)"
+    local ssh_container_id
+    ssh_container_id="$(dc ps -q "$MAIN_SERVICE" 2>/dev/null | head -1 || true)"
+    if [[ -n "$ssh_container_id" ]]; then
+        print_ssh_probe_line "container" "$(probe_container_ssh_agent)"
+    else
+        echo -e "  ${YELLOW}container:${NC} not running"
+    fi
+    echo ""
 
     # Container status
     echo -e "${BOLD}running containers:${NC}"
@@ -1614,12 +1905,18 @@ cmd_status() {
 
 cmd_sh() {
     require_host "sh"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
+        local container_project_dir quoted_project_dir
+        container_project_dir="$CONTAINER_DEV_HOME/projects/$project_path"
+        printf -v quoted_project_dir '%q' "$container_project_dir"
         print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
-        dc exec -u 1000 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash -l"
+        dc exec -u 1000 "$MAIN_SERVICE" bash -lc "cd -- $quoted_project_dir && exec bash -l"
     else
         print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev)"
@@ -1629,12 +1926,18 @@ cmd_sh() {
 
 cmd_root() {
     require_host "root"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     local project_path
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
+        local container_project_dir quoted_project_dir
+        container_project_dir="$CONTAINER_DEV_HOME/projects/$project_path"
+        printf -v quoted_project_dir '%q' "$container_project_dir"
         print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC}) @ ${YELLOW}projects/$project_path${NC}"
-        dc exec -u 0 "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash"
+        dc exec -u 0 "$MAIN_SERVICE" bash -lc "cd -- $quoted_project_dir && exec bash"
     else
         print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC})"
@@ -1644,6 +1947,9 @@ cmd_root() {
 
 cmd_cp_term() {
     require_host "cp-term"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     local container_name
     container_name=$(dc ps -q "$MAIN_SERVICE" 2>/dev/null)
     if [[ -z "$container_name" ]]; then
@@ -1667,15 +1973,18 @@ cmd_build() {
         echo -e "🔨 ${YELLOW}Force rebuild${NC} requested"
     fi
 
+    if ! ensure_host_paths; then
+        echo "error: fix missing paths before building" >&2
+            exit 1
+        fi
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
     if ! verify_moby_seccomp_profile; then
         echo "error: seccomp profile verification failed" >&2
         exit 1
     fi
     maybe_notify_seccomp_update_available || true
-    if ! validate_host_paths; then
-        echo "error: fix missing paths before building" >&2
-            exit 1
-        fi
 
     # Build/validate tools volume (has its own trap)
     if ! build_tools_volume "$force" "$nocache"; then
@@ -1696,7 +2005,9 @@ cmd_build() {
     # Build service image
     echo -e "🏗️  Building service image..."
     export DOCKER_BUILDKIT=1
-    if ! dc build $nocache "$MAIN_SERVICE"; then
+    local -a build_args=()
+    [[ -n "$nocache" ]] && build_args+=("$nocache")
+    if ! dc build "${build_args[@]}" "$MAIN_SERVICE"; then
         echo "error: image build failed" >&2
         exit 1
     fi
@@ -1720,6 +2031,9 @@ cmd_build() {
 
 cmd_clean() {
     require_host "clean"
+    if ! ensure_docker_daemon; then
+        exit 1
+    fi
 
     # Try to promote any staged .next build for current hash (Phase 4)
     maybe_promote_staged_next "$DOCKERFILE_HASH"
@@ -1735,6 +2049,7 @@ cmd_clean() {
         containers=$(docker ps -aq --filter "volume=$SHARED_TOOLS_VOLUME" 2>/dev/null | tr '\n' ' ')
         if [[ -n "$containers" ]]; then
             echo -e "🛑 Removing containers using volume..."
+            # shellcheck disable=SC2086 # containers is a docker-produced ID list.
             docker rm -f $containers >/dev/null
         fi
 
@@ -1793,6 +2108,98 @@ cmd_clean() {
     fi
 }
 
+cmd_doctor() {
+    require_host "doctor"
+
+    local fix=false
+    local doctor_failed=false
+    case "${1:-}" in
+        --fix) fix=true ;;
+        "") ;;
+        *)
+            echo "error: unknown option: $1 (try --fix)" >&2
+            exit 1
+            ;;
+    esac
+
+    echo -e "${BOLD}c0 doctor${NC}"
+    echo ""
+
+    echo -e "${BOLD}host paths:${NC}"
+    if [[ "$fix" == true ]]; then
+        if ensure_host_paths; then
+            echo -e "  ${GREEN}ok${NC}"
+        else
+            exit 1
+        fi
+    elif validate_host_paths; then
+        echo -e "  ${GREEN}ok${NC}"
+    else
+        echo -e "  ${YELLOW}run:${NC} c0 doctor --fix"
+        doctor_failed=true
+    fi
+    echo ""
+
+    echo -e "${BOLD}docker:${NC}"
+    if ensure_docker_daemon; then
+        echo -e "  ${GREEN}ok${NC}"
+    else
+        exit 1
+    fi
+    echo ""
+
+    echo -e "${BOLD}ssh agent:${NC}"
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+        resolve_ssh_auth_sock_bind_source
+        if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
+            echo -e "  🔑 ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE} (gid ${C0_SSH_AUTH_SOCK_GID:-$C0_SSH_AUTH_SOCK_GID_DEFAULT})"
+        else
+            echo -e "  ${YELLOW}(host socket unavailable; see warning above)${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}(disabled; set SSH_AUTH_SOCK before c0 start)${NC}"
+    fi
+    local host_ssh_probe
+    host_ssh_probe="$(probe_host_ssh_agent)"
+    print_ssh_probe_line "host" "$host_ssh_probe"
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]] && ssh_probe_failed "$host_ssh_probe"; then
+        doctor_failed=true
+    fi
+    local ssh_container_id
+    ssh_container_id="$(dc ps -q "$MAIN_SERVICE" 2>/dev/null | head -1 || true)"
+    if [[ -n "$ssh_container_id" ]]; then
+        local container_ssh_probe
+        container_ssh_probe="$(probe_container_ssh_agent)"
+        print_ssh_probe_line "container" "$container_ssh_probe"
+        if ssh_probe_failed "$container_ssh_probe"; then
+            echo -e "  ${YELLOW}hint:${NC} rebuild with c0 build -f, restart, then re-run c0 doctor"
+            doctor_failed=true
+        fi
+    else
+        echo -e "  ${YELLOW}container:${NC} not running"
+    fi
+    echo ""
+
+    echo -e "${BOLD}seccomp:${NC}"
+    if verify_moby_seccomp_profile; then
+        echo -e "  ${GREEN}ok${NC}"
+    else
+        exit 1
+    fi
+    echo ""
+
+    echo -e "${BOLD}tools:${NC}"
+    if tools_volume_valid; then
+        echo -e "  ${GREEN}valid${NC}"
+    else
+        echo -e "  ${YELLOW}missing or stale${NC}; run c0 build"
+    fi
+
+    if [[ "$doctor_failed" == true ]]; then
+        exit 1
+    fi
+}
+
 cmd_help() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         cat <<EOF
@@ -1805,7 +2212,7 @@ Note: Running inside container. Use 'exit' to return to host.
 EOF
     else
         cat <<EOF
-Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|seccomp-upgrade|help}
+Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|doctor|seccomp-upgrade|help}
 
 Commands:
   start [--cap-drop-all]
@@ -1821,6 +2228,8 @@ Commands:
   build [-f]    Build tools and image (-f forces rebuild)
                 Pins current Dockerfile hash on success for this folder.
                 Triggers automatic cleanup of unpinned/inactive hashes.
+  doctor [--fix]
+                Check onboarding preconditions. --fix creates missing host dirs.
   seccomp-upgrade [--dry-run]
                 Use git ls-remote on moby/profiles, pick latest seccomp/vM.m.p tag,
                 curl raw default.json, verify sha256, then rewrite docker/seccomp when newer.
@@ -1834,6 +2243,8 @@ Environment:
   C0_SECURITY   permissive (default) or cap-drop-all; overridden by start --cap-drop-all
   C0_SECCOMP_NOTIFY=0  Skip upstream seccomp "newer available" notices on build/start
   C0_SECCOMP_REMOTE_CACHE_TTL  Seconds to cache git ls-remote + profile hash (default 21600)
+  C0_DOCKER_AUTOSTART=0  Disable macOS OrbStack autostart when Docker is unavailable
+  C0_DOCKER_START_TIMEOUT  Seconds to wait after autostart (default 60)
   MOBY_PROFILES_GIT_URL  Override moby/profiles.git URL (default https://github.com/moby/profiles.git)
 
 Notes:
@@ -1864,6 +2275,7 @@ case "${1:-}" in
     cp-term)    cmd_cp_term ;;
     build)      shift; cmd_build "$@" ;;
     clean)      shift; cmd_clean "$@" ;;
+    doctor)     shift; cmd_doctor "$@" ;;
     seccomp-upgrade) shift; cmd_seccomp_upgrade "$@" ;;
     help|--help|-h)
                 cmd_help ;;

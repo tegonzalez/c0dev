@@ -1,2 +1,2 @@
-PATH="$(realpath $(dirname $0))/bin:$PATH" \
+PATH="$(realpath "$(dirname "$0")")/bin:$PATH" \
 bash "$@"

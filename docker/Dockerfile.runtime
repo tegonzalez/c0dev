@@ -1,0 +1,52 @@
+# Final runtime stage (concatenated with Dockerfile.base at build time)
+FROM base
+
+RUN apt install -y \
+    locales procps \
+    bc fzf jq yq \
+    iproute2 iputils-ping net-tools socat netcat-traditional \
+    tmux vim neovim \
+    wget bat btop tree \
+    pandoc poppler-utils \
+    openssh-server
+
+RUN printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/01c0dev-no-sandbox
+
+# && rm -rf /var/lib/apt/lists/*
+
+# Install global bun packages
+RUN bun i -g opencode-ai@latest
+RUN bun i -g @openai/codex@latest
+RUN bun i -g @anthropic-ai/claude-code@latest
+# > 300s WTAF??
+# RUN bun i -g @google/gemini-cli@latest
+
+# errata: handle bun -g installing as local user garbage
+RUN chmod +rx /root
+
+# Set the locale
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+# Set timezone (default to Los Angeles, can be overridden with TZ env var)
+ARG TZ=America/Los_Angeles
+ENV TZ=${TZ}
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Copy terminfo
+COPY .terminfo /tmp/.terminfo
+RUN for term in /tmp/.terminfo/*; do tic -x -o /usr/share/terminfo $term; done
+
+# Copy entrypoint script (bind-mounted from host at runtime; baked in for standalone runs)
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Set up dev user
+USER dev
+WORKDIR /home/dev
+
+RUN echo '. "$HOME/bin/activate"' >> ~/.profile
+ENV SHELL=/bin/bash
+ENTRYPOINT [""]

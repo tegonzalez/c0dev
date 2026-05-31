@@ -1,4 +1,5 @@
-# Strict runtime security for Codex/Cursor as dev (c0 start --cap-drop-all).
+# Strict runtime label for Codex/Cursor (c0 start --cap-drop-all).
+# Same cap/seccomp profile as permissive; mode is recorded on the container label only.
 services:
   c0dev:
     privileged: false
@@ -7,3 +8,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER

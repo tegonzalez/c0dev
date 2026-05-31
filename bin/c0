@@ -23,14 +23,20 @@ NC='\033[0m' # No Color
 # Preconditions (fail-fast)
 # =============================================================================
 
-C0ROOT="$(realpath "$(dirname "$0")/..")"
+# Repo root from this script's real path (symlink-safe: c0 may live outside the checkout)
+C0_BIN="$(realpath "$0")"
+C0ROOT="$(realpath "$(dirname "$C0_BIN")/..")"
 
 # Required files - exit non-zero if any are missing
 REQUIRED_FILES=(
     "$C0ROOT/docker/docker-compose.public.yaml"
     "$C0ROOT/docker/volumes-folders.yaml"
     "$C0ROOT/docker/volumes-files.yaml"
-    "$C0ROOT/docker/Dockerfile"
+    "$C0ROOT/docker/Dockerfile.runtime"
+    "$C0ROOT/docker/Dockerfile.base"
+    "$C0ROOT/docker/Dockerfile.tools"
+    "$C0ROOT/bin/docker-hash"
+    "$C0ROOT/bin/dockerfile-concat"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.json"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.sha256"
     "$C0ROOT/docker/seccomp/moby-seccomp.tag"
@@ -53,16 +59,18 @@ else
 fi
 
 # =============================================================================
-# Mode and project naming
+# Instance id (docker compose -p; one per c0dev checkout path)
 # =============================================================================
 
-# =============================================================================
 # Web port allocation
 # =============================================================================
 
 # Host port range used to map guest:3000 -> host:<port>
 C0DEV_WEB_PORT_MIN=3000
 C0DEV_WEB_PORT_MAX=4000
+C0DEV_SSH_PORT_MIN=2222
+C0DEV_SSH_PORT_MAX=2322
+C0_SSH_DIR="$C0ROOT/auth/ssh"
 
 # C0_MODE validation: only "" (prod) or "dev" allowed
 if [[ -n "$C0_MODE" && "$C0_MODE" != "dev" ]]; then
@@ -75,18 +83,43 @@ short_hash() {
     echo -n "$1" | shasum -a 256 | cut -c1-8
 }
 
-# Project naming based on mode
+# Docker instance id for a c0dev folder (C0ROOT) and mode.
+c0_instance_id_for() {
+    local c0root="$1" mode="${2:-}"
+    if [[ "$mode" == "dev" ]]; then
+        echo "c0dev-dev-$(short_hash "${c0root}:dev")"
+    else
+        echo "c0dev-$(short_hash "$c0root")"
+    fi
+}
+
 if [[ "$C0_MODE" == "dev" ]]; then
-    PROJECT_NAME="c0dev-dev-$(short_hash "${C0ROOT}:dev")"
+    C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT" dev)"
     SHARED_TOOLS_VOLUME="c0dev-tools-shared-dev"
 else
-    PROJECT_NAME="c0dev-$(short_hash "$C0ROOT")"
+    C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT")"
     SHARED_TOOLS_VOLUME="c0dev-tools-shared"
 fi
 
-# Dockerfile hash for tools prefix
-DOCKERFILE_HASH="$(shasum -a 256 "$C0ROOT/docker/Dockerfile" | cut -c1-64)"
-TOOLS_PREFIX="/tools/opt/$DOCKERFILE_HASH"
+# Tools volume key: hash of Dockerfile.base + Dockerfile.tools (comment-stripped).
+TOOLS_ID="$("$C0ROOT/bin/docker-hash" "$C0ROOT/docker/Dockerfile.base" "$C0ROOT/docker/Dockerfile.tools")"
+TOOLS_PREFIX="/tools/opt/$TOOLS_ID"
+
+DOCKERFILE_BASE="$C0ROOT/docker/Dockerfile.base"
+DOCKERFILE_TOOLS="$C0ROOT/docker/Dockerfile.tools"
+DOCKERFILE_RUNTIME="$C0ROOT/docker/Dockerfile.runtime"
+DOCKERFILE_TOOLS_BUILD="$C0ROOT/docker/.Dockerfile.tools.build"
+DOCKERFILE_RUNTIME_BUILD="$C0ROOT/docker/.Dockerfile.build"
+
+c0_prepare_tools_dockerfile() {
+    "$C0ROOT/bin/dockerfile-concat" -o "$DOCKERFILE_TOOLS_BUILD" \
+        "$DOCKERFILE_BASE" "$DOCKERFILE_TOOLS"
+}
+
+c0_prepare_runtime_dockerfile() {
+    "$C0ROOT/bin/dockerfile-concat" -o "$DOCKERFILE_RUNTIME_BUILD" \
+        "$DOCKERFILE_BASE" "$DOCKERFILE_RUNTIME"
+}
 
 # =============================================================================
 # Compose file paths
@@ -96,7 +129,8 @@ COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
 COMPOSE_SECURITY_PERMISSIVE="$C0ROOT/docker/docker-compose.security-permissive.yaml"
 COMPOSE_SECURITY_CAP_DROP_ALL="$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
 COMPOSE_SSH_AUTH_FILE="$C0ROOT/docker/.compose.ssh-auth.yaml"
-C0_SSH_AUTH_SOCK_GUEST="/home/dev/.ssh-auth.sock"
+# OrbStack / Docker Desktop relay; same path in VM and guest (required for 1Password — not launchd $SSH_AUTH_SOCK)
+C0_SSH_AUTH_SOCK_PATH="/run/host-services/ssh-auth.sock"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
 VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
 MAIN_SERVICE="c0dev"
@@ -443,11 +477,35 @@ c0_security_compose_file() {
 }
 
 # Running container label (docker inspect; does not use compose).
-get_running_container_security_mode() {
+get_c0_container_id() {
+    docker ps -q -f "label=c0dev.instance=${C0_INSTANCE_ID}" 2>/dev/null | head -n 1 || true
+}
+
+get_c0_container_id_any() {
     local cid
-    cid="$(docker ps -aq -f "label=c0dev.project=${PROJECT_NAME}" 2>/dev/null | head -n 1 || true)"
+    cid="$(get_c0_container_id)"
+    [[ -n "$cid" ]] && { echo "$cid"; return 0; }
+    docker ps -aq -f "label=c0dev.instance=${C0_INSTANCE_ID}" 2>/dev/null | head -n 1 || true
+}
+
+get_c0_container_state() {
+    local cid="$1"
+    [[ -z "$cid" ]] && return 0
+    docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || true
+}
+
+get_c0_container_security_mode() {
+    local cid="$1"
     [[ -z "$cid" ]] && return 0
     docker inspect "$cid" --format '{{ index .Config.Labels "c0dev.security_mode" }}' 2>/dev/null || true
+}
+
+get_running_container_security_mode() {
+    local cid
+    cid="$(get_c0_container_id)"
+    [[ -z "$cid" ]] && cid="$(docker ps -q -f "label=c0dev.project=${C0_INSTANCE_ID}" 2>/dev/null | head -n 1 || true)"
+    [[ -z "$cid" ]] && return 0
+    get_c0_container_security_mode "$cid"
 }
 
 # For dc and display when not starting: match running container, else env, else permissive.
@@ -509,16 +567,50 @@ print_security_mode() {
 }
 
 # =============================================================================
-# SSH agent: use shell SSH_AUTH_SOCK; macOS/OrbStack uses VM relay (not launchd path)
+# SSH agent: OrbStack/Desktop relay at /run/host-services/ssh-auth.sock (1Password-safe)
 # =============================================================================
 
-# Darwin + OrbStack/Docker Desktop: bind relay, not $SSH_AUTH_SOCK (launchd path → guest directory).
+# Host $SSH_AUTH_SOCK may be launchd or 1Password — never bind that into containers on macOS.
+c0_ssh_agent_use_host_relay() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        return 0
+    fi
+    [[ -S "$C0_SSH_AUTH_SOCK_PATH" ]]
+}
+
+c0_host_ssh_agent_backend() {
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+        echo "none"
+    elif [[ "$SSH_AUTH_SOCK" == *1Password* || "$SSH_AUTH_SOCK" == *"Group Containers"* ]]; then
+        echo "1password"
+    else
+        echo "openssh"
+    fi
+}
+
+# Agent on host is usable (1Password or launchd); guest always uses VM relay path, not host path.
+c0_host_ssh_agent_ready() {
+    [[ "${C0_SSH_AGENT:-1}" == "0" ]] && return 1
+    [[ -n "${SSH_AUTH_SOCK:-}" ]] || return 1
+    [[ -S "$SSH_AUTH_SOCK" ]] || return 1
+    command -v ssh-add &>/dev/null || return 1
+    ssh-add -l &>/dev/null
+}
+
 resolve_ssh_auth_sock_bind_source() {
     C0_SSH_AUTH_SOCK_BIND_SOURCE=""
-    [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
+    if ! c0_host_ssh_agent_ready; then
+        return 0
+    fi
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        C0_SSH_AUTH_SOCK_BIND_SOURCE="/run/host-services/ssh-auth.sock"
+    if [[ -n "${C0_SSH_AUTH_BIND:-}" ]]; then
+        C0_SSH_AUTH_SOCK_BIND_SOURCE="$C0_SSH_AUTH_BIND"
+        if c0_ssh_agent_use_host_relay && [[ "$C0_SSH_AUTH_BIND" != "$C0_SSH_AUTH_SOCK_PATH" ]]; then
+            echo -e "${YELLOW}warning:${NC} C0_SSH_AUTH_BIND=${C0_SSH_AUTH_BIND} overrides OrbStack relay" >&2
+            echo -e "  With 1Password, use ${C0_SSH_AUTH_SOCK_PATH} only (unset C0_SSH_AUTH_BIND)." >&2
+        fi
+    elif c0_ssh_agent_use_host_relay; then
+        C0_SSH_AUTH_SOCK_BIND_SOURCE="$C0_SSH_AUTH_SOCK_PATH"
     elif [[ -S "$SSH_AUTH_SOCK" ]]; then
         C0_SSH_AUTH_SOCK_BIND_SOURCE="$SSH_AUTH_SOCK"
     else
@@ -529,17 +621,41 @@ resolve_ssh_auth_sock_bind_source() {
     export C0_SSH_AUTH_SOCK_BIND_SOURCE
 }
 
+# Relay socket gid is host-specific (mode often 660); guest dev needs that gid via group_add.
+c0_ssh_relay_socket_gid() {
+    local bind="${1:-$C0_SSH_AUTH_SOCK_PATH}"
+    docker run --rm -v "${bind}:/s:ro" alpine stat -c '%g' /s 2>/dev/null | tr -d ' \n'
+}
+
 ensure_ssh_auth_compose_fragment() {
     resolve_ssh_auth_sock_bind_source
     if [[ -z "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
         rm -f "$COMPOSE_SSH_AUTH_FILE"
+        C0_SSH_AUTH_GID=""
         return 0
     fi
+
+    C0_SSH_AUTH_GID=""
+    local group_add_yaml=""
+    if [[ "${C0_SSH_AUTH_SOCK_BIND_SOURCE}" == "$C0_SSH_AUTH_SOCK_PATH" ]]; then
+        C0_SSH_AUTH_GID="$(c0_ssh_relay_socket_gid "$C0_SSH_AUTH_SOCK_BIND_SOURCE")"
+        if [[ -n "$C0_SSH_AUTH_GID" && "$C0_SSH_AUTH_GID" =~ ^[0-9]+$ ]]; then
+            group_add_yaml="
+    group_add:
+      - \"${C0_SSH_AUTH_GID}\""
+        else
+            echo -e "${YELLOW}warning:${NC} could not read gid of ${C0_SSH_AUTH_SOCK_BIND_SOURCE} (docker stat)" >&2
+            echo -e "  SSH agent in guest may fail with Permission denied; restart after OrbStack is up." >&2
+        fi
+    fi
+    export C0_SSH_AUTH_GID
+
     cat >"$COMPOSE_SSH_AUTH_FILE" <<EOF
 services:
   c0dev:
     volumes:
-      - ${C0_SSH_AUTH_SOCK_BIND_SOURCE}:${C0_SSH_AUTH_SOCK_GUEST}
+      - ${C0_SSH_AUTH_SOCK_BIND_SOURCE}:${C0_SSH_AUTH_SOCK_PATH}
+${group_add_yaml}
 EOF
 }
 
@@ -547,15 +663,17 @@ print_ssh_auth_mapping() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         return 0
     fi
-    [[ -z "${SSH_AUTH_SOCK:-}" ]] && return 0
     resolve_ssh_auth_sock_bind_source
     if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
-        echo -e "🔑 SSH agent: ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+        echo -e "🔑 SSH agent: ${YELLOW}${C0_SSH_AUTH_SOCK_PATH}${NC} (host ${c0_host_ssh_agent_backend} → relay)"
+        if [[ -n "${C0_SSH_AUTH_GID:-}" ]]; then
+            echo -e "   group_add: ${YELLOW}${C0_SSH_AUTH_GID}${NC} (relay socket group)"
+        fi
     fi
 }
 
 # =============================================================================
-# Helper: docker-compose wrapper with project isolation
+# Helper: docker-compose wrapper (one compose project per instance id)
 # =============================================================================
 
 dc() {
@@ -565,10 +683,11 @@ dc() {
     ensure_ssh_auth_compose_fragment
 
     export SHARED_TOOLS_VOLUME
+    export TOOLS_ID
     export TOOLS_PREFIX
-    export DOCKERFILE_HASH
-    export C0DEV_HOSTNAME="$PROJECT_NAME"
+    export C0_INSTANCE_ID
     export C0_SECURITY
+    export C0DEV_SSH_PORT
 
     local -a compose_files=(
         -f "$VOLUMES_FOLDERS_FILE"
@@ -580,7 +699,7 @@ dc() {
         compose_files+=(-f "$COMPOSE_SSH_AUTH_FILE")
     fi
 
-    docker compose -p "$PROJECT_NAME" "${compose_files[@]}" "$@"
+    docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" "$@"
 }
 
 # =============================================================================
@@ -589,7 +708,7 @@ dc() {
 
 get_mapped_web_port_from_container() {
     local container_id="$1"
-    docker inspect -f '{{with (index .NetworkSettings.Ports "3000/tcp")}}{{(index . 0).HostPort}}{{end}}' "$container_id" 2>/dev/null || true
+    docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "3000/tcp"}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}{{end}}' "$container_id" 2>/dev/null || true
 }
 
 get_current_web_port() {
@@ -598,7 +717,7 @@ get_current_web_port() {
     fi
 
     local container_id
-    container_id="$(dc ps -aq "$MAIN_SERVICE" 2>/dev/null | head -n 1 || true)"
+    container_id="$(get_c0_container_id_any)"
     if [[ -n "$container_id" ]]; then
         local mapped
         mapped="$(get_mapped_web_port_from_container "$container_id")"
@@ -612,6 +731,36 @@ get_current_web_port() {
         echo "$C0DEV_WEB_PORT"
         return 0
     fi
+}
+
+# Finds the first integer >= start that is not present in the provided set.
+# Signature: first_gap_port <start> [ports...]
+# Assumes the list is sorted ascending (as produced by bin/list-listening-ports).
+first_gap_port() {
+    local start="$1"
+    shift
+
+    local candidate="$start"
+    local port
+    for port in "$@"; do
+        case "$port" in
+            ''|*[!0-9]*) continue ;;
+        esac
+
+        if [[ "$port" -lt "$candidate" ]]; then
+            continue
+        fi
+        if [[ "$port" -eq "$candidate" ]]; then
+            candidate=$((candidate + 1))
+            continue
+        fi
+
+        echo "$candidate"
+        return 0
+    done
+
+    echo "$candidate"
+    return 0
 }
 
 ensure_web_port() {
@@ -630,37 +779,6 @@ ensure_web_port() {
         echo "error: missing required helper: $ports_cmd" >&2
         return 1
     fi
-
-    # Finds the first integer >= start that is not present in the provided set.
-    # Signature: first_gap_port <start> [ports...]
-    # Assumes the list is sorted ascending (as produced by bin/list-listening-ports).
-    first_gap_port() {
-        local start="$1"
-        shift
-
-        local candidate="$start"
-        local port
-        for port in "$@"; do
-            case "$port" in
-                ''|*[!0-9]*) continue ;;
-            esac
-
-            if [[ "$port" -lt "$candidate" ]]; then
-                continue
-            fi
-            if [[ "$port" -eq "$candidate" ]]; then
-                candidate=$((candidate + 1))
-                continue
-            fi
-
-            # port > candidate means candidate is a gap
-            echo "$candidate"
-            return 0
-        done
-
-        echo "$candidate"
-        return 0
-    }
 
     local ports
     if ! ports="$("$ports_cmd" "$start" "$end")"; then
@@ -697,6 +815,238 @@ print_web_port_mapping() {
     port="$(get_current_web_port || true)"
     if [[ -n "$port" ]]; then
         echo -e "🌐 Port: ${YELLOW}host:${port}${NC} -> ${YELLOW}guest:3000${NC}"
+    fi
+}
+
+get_mapped_ssh_port_from_container() {
+    local container_id="$1"
+    docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "2222/tcp"}}{{range $conf}}{{if eq .HostIp "127.0.0.1"}}{{.HostPort}}{{end}}{{end}}{{end}}{{end}}' "$container_id" 2>/dev/null || true
+}
+
+get_current_ssh_port() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local container_id
+    container_id="$(get_c0_container_id_any)"
+    if [[ -n "$container_id" ]]; then
+        local mapped
+        mapped="$(get_mapped_ssh_port_from_container "$container_id")"
+        if [[ -n "$mapped" ]]; then
+            echo "$mapped"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${C0DEV_SSH_PORT:-}" ]]; then
+        echo "$C0DEV_SSH_PORT"
+        return 0
+    fi
+}
+
+ensure_ssh_port() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${C0DEV_SSH_PORT:-}" ]]; then
+        return 0
+    fi
+
+    local container_id
+    container_id="$(docker compose -p "$C0_INSTANCE_ID" \
+        -f "$VOLUMES_FOLDERS_FILE" -f "$VOLUMES_FILES_FILE" -f "$COMPOSE_PUBLIC_FILE" \
+        ps -aq "$MAIN_SERVICE" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$container_id" ]]; then
+        local mapped
+        mapped="$(get_mapped_ssh_port_from_container "$container_id")"
+        if [[ -n "$mapped" ]]; then
+            C0DEV_SSH_PORT="$mapped"
+            export C0DEV_SSH_PORT
+            return 0
+        fi
+    fi
+
+    local start="$C0DEV_SSH_PORT_MIN"
+    local end="$C0DEV_SSH_PORT_MAX"
+    local ports_cmd="$C0ROOT/bin/list-listening-ports"
+    if [[ ! -x "$ports_cmd" ]]; then
+        echo "error: missing required helper: $ports_cmd" >&2
+        return 1
+    fi
+
+    local ports
+    if ! ports="$("$ports_cmd" "$start" "$end")"; then
+        return 1
+    fi
+
+    local next
+    local -a port_list=()
+    if [[ -n "$ports" ]]; then
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            port_list+=("$line")
+        done <<<"$ports"
+    fi
+
+    next="$(first_gap_port "$start" "${port_list[@]}")"
+
+    if [[ "$next" -gt "$end" ]]; then
+        echo "error: no SSH ports left in range ${start}-${end}" >&2
+        return 1
+    fi
+
+    C0DEV_SSH_PORT="$next"
+    export C0DEV_SSH_PORT
+}
+
+print_ssh_server_mapping() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+
+    local port
+    port="$(get_current_ssh_port || true)"
+    if [[ -n "$port" ]]; then
+        echo -e "🔐 SSH: ${YELLOW}127.0.0.1:${port}${NC} -> ${YELLOW}dev@guest:2222${NC} (${CYAN}c0 ssh${NC})"
+    fi
+}
+
+c0_ssh_write_sshd_config() {
+    local ssh_dir="$C0_SSH_DIR"
+    cat >"$ssh_dir/sshd_config" <<EOF
+Port 2222
+ListenAddress 0.0.0.0
+PermitTTY yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/dev/.ssh/authorized_keys
+HostKey /home/dev/.ssh/ssh_host_ed25519_key
+PidFile /run/sshd/sshd.pid
+UsePAM no
+LogLevel INFO
+EOF
+    chmod 644 "$ssh_dir/sshd_config"
+}
+
+c0_ssh_keygen() {
+    local ssh_dir="$C0_SSH_DIR"
+
+    chmod 700 "$ssh_dir"
+
+    if [[ ! -f "$ssh_dir/id_ed25519" ]]; then
+        ssh-keygen -t ed25519 -a 100 -f "$ssh_dir/id_ed25519" -N "" -C "c0dev@${C0_INSTANCE_ID}"
+    fi
+
+    if [[ ! -f "$ssh_dir/ssh_host_ed25519_key" ]]; then
+        ssh-keygen -t ed25519 -a 100 -f "$ssh_dir/ssh_host_ed25519_key" -N "" -C "c0dev-sshd@${C0_INSTANCE_ID}"
+    fi
+
+    if [[ ! -s "$ssh_dir/authorized_keys" ]]; then
+        cat "$ssh_dir/id_ed25519.pub" >"$ssh_dir/authorized_keys"
+        chmod 600 "$ssh_dir/authorized_keys"
+    fi
+
+    c0_ssh_write_sshd_config
+}
+
+c0_ssh_ensure_keys() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$C0_SSH_DIR/authorized_keys" ]]; then
+        c0_ssh_keygen
+    else
+        c0_ssh_write_sshd_config
+    fi
+}
+
+c0_container_log_tail() {
+    local cid="$1" lines="${2:-30}"
+    local name
+    [[ -z "$cid" ]] && return 0
+    name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')"
+    [[ -z "$name" ]] && return 0
+    docker logs "$name" 2>&1 | tail -n "$lines"
+}
+
+c0_require_container_running() {
+    local cid state name
+    cid="$(get_c0_container_id)"
+    if [[ -n "$cid" ]]; then
+        return 0
+    fi
+    cid="$(get_c0_container_id_any)"
+    if [[ -z "$cid" ]]; then
+        echo "error: container not running — run 'c0 start' first" >&2
+        return 1
+    fi
+    state="$(get_c0_container_state "$cid")"
+    name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')"
+    echo "error: container ${state} (${name})" >&2
+    c0_container_log_tail "$cid" 20 >&2
+    return 1
+}
+
+c0_wait_container_running() {
+    local i cid
+    for i in $(seq 1 15); do
+        cid="$(get_c0_container_id)"
+        [[ -n "$cid" ]] && return 0
+        sleep 0.2
+    done
+    c0_require_container_running
+}
+
+c0_warn_container_user() {
+    local cid user
+    cid="$(get_c0_container_id)"
+    [[ -z "$cid" ]] && return 0
+    user="$(docker inspect -f '{{.Config.User}}' "$cid" 2>/dev/null || true)"
+    if [[ -n "$user" && "$user" != "dev" ]]; then
+        echo -e "${YELLOW}warning:${NC} container User=${user} (expected dev, image USER); run 'c0 build' to refresh image" >&2
+    fi
+}
+
+cmd_ssh() {
+    require_host "ssh"
+
+    if [[ "${1:-}" == "--keygen" ]]; then
+        c0_ssh_keygen
+        echo -e "✅ SSH keys: ${GREEN}auth/ssh/${NC}"
+        return 0
+    fi
+
+    c0_ssh_ensure_keys
+    c0_require_container_running || exit 1
+
+    local port project_path
+    port="$(get_current_ssh_port || true)"
+    if [[ -z "$port" ]]; then
+        echo "error: SSH port unknown — run 'c0 start' first" >&2
+        exit 1
+    fi
+
+    project_path=$(get_project_path)
+
+    local -a ssh_args=(
+        -i "$C0_SSH_DIR/id_ed25519"
+        -o "StrictHostKeyChecking=accept-new"
+        -o "UserKnownHostsFile=$C0_SSH_DIR/known_hosts"
+        -p "$port"
+    )
+    if [[ $# -gt 0 ]]; then
+        exec ssh "${ssh_args[@]}" dev@127.0.0.1 /bin/bash -lc "$(printf '%q ' "$@")"
+    elif [[ -n "$project_path" ]]; then
+        print_web_port_mapping
+        echo -e "🔐 SSH: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
+        exec ssh "${ssh_args[@]}" -t dev@127.0.0.1 /bin/bash -lc "cd $(printf '%q' "$CONTAINER_DEV_HOME/projects/$project_path") && exec bash -l"
+    else
+        exec ssh "${ssh_args[@]}" -t dev@127.0.0.1 /bin/bash -l
     fi
 }
 
@@ -857,6 +1207,11 @@ validate_host_paths() {
     parse_folder_mappings _validate_folder_callback
     parse_file_mappings _validate_file_callback
 
+    # Non-destructive: ensure mutable tool cache dirs exist on host (never purge)
+    if [[ -d "$C0ROOT/.cache" ]]; then
+        mkdir -p "$C0ROOT/.cache/cargo" "$C0ROOT/.cache/uv" 2>/dev/null || true
+    fi
+
     if [[ ${#errors[@]} -gt 0 ]]; then
         echo "error: host path validation failed:" >&2
         for err in "${errors[@]}"; do
@@ -878,16 +1233,29 @@ validate_host_paths() {
     return 0
 }
 
-# Check if shared tools volume exists and is valid for current Dockerfile hash
-tools_volume_valid() {
-    # Check if volume exists
+# Check if a tools hash directory is complete on the shared volume
+tools_volume_hash_complete() {
+    local h="$1"
+    [[ -z "$h" ]] && return 1
     if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
         return 1
     fi
-
-    # Check if completeness marker exists
     c0_docker_run -v "$SHARED_TOOLS_VOLUME:/tools:ro" alpine \
-        test -f "/tools/opt/$DOCKERFILE_HASH/.c0dev-complete" 2>/dev/null
+        test -f "/tools/opt/$h/.c0dev-complete" 2>/dev/null
+}
+
+# Check if shared tools volume has complete tools for current TOOLS_ID
+tools_volume_valid() {
+    tools_volume_hash_complete "$TOOLS_ID"
+}
+
+tools_volume_invalid_hint() {
+    if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
+        echo "hint: volume ${SHARED_TOOLS_VOLUME} missing — run 'c0 build'" >&2
+        return 0
+    fi
+    echo "hint: no tools at /tools/opt/${TOOLS_ID} — run 'c0 build'" >&2
+    echo "hint: TOOLS_ID hashes Dockerfile.base + Dockerfile.tools (runtime Dockerfile excluded)" >&2
 }
 
 # Get project relative path for shell navigation
@@ -972,7 +1340,19 @@ pin_path_for_folder_id() {
     echo "/tools/pins/${folder_id}.pin"
 }
 
-# Read pin for current folder (returns hash or empty)
+# Extract tools_id from pin file content (tools_id= preferred; hash= for legacy pins)
+pin_tools_id_from_content() {
+    local content="$1"
+    local id
+    id="$(echo "$content" | grep '^tools_id=' | cut -d= -f2-)"
+    if [[ -n "$id" ]]; then
+        echo "$id"
+        return 0
+    fi
+    echo "$content" | grep '^hash=' | cut -d= -f2-
+}
+
+# Read pin for current folder (returns tools_id or empty; GC metadata only)
 read_pin_for_folder_id() {
     local folder_id="$1"
     local pin_path
@@ -985,7 +1365,7 @@ read_pin_for_folder_id() {
     local content
     content="$(tools_volume_sh "cat '$pin_path' 2>/dev/null || true")"
     if [[ -n "$content" ]]; then
-        echo "$content" | grep '^hash=' | cut -d= -f2
+        pin_tools_id_from_content "$content"
     fi
 }
 
@@ -1008,6 +1388,7 @@ write_pin_for_folder_id() {
     tools_volume_sh "
         mkdir -p /tools/pins
         cat > '$pin_path' <<EOF
+tools_id=$hash
 hash=$hash
 c0root=$c0root
 mode=$mode
@@ -1052,7 +1433,7 @@ list_all_pins() {
         content="$(tools_volume_sh "cat '$pin_file' 2>/dev/null || true")"
         if [[ -n "$content" ]]; then
             local hash c0root
-            hash="$(echo "$content" | grep '^hash=' | cut -d= -f2)"
+            hash="$(pin_tools_id_from_content "$content")"
             c0root="$(echo "$content" | grep '^c0root=' | cut -d= -f2-)"
             if [[ -n "$hash" && -n "$c0root" ]]; then
                 echo "$folder_id $hash $c0root"
@@ -1224,7 +1605,7 @@ maybe_promote_staged_next() {
 build_tools_volume() {
     local force="${1:-false}"
     local nocache="${2:-}"
-    local H="$DOCKERFILE_HASH"
+    local H="$TOOLS_ID"
     local VOL="$SHARED_TOOLS_VOLUME"
     local TAG="c0dev-tools-builder:$H"
 
@@ -1263,28 +1644,53 @@ build_tools_volume() {
     # 2) Build tools image (BuildKit builder is short-lived; service hardening is in compose at runtime)
     echo -e "  🔧 Building tools-builder stage..."
     export DOCKER_BUILDKIT=1
-    if ! docker build $nocache --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
+    c0_prepare_tools_dockerfile
+    if ! docker build $nocache -f "$DOCKERFILE_TOOLS_BUILD" --target tools-builder -t "$TAG" "$C0ROOT/docker"; then
         trap - INT TERM
         return 1
     fi
 
-    # 3) Stream tarball from tools image into volume temp dir
+    # 3) Pack immutable paths and extract to tools volume as dev (image USER; no chown under cap_drop)
     echo -e "  📤 Extracting to temp..."
-    if ! (c0_docker_run "$TAG" sh -lc 'tar -C /home/dev -cf - .cargo .rustup .local' | \
-        c0_docker_run -i -v "$VOL:/tools" alpine sh -c "
+    if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
             set -e
             rm -rf '/tools/tmp/$H.partial'
-            mkdir -p '/tools/tmp/$H.partial'
-            tar -C '/tools/tmp/$H.partial' -xf -
-        "); then
+            mkdir -p '/tools/tmp' '/tools/tmp/$H.partial'
+            chmod 1777 '/tools/tmp'
+            chmod 777 '/tools/tmp/$H.partial'
+        "; then
+        trap - INT TERM
+        return 1
+    fi
+    if ! c0_docker_run -u dev -v "$VOL:/tools" "$TAG" sh -lc "
+            set -e
+            cd /home/dev
+            paths=''
+            for p in \
+                .cargo/bin \
+                .rustup \
+                .local/bin \
+                .local/share/uv/tools \
+                .local/share/uv/python
+            do
+                if [ -e \"\$p\" ]; then
+                    paths=\"\$paths \$p\"
+                fi
+            done
+            if [ -z \"\$paths\" ]; then
+                echo 'error: no immutable tool paths to pack' >&2
+                exit 1
+            fi
+            tar -cf - \$paths | tar -C '/tools/tmp/$H.partial' --no-same-owner -xf -
+        "; then
         trap - INT TERM
         c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
         return 1
     fi
 
-    # 4) Write completeness marker
+    # 4) Write completeness marker (as dev so volume tree matches image USER)
     echo -e "  ✓ Marking complete..."
-    if ! c0_docker_run -v "$VOL:/tools" alpine touch "/tools/tmp/$H.partial/.c0dev-complete"; then
+    if ! c0_docker_run -u dev -v "$VOL:/tools" "$TAG" touch "/tools/tmp/$H.partial/.c0dev-complete"; then
         trap - INT TERM
         c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
         return 1
@@ -1360,6 +1766,8 @@ cmd_start() {
     resolve_c0_security_for_start "$@" || exit 1
 
     ensure_web_port
+    ensure_ssh_port
+    c0_ssh_ensure_keys
 
     if ! verify_moby_seccomp_profile; then
         echo "error: seccomp profile verification failed" >&2
@@ -1376,24 +1784,30 @@ cmd_start() {
     # Check tools volume
     if ! tools_volume_valid; then
         echo "error: tools volume invalid or missing - run 'c0 build' first" >&2
-            exit 1
-        fi
-
-    echo -e "🚀 Starting ${CYAN}$PROJECT_NAME${NC}..."
-    if ! dc up -d; then
-        echo "error: failed to start containers (port may already be in use)" >&2
-        echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
+        tools_volume_invalid_hint
         exit 1
     fi
+
+    echo -e "🚀 Starting ${CYAN}$C0_INSTANCE_ID${NC}..."
+    if ! dc up -d; then
+        echo "error: failed to start containers (port may already be in use)" >&2
+        echo "hint: retry with different ports, e.g. C0DEV_WEB_PORT=3001 C0DEV_SSH_PORT=2223 c0 start" >&2
+        exit 1
+    fi
+    if ! c0_wait_container_running; then
+        exit 1
+    fi
+    c0_warn_container_user
     print_security_mode
     print_ssh_auth_mapping
+    print_ssh_server_mapping
     print_web_port_mapping
     echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
 }
 
 cmd_stop() {
     require_host "stop"
-    echo -e "🛑 Stopping ${CYAN}$PROJECT_NAME${NC}..."
+    echo -e "🛑 Stopping ${CYAN}$C0_INSTANCE_ID${NC}..."
     dc down
     echo -e "✅ Stopped"
 }
@@ -1404,7 +1818,9 @@ cmd_restart() {
     resolve_c0_security_for_start "$@" || exit 1
 
     ensure_web_port
-    echo -e "🔄 Restarting ${CYAN}$PROJECT_NAME${NC}..."
+    ensure_ssh_port
+    c0_ssh_ensure_keys
+    echo -e "🔄 Restarting ${CYAN}$C0_INSTANCE_ID${NC}..."
     dc down
 
     # Validate before restart
@@ -1419,16 +1835,22 @@ cmd_restart() {
         fi
     if ! tools_volume_valid; then
         echo "error: tools volume invalid - run 'c0 build' first" >&2
-            exit 1
-        fi
+        tools_volume_invalid_hint
+        exit 1
+    fi
 
     if ! dc up -d; then
         echo "error: failed to restart containers (port may already be in use)" >&2
-        echo "hint: retry with a different port, e.g. C0DEV_WEB_PORT=3001 c0 start" >&2
+        echo "hint: retry with different ports, e.g. C0DEV_WEB_PORT=3001 C0DEV_SSH_PORT=2223 c0 restart" >&2
         exit 1
     fi
+    if ! c0_wait_container_running; then
+        exit 1
+    fi
+    c0_warn_container_user
     print_security_mode
     print_ssh_auth_mapping
+    print_ssh_server_mapping
     print_web_port_mapping
     echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -1449,23 +1871,33 @@ cmd_status() {
 
     # Port mapping (if container exists)
     echo -e "${BOLD}ports:${NC}"
-    local mapped_port
+    local mapped_port mapped_ssh_port
     mapped_port="$(get_current_web_port || true)"
+    mapped_ssh_port="$(get_current_ssh_port || true)"
     if [[ -n "$mapped_port" ]]; then
         echo -e "  🌐 ${YELLOW}host:${mapped_port}${NC} -> ${YELLOW}guest:3000${NC}"
     else
-        echo -e "  ${YELLOW}(none)${NC}"
+        echo -e "  🌐 ${YELLOW}(none)${NC}"
+    fi
+    if [[ -n "$mapped_ssh_port" ]]; then
+        echo -e "  🔐 ${YELLOW}127.0.0.1:${mapped_ssh_port}${NC} -> ${YELLOW}dev@guest:2222${NC}"
+    else
+        echo -e "  🔐 ${YELLOW}(none)${NC}"
     fi
     echo ""
 
     echo -e "${BOLD}security:${NC}"
-    local running_security configured_security
-    running_security="$(get_running_container_security_mode)"
-    if [[ -n "$running_security" ]]; then
+    local running_security configured_security container_cid container_state
+    container_cid="$(get_c0_container_id_any)"
+    container_state="$(get_c0_container_state "$container_cid")"
+    running_security="$(get_c0_container_security_mode "$container_cid")"
+    if [[ -n "$running_security" && "$container_state" == "running" ]]; then
         echo -e "  🔒 ${YELLOW}${running_security}${NC} (running)"
         if [[ -n "${C0_SECURITY:-}" && "${C0_SECURITY}" != "$running_security" ]]; then
             echo -e "  ${YELLOW}note:${NC} shell C0_SECURITY=${C0_SECURITY} differs; use matching flag on restart"
         fi
+    elif [[ -n "$running_security" && -n "$container_state" ]]; then
+        echo -e "  🔒 ${YELLOW}${running_security}${NC} (${RED}${container_state}${NC})"
     else
         ensure_c0_security_resolved || true
         configured_security="${C0_SECURITY:-permissive}"
@@ -1473,31 +1905,46 @@ cmd_status() {
     fi
     echo ""
 
-    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
-        echo -e "${BOLD}ssh agent:${NC}"
+    echo -e "${BOLD}ssh agent:${NC}"
+    if c0_host_ssh_agent_ready; then
         resolve_ssh_auth_sock_bind_source
         if [[ -n "${C0_SSH_AUTH_SOCK_BIND_SOURCE:-}" ]]; then
-            echo -e "  🔑 ${YELLOW}${C0_SSH_AUTH_SOCK_GUEST}${NC} ← ${C0_SSH_AUTH_SOCK_BIND_SOURCE}"
+            echo -e "  host: ${YELLOW}${c0_host_ssh_agent_backend}${NC} (${SSH_AUTH_SOCK})"
+            echo -e "  guest: ${YELLOW}${C0_SSH_AUTH_SOCK_PATH}${NC} ← relay"
+            if [[ -n "${C0_SSH_AUTH_GID:-}" ]]; then
+                echo -e "  group_add: ${YELLOW}${C0_SSH_AUTH_GID}${NC}"
+            fi
         else
-            echo -e "  ${YELLOW}(unavailable — see warning above)${NC}"
+            echo -e "  ${YELLOW}(relay not configured)${NC}"
         fi
-        echo ""
+    else
+        echo -e "  ${YELLOW}(off — load keys on host: ssh-add -l; 1Password SSH agent enabled)${NC}"
     fi
+    echo ""
 
     # Container status
     echo -e "${BOLD}running containers:${NC}"
-    local container_info
-    container_info=$(dc ps --format "{{.Name}}: {{.State}}" 2>/dev/null | head -1)
-    if [[ -n "$container_info" ]]; then
-        if [[ "$container_info" =~ running ]]; then
-            echo -e "  ${GREEN}$container_info${NC}"
-        elif [[ "$container_info" =~ exited ]]; then
-            echo -e "  ${RED}$container_info${NC}"
-        else
-            echo -e "  ${YELLOW}$container_info${NC}"
-        fi
+    local container_info container_name
+    container_cid="$(get_c0_container_id)"
+    if [[ -n "$container_cid" ]]; then
+        container_name="$(docker inspect -f '{{.Name}}' "$container_cid" 2>/dev/null | sed 's|^/||')"
+        container_info="${container_name}: running"
+        echo -e "  ${GREEN}$container_info${NC}"
     else
-        echo -e "  ${YELLOW}(none)${NC}"
+        container_cid="$(get_c0_container_id_any)"
+        if [[ -n "$container_cid" ]]; then
+            container_name="$(docker inspect -f '{{.Name}}' "$container_cid" 2>/dev/null | sed 's|^/||')"
+            container_state="$(get_c0_container_state "$container_cid")"
+            container_info="${container_name}: ${container_state}"
+            if [[ "$container_state" == "exited" ]]; then
+                echo -e "  ${RED}$container_info${NC}"
+                echo -e "  ${YELLOW}hint:${NC} docker logs ${container_name}" >&2
+            else
+                echo -e "  ${YELLOW}$container_info${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}(none)${NC}"
+        fi
     fi
     echo ""
 
@@ -1542,6 +1989,15 @@ cmd_status() {
     parse_file_mappings _status_mapping
     echo ""
 
+    echo -e "${BOLD}tools:${NC}"
+    echo -e "  id: ${YELLOW}${TOOLS_ID:0:12}...${NC}"
+    if tools_volume_valid; then
+        echo -e "  volume: ${GREEN}complete${NC} @ ${CYAN}/tools/opt/${TOOLS_ID:0:12}...${NC}"
+    else
+        echo -e "  volume: ${RED}missing${NC} — run ${CYAN}c0 build${NC}"
+    fi
+    echo ""
+
     # Workspaces (grouped by tools hash)
     echo -e "${BOLD}workspaces:${NC}"
     if tools_volume_exists; then
@@ -1565,20 +2021,13 @@ cmd_status() {
                     [[ "$pin_hash" != "$hash" ]] && continue
                     [[ -z "$c0root" ]] && continue
 
-                    # Compute project name for this workspace
                     local ws_mode=""
-                    if [[ "$folder_id" == *":dev" ]]; then
-                        ws_mode="dev"
-                    fi
-                    local ws_project_name
-                    if [[ "$ws_mode" == "dev" ]]; then
-                        ws_project_name="c0dev-dev-$(short_hash "${c0root}:dev")"
-                    else
-                        ws_project_name="c0dev-$(short_hash "$c0root")"
-                    fi
+                    [[ "$folder_id" == *":dev" ]] && ws_mode="dev"
+                    local ws_instance_id
+                    ws_instance_id="$(c0_instance_id_for "$c0root" "$ws_mode")"
 
                     # Check if running and get port
-                    local container_name="${ws_project_name}-${MAIN_SERVICE}"
+                    local container_name="${ws_instance_id}-${MAIN_SERVICE}"
                     local is_running=false
                     local port_info=""
                     if docker ps --format "{{.Names}}" 2>/dev/null | grep -qF "$container_name"; then
@@ -1672,6 +2121,7 @@ cmd_build() {
         exit 1
     fi
     maybe_notify_seccomp_update_available || true
+    c0_ssh_ensure_keys
     if ! validate_host_paths; then
         echo "error: fix missing paths before building" >&2
             exit 1
@@ -1696,6 +2146,7 @@ cmd_build() {
     # Build service image
     echo -e "🏗️  Building service image..."
     export DOCKER_BUILDKIT=1
+    c0_prepare_runtime_dockerfile
     if ! dc build $nocache "$MAIN_SERVICE"; then
         echo "error: image build failed" >&2
         exit 1
@@ -1708,7 +2159,7 @@ cmd_build() {
         local folder_id
         folder_id="$(compute_folder_id)"
         if [[ -n "$folder_id" ]]; then
-            write_pin_for_folder_id "$folder_id" "$DOCKERFILE_HASH" "$C0ROOT" "$C0_MODE"
+            write_pin_for_folder_id "$folder_id" "$TOOLS_ID" "$C0ROOT" "$C0_MODE"
         fi
     fi
 
@@ -1722,7 +2173,7 @@ cmd_clean() {
     require_host "clean"
 
     # Try to promote any staged .next build for current hash (Phase 4)
-    maybe_promote_staged_next "$DOCKERFILE_HASH"
+    maybe_promote_staged_next "$TOOLS_ID"
 
     local clean_all=false
     if [[ "$1" == "--all" || "$1" == "-a" ]]; then
@@ -1756,7 +2207,7 @@ cmd_clean() {
             return 0
         fi
 
-        local current_hash="$DOCKERFILE_HASH"
+        local current_hash="$TOOLS_ID"
         local pinned_hash=""
         local folder_id
         folder_id="$(compute_folder_id)"
@@ -1805,7 +2256,7 @@ Note: Running inside container. Use 'exit' to return to host.
 EOF
     else
         cat <<EOF
-Usage: c0 {start|stop|restart|logs|status|sh|root|cp-term|build|clean|seccomp-upgrade|help}
+Usage: c0 {start|stop|restart|logs|status|sh|root|ssh|cp-term|build|clean|seccomp-upgrade|help}
 
 Commands:
   start [--cap-drop-all]
@@ -1817,16 +2268,18 @@ Commands:
   status        Show service status, volume mappings, and workspaces
   sh            Shell as dev user (uid 1000)
   root          Shell as root (uid 0)
+  ssh [--keygen]
+                SSH into container as dev (127.0.0.1 only). --keygen creates auth/ssh keys.
   cp-term       Copy terminfo into container
-  build [-f]    Build tools and image (-f forces rebuild)
-                Pins current Dockerfile hash on success for this folder.
-                Triggers automatic cleanup of unpinned/inactive hashes.
+  build [-f]    Build tools and image (-f forces tools re-extract)
+                TOOLS_ID = hash(Dockerfile.base + Dockerfile.tools). Runtime Dockerfile
+                changes rebuild image only. Pins record tools_id for GC.
   seccomp-upgrade [--dry-run]
                 Use git ls-remote on moby/profiles, pick latest seccomp/vM.m.p tag,
                 curl raw default.json, verify sha256, then rewrite docker/seccomp when newer.
                 --dry-run shows target tag, peeled commit OID, profile sha256; no writes.
-  clean [-a]    Remove tools for current + pinned hashes; unpins this folder.
-                Runs garbage collection. (-a removes entire shared volume)
+  clean [-a]    Remove shared tools volume hashes only (never host .cache or projects).
+                Unpins this folder; runs garbage collection. (-a removes entire tools volume)
   help          Show this help message
 
 Environment:
@@ -1837,14 +2290,20 @@ Environment:
   MOBY_PROFILES_GIT_URL  Override moby/profiles.git URL (default https://github.com/moby/profiles.git)
 
 Notes:
-  - Each folder pins its latest successful build hash
-  - Active hashes (from running containers) are never garbage collected
-  - Force rebuild of active hash stages to .next, promotes after stop
+  - Each folder pins tools_id on successful build (GC metadata; not startup validation)
+  - Active tools_ids (from running containers) are never garbage collected
+  - Force rebuild of active tools_id stages to .next, promotes after stop
   - Ephemeral docker runs during build use --cap-drop ALL and no-new-privileges
-  - Default start: permissive (cap_drop ALL + CHOWN/SETUID/SETGID for apt as root)
-  - Strict Codex: c0 start --cap-drop-all or C0_SECURITY=cap-drop-all
+  - Runtime: cap_drop ALL then guest-admin caps (DAC_OVERRIDE, CHOWN, FOWNER); not host root
+  - permissive vs cap-drop-all: same caps; label only (Codex/Cursor strict mode)
   - Moby seccomp updates: notices on build/start if upstream tag is newer; run seccomp-upgrade to apply
-  - SSH agent: set SSH_AUTH_SOCK in your shell before c0 start (no extra c0 env vars)
+  - SSH agent: host ssh-add -l must work (1Password or launchd); guest SSH_AUTH_SOCK is always
+    /run/host-services/ssh-auth.sock (OrbStack relay). Never bind host launchd/1Password paths.
+    C0_SSH_AGENT=0 disables. Override bind: C0_SSH_AUTH_BIND (not for 1Password).
+  - SSH login: host -> dev via 127.0.0.1:<port> (auto 2222-2322 -> guest:2222). Keys in auth/ssh/.
+    sshd runs as dev; loopback publish only. Override: C0DEV_SSH_PORT.
+  - Tools: immutable installs on tools-shared (/tools:ro at runtime). Mutable caches (cargo
+    registry, uv) live in host ./.cache/; c0 never purges them — remove manually if needed.
 EOF
     fi
 }
@@ -1861,6 +2320,7 @@ case "${1:-}" in
     status)     cmd_status ;;
     sh)         cmd_sh ;;
     root)       cmd_root ;;
+    ssh)        shift; cmd_ssh "$@" ;;
     cp-term)    cmd_cp_term ;;
     build)      shift; cmd_build "$@" ;;
     clean)      shift; cmd_clean "$@" ;;

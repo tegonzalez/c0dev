@@ -1,4 +1,5 @@
-# Default runtime security: cap_drop ALL with minimal cap_add for apt (c0 root).
+# Default runtime: drop host-relevant caps; restore guest-admin caps for c0 root / apt.
+# Moby seccomp + no-new-privileges. sshd on 2222 as dev (no setuid).
 services:
   c0dev:
     privileged: false
@@ -8,6 +9,6 @@ services:
     cap_drop:
       - ALL
     cap_add:
+      - DAC_OVERRIDE
       - CHOWN
-      - SETUID
-      - SETGID
+      - FOWNER

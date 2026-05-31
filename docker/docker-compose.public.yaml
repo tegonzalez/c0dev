@@ -5,29 +5,31 @@ x-environment-base: &env-base
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
   TERM: ${TERM}
-  # Guest path; host bind is added by c0 when shell SSH_AUTH_SOCK is set (see bin/c0).
-  SSH_AUTH_SOCK: /home/dev/.ssh-auth.sock
-  # Shared tools prefix (symlinked to ~/.cargo etc. by entrypoint)
+  # OrbStack/Desktop relay path (same in guest as VM); bind added by c0 when host agent is ready.
+  SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
+  # Immutable toolchains on shared volume (RO at runtime); mutable caches in ~/.cache
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
 services:
   c0dev:
     build:
       context: .
-      dockerfile: Dockerfile
-    hostname: ${C0DEV_HOSTNAME:-c0dev}
+      dockerfile: .Dockerfile.build
+    hostname: ${C0_INSTANCE_ID:-c0dev}
     ports:
       - "${C0DEV_WEB_PORT:-3000}:3000"
+      - "127.0.0.1:${C0DEV_SSH_PORT:-2222}:2222"
     working_dir: /home/dev
     tty: true
     environment:
       <<: *env-base
     entrypoint:
+      - /bin/bash
       - /usr/local/bin/docker-entrypoint.sh
     extra_hosts:
       - "host.docker.internal:host-gateway"
     labels:
-      c0dev.tools_hash: ${DOCKERFILE_HASH}
+      c0dev.tools_hash: ${TOOLS_ID}
       c0dev.tools_volume: ${SHARED_TOOLS_VOLUME}
-      c0dev.project: ${C0DEV_HOSTNAME}
+      c0dev.instance: ${C0_INSTANCE_ID}
       c0dev.security_mode: ${C0_SECURITY:-permissive}

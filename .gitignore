@@ -1,4 +1,3 @@
-.claude
 *.bak
 .DS_Store
 projects
@@ -17,3 +16,6 @@ rules
 .rustup
 .terminfo
 docker/.compose.ssh-auth.yaml
+docker/.Dockerfile.build
+docker/.Dockerfile.tools.build
+auth/

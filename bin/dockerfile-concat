@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Concatenate Dockerfile fragments for docker build.
+# OrbStack/Docker stable frontends do not support BuildKit "include"; join base + stage files instead.
+#
+# Usage: dockerfile-concat [-o OUT] FILE [FILE...]
+#   Without -o: write combined Dockerfile to stdout.
+
+set -euo pipefail
+
+out=""
+files=()
+
+usage() {
+    echo "usage: dockerfile-concat [-o OUT] FILE [FILE...]" >&2
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)
+            [[ $# -ge 2 ]] || usage
+            out="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            files+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[[ ${#files[@]} -gt 0 ]] || usage
+
+for f in "${files[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "error: missing file: $f" >&2
+        exit 1
+    fi
+done
+
+write_concat() {
+    local first=true f
+    for f in "${files[@]}"; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            printf '\n'
+        fi
+        cat "$f"
+    done
+}
+
+if [[ -n "$out" ]]; then
+    write_concat >"$out"
+else
+    write_concat
+fi

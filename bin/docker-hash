@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# docker-hash — content hash for Docker build inputs (comment-stripped).
+#
+# Usage: docker-hash <file> [<file>...]
+#   Prints sha256 hex (64 chars) of normalized content to stdout.
+#
+# Normalization (deterministic):
+#   - For each file in argument order: emit "<path>\n" then normalized body
+#   - Strip trailing whitespace per line
+#   - Drop full-line comments (^[[:space:]]*#)
+#   - Drop blank lines
+#
+# Convention: avoid inline "#" on instruction lines (not stripped in v1).
+#
+# Self-check fixtures (same hash):
+#   printf 'FROM x\n# comment\nRUN y\n' | ...  ==  printf 'FROM x\nRUN y\n' | ...
+# Different hash when instruction changes:
+#   RUN y  vs  RUN z
+
+set -euo pipefail
+
+normalize_dockerfile_stream() {
+    sed -E 's/[[:space:]]+$//' |
+        sed -E '/^[[:space:]]*#/d' |
+        sed -E '/^[[:space:]]*$/d'
+}
+
+hash_files() {
+    local f
+    if [[ $# -eq 0 ]]; then
+        echo "usage: docker-hash <file> [<file>...]" >&2
+        exit 1
+    fi
+    {
+        for f in "$@"; do
+            if [[ ! -f "$f" ]]; then
+                echo "error: missing file: $f" >&2
+                exit 1
+            fi
+            printf '%s\n' "$f"
+            normalize_dockerfile_stream <"$f"
+        done
+    } | shasum -a 256 | awk '{print $1}'
+}
+
+hash_files "$@"

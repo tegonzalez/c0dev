@@ -7,7 +7,8 @@ x-volume-folders: &folders
     - ../rules:/home/dev/rules
     - ../projects:/home/dev/projects
     - ../bin:/home/dev/bin
-    - tools-shared:/tools
+    - ../auth/ssh:/home/dev/.ssh
+    - tools-shared:/tools:ro
 
 services:
   c0dev:

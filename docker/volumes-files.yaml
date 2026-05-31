@@ -2,6 +2,7 @@ x-volume-files: &files
   volumes:
     - ../.claude.json:/home/dev/.claude.json
     - ~/.gitconfig:/home/dev/.gitconfig
+    - ../docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
 
 services:
   c0dev:

@@ -41,10 +41,24 @@ esac
 script_dir=$(resolve_path "$(dirname -- "$script_path")")
 root_dir=$(resolve_path "$script_dir/..")
 
-# Standard tool locations (symlinked to shared volume in container)
 prepend_path "/usr/local/bun-node-fallback-bin"
-prepend_path "$(resolve_path "$root_dir/.cargo/bin")"
-prepend_path "$(resolve_path "$root_dir/.local/bin")"
+
+if [ -n "${TOOLS_PREFIX:-}" ]; then
+	prepend_path "$TOOLS_PREFIX/.cargo/bin"
+	prepend_path "$TOOLS_PREFIX/.local/bin"
+	export RUSTUP_HOME="$TOOLS_PREFIX/.rustup"
+	export CARGO_HOME="${HOME}/.cache/cargo"
+	export UV_CACHE_DIR="${HOME}/.cache/uv"
+	export XDG_CACHE_HOME="${HOME}/.cache"
+	export RUSTUP_NO_UPDATE=1
+	if [ -d "$TOOLS_PREFIX/.rustup" ]; then
+		ln -sfn "$TOOLS_PREFIX/.rustup" "${HOME}/.rustup"
+	fi
+else
+	prepend_path "$(resolve_path "$root_dir/.cargo/bin")"
+	prepend_path "$(resolve_path "$root_dir/.local/bin")"
+fi
+
 prepend_path "$(resolve_path "$root_dir/bin")"
 
 export PATH

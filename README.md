@@ -3,219 +3,326 @@
 A containerized development environment for AI-assisted coding and full-stack work, packaged as a reproducible Docker image with modern CLI tooling.
 
 ## Overview
-- Portable workspace with assistants (Claude Code, Codex, OpenCode, Cursor) and polyglot toolchains
-- Multi-stage image build that extracts heavy tooling to the host for reuse between rebuilds
-- Opinionated defaults that mirror the author’s macOS-based setup for low-friction onboarding
 
-## Release Status and Host Requirements
-**⚠️ Alpha Release:** Validated on the author’s workstation only.
-- macOS: Apple M-series Tahoe v26.0.1
-- OrbStack: orbctl 2.0.2 (2000200)
-- Terminal: Ghostty v1.2.0 (supports CMD+click URL auth)
-- Xcode: Required to provide `infocmp` during image build
+**Purpose:** Run a reproducible Linux dev environment in Docker with preinstalled assistant CLIs, polyglot toolchains, and host-persisted credentials and projects.
 
-## Container Image Summary
-- Base distro: Debian (downstream of `oven/bun:latest`)
-- Approximate size: 2 GB total (Rustup toolchain accounts for ~1.3 GB)
-- ~10 bin builder build time
+**Audience:** Developers on macOS who want an isolated workspace for autonomous coding agents and full-stack work without reconfiguring the host shell.
 
-## Tooling Inventory
-### Built from Source (Cargo)
-- `fd` 10.3.0 – fast file finder
-- `ripgrep` 14.1.1 – recursive search
-- `ast-grep` 0.39.4 – structural code search
-- `zellij` 0.43.1 – terminal multiplexer
-- `cargo-cache` – cargo cache management
+**In scope:** Building and running the c0dev container, mounting host data into the guest, inbound loopback SSH, and operational commands via `c0`.
 
-### Installed via Package Managers
+**Non-goals:** Multi-tenant isolation, production deployment, or sandboxing agents from your own mounted data and credentials.
+
+## Terms
+
+| Term            | Meaning |
+| --------------- | ------- |
+| checkout        | Your clone of this repository on the host |
+| guest           | The running c0dev container |
+| dev user        | Default shell user inside the guest (`uid` 1000); use `c0 sh` |
+| `TOOLS_ID`      | Content hash of `docker/Dockerfile.base` + `docker/Dockerfile.tools`; selects the immutable toolchain directory on the shared tools volume |
+| tools volume    | Docker volume `c0dev-tools-shared` (override: `SHARED_TOOLS_VOLUME`); holds `/tools/opt/<TOOLS_ID>/` |
+| instance        | Per-checkout container identity (`c0dev.instance` label); ports and hostname are allocated per instance |
+
+## Host requirements
+
+**Status (fact):** Alpha — validated on the author's workstation only.
+
+| Requirement | Version or note |
+| ----------- | --------------- |
+| macOS       | Apple M-series, Tahoe v26.5 |
+| OrbStack    | orbctl 2.2.1 (2020100) |
+| Terminal    | Ghostty v1.3.1 |
+| Xcode       | Required for `infocmp` during image build |
+
+## Image summary
+
+| Property    | Value                                                 |
+| ----------- | ----------------------------------------------------- |
+| Base distro | Debian (downstream of `oven/bun:latest`)              |
+| Image size  | ~4 GB total                                           |
+| Build time  | ~20 minutes for a full build including Rust toolchain |
+
+## Tooling inventory
+
+### Built from source (Cargo)
+
+| Tool          | Version | Role |
+| ------------- | ------- | ---- |
+| `fd`          | 10.3.0  | Fast file finder |
+| `ripgrep`     | 14.1.1  | Recursive search |
+| `ast-grep`    | 0.39.4  | Structural code search |
+| `zellij`      | 0.43.1  | Terminal multiplexer |
+| `cargo-cache` | —       | Cargo cache management |
+
+### Installed via package managers
+
 - Python: `uv`, `code-graph-rag` (commit 0037ad4)
 - Bun globals: `@anthropic-ai/claude-code`, `@openai/codex`, `opencode-ai`
 - System utilities: `build-essential`, `cmake`, `git`, `curl`, `wget`, `fzf`, `jq`, `yq`, `bc`, `bat`, `btop`, `iproute2`, `iputils-ping`, `net-tools`, `socat`, `netcat`, `vim`, `tmux`
 - Rust toolchain: `rustup` with `wasm32-unknown-unknown` target (registry cache cleaned post-build)
 
-## Quick Start Workflow
-### Bootstrap the Workspace
-1. Clone the repo: `git clone https://github.com/tegonzalez/c0dev.git`
-2. Enter the project: `cd c0dev`
-3. Load helper scripts into `PATH`: `./env.sh`
-4. Build the image: `c0 build` (first build takes ~10 minutes)
+## Quick start
 
-### Launch and Access the Container
-- Start services: `c0 start`
-- Open a shell as the dev user: `c0 sh` (auto-navigates to matching project directory)
-
-## Installation
+1. Clone: `git clone https://github.com/tegonzalez/c0dev.git`
+1. Enter the checkout: `cd c0dev`
+1. Load helper scripts: `./env.sh`
+1. Build the image: `c0 build` (~10 minutes on first run)
+1. Start services: `c0 start`
+1. Open a shell: `c0 sh` (auto-navigates to a matching project directory under `projects/`)
 
 ```bash
-# Clone the repository
 git clone https://github.com/tegonzalez/c0dev.git
 cd c0dev
-
-# Enter sub-shell for c0dev PATH
 ./env.sh
-
-# Build the Docker image (~10 minutes)
 c0 build
+c0 start
+c0 sh
 ```
-
-**Build Time**: Approximately 10 minutes for full build including Rust toolchain installation.
-
-### What `c0 build` Does
-1. Ensures file mappings exist on host (prevents Docker from creating directories)
-2. Builds `tools-builder` stage with uv, Cursor CLI, code-graph-rag, and Rust tools
-3. Extracts built tools to host directories (`.local`, `.cargo`, `.rustup`)
-4. Builds final Docker image with system packages and global tools
-5. Installs terminfo for proper terminal emulation
 
 ## Usage
 
-### Service Management
+### Service management
 
 ```bash
-# Start the development environment
-c0 start
-
-# Enter container as dev user (UID 1000)
-c0 sh
-
-# Enter container as root (UID 0)
-# Note: Use 'c0 root' instead of sudo
-c0 root
-
-# Stop the environment
-c0 stop
-
-# Restart services
-c0 restart
-
-# View logs
-c0 logs
-
-# Check status
-c0 status
-
-# Rebuild (force with -f flag)
-c0 build [-f]
+c0 start                  # Start the development environment
+c0 sh                     # Shell as dev user (UID 1000)
+c0 root                   # Shell as root (UID 0); prefer over sudo
+c0 stop                   # Stop all services
+c0 restart                # Restart services
+c0 logs                   # Show logs
+c0 status                 # Service status, volume mappings, workspaces
+c0 build [-f]             # Build tools and image (-f forces tools re-extract)
+c0 ssh                    # SSH as dev (loopback only; keys in auth/ssh/)
+c0 ssh --keygen           # Regenerate auth/ssh keys
 ```
 
-### Web Port Mapping
-- The container listens on `guest:3000`. The host port is auto-selected per `c0dev` checkout.
-- Auto-selection range: `3000–4000`. Allocation rule: first available port in the range (fills gaps).
-- The selected mapping is printed on `c0 start`, `c0 restart`, and `c0 status` as `host:<port> -> guest:3000`.
+Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps running in the background (`docker attach` does not open a shell).
+
+### Web port mapping
+
+- Guest listens on port `3000`. The host port is auto-selected per checkout.
+- Range: `3000–4000`. Rule: first available port in the range (fills gaps).
+- Mapping is printed on `c0 start`, `c0 restart`, and `c0 status` as `host:<port> -> guest:3000`.
 - Override: `C0DEV_WEB_PORT=3001 c0 start`
 
-## Authenticate Assistants
+### Inbound SSH (loopback)
+
+- Guest `sshd` listens on port `2222`; the host publishes **`127.0.0.1:<port>` only** (not LAN-wide).
+- Range: `2222–2322` (same gap-fill rule as web ports). Shown on `c0 start`, `c0 restart`, and `c0 status`.
+- Keys and host key live under gitignored `auth/ssh/` (created on first `c0 start` or `c0 build`). Pubkey auth only.
+- Connect: `c0 ssh` (same project-path behavior as `c0 sh`). Override: `C0DEV_SSH_PORT=2223 c0 start`.
+
+## Authenticate assistants
 
 ### Claude Code
-1. Run `claude setup-token` inside the container.
-2. Follow the browser prompt (Ghostty users can CMD+click the URL) and approve long-term access.
- - from host: `open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')`
-3. Wait for the CLI to confirm the token was stored under `/home/dev/.claude.json` (persisted via the host volume).
+
+1. Run `claude setup-token` inside the guest.
+1. Follow the browser prompt (Ghostty: CMD+click the URL) and approve long-term access. From host: `open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')`
+1. Confirm the token is stored under `/home/dev/.claude.json` (persisted via the host volume).
 
 ### Codex CLI
-Codex now supports device authentication; run `codex login --device-auth` and follow the prompts.
+
+Run `codex login --device-auth` inside the guest and follow the prompts.
 
 ### OpenCode CLI
-1. Run `opencode auth login` to start the interactive login.
-2. Choose your provider (or supply a URL) and finish the browser flow when prompted.
-3. The CLI saves credentials under `/home/dev/.config/opencode`, so future sessions reuse the same login.
 
-## Volume Mappings
-Persistent host ↔ container paths for credentials, tooling, and projects:
-- `.claude/` → `/home/dev/.claude`
-- `.config/` → `/home/dev/.config`
-- `.cargo/` → `/home/dev/.cargo`
-- `.local/` → `/home/dev/.local`
-- `.rustup/` → `/home/dev/.rustup`
-- `.terminfo/` → `/home/dev/.terminfo`
-- `rules/` → `/home/dev/rules`
-- `projects/` → `/home/dev/projects`
-- `bin/` → `/home/dev/bin`
-- `.claude.json` → `/home/dev/.claude.json`
+1. Run `opencode auth login` inside the guest.
+1. Choose your provider (or supply a URL) and finish the browser flow.
+1. Credentials are saved under `/home/dev/.config/opencode` for reuse.
 
-These mappings keep credentials, tool installs, and in-progress work outside the ephemeral container filesystem.
+## Volume mappings
 
-## Environment Defaults
-- Locale: `en_US.UTF-8`
-- Timezone: `America/Los_Angeles` (`TZ` build arg overrides)
-- Exposed ports: `host:<auto> -> guest:3000` (auto-selected in range `3000–4000`, override with `C0DEV_WEB_PORT`)
-- LLM provider: Ollama at `http://host.docker.internal:11434`
-- Default model: `gpt-oss:20b`
+Persistent host ↔ guest paths for credentials, tooling, and projects:
 
-## Build Pipeline Highlights
-1. Verify host directories exist before mounting volumes
-2. Build `tools-builder` stage (uv, Cursor CLI, code-graph-rag, Rust tools)
-3. Extract tool artifacts to host (`.local`, `.cargo`, `.rustup`)
-4. Assemble final runtime image with system packages and global CLIs
-5. Install terminfo database for accurate terminal emulation
+| Host path        | Guest path              | Role |
+| ---------------- | ----------------------- | ---- |
+| `.claude/`       | `/home/dev/.claude`     | Assistant state |
+| `.cache/`        | `/home/dev/.cache`      | Mutable tool caches (cargo registry, uv); `c0` never purges |
+| `.config/`       | `/home/dev/.config`     | Application config |
+| `.codex/`        | `/home/dev/.codex`      | Assistant state |
+| `rules/`         | `/home/dev/rules`       | Project rules |
+| `projects/`      | `/home/dev/projects`    | Sources and build outputs |
+| `bin/`           | `/home/dev/bin`         | Host helper scripts |
+| `auth/ssh/`      | `/home/dev/.ssh`        | SSH keys and `sshd` config (gitignored) |
+| `.claude.json`   | `/home/dev/.claude.json`| Assistant credentials file |
+| `tools-shared`   | `/tools:ro`             | Immutable toolchains (rustup, cargo bins, uv tools) |
 
-## Networking Notes
-- Container has public network access with host bridging
-- `host.docker.internal` resolves to the host for local services (e.g., Ollama)
-- **SSH agent:** if your shell has `SSH_AUTH_SOCK` set, `c0 start` forwards it automatically (guest path `/home/dev/.ssh-auth.sock`). On macOS/OrbStack the relay `/run/host-services/ssh-auth.sock` is used instead of the launchd path. Verify in the container: `test -S "$SSH_AUTH_SOCK" && ssh-add -l`.
+Immutable Rust and uv binaries live on the read-only tools volume. Download caches live under host `.cache/` (`CARGO_HOME=~/.cache/cargo`, `UV_CACHE_DIR=~/.cache/uv`). After a toolchain upgrade, purge incompatible cache manually (for example `rm -rf .cache/cargo`).
+
+## Environment defaults
+
+| Setting        | Default |
+| -------------- | ------- |
+| Locale         | `en_US.UTF-8` |
+| Timezone       | `America/Los_Angeles` (`TZ` build arg overrides) |
+| Web port       | `host:<auto> -> guest:3000` (range `3000–4000`; override `C0DEV_WEB_PORT`) |
+| SSH port       | `127.0.0.1:<auto> -> guest:2222` (range `2222–2322`; override `C0DEV_SSH_PORT`) |
+| LLM provider   | Ollama at `http://host.docker.internal:11434` |
+| Default model  | `gpt-oss:20b` |
+
+## Build pipeline
+
+On `c0 build`:
+
+1. Ensures host mount directories exist (prevents Docker from creating them as root-owned paths).
+1. Builds `tools-builder` from `docker/Dockerfile.base` + `docker/Dockerfile.tools` via `bin/dockerfile-concat` (OrbStack-compatible; no BuildKit include).
+1. Extracts immutable tool artifacts to the shared tools volume at `/tools/opt/<TOOLS_ID>/`.
+1. Builds the runtime image from `docker/Dockerfile.base` + `docker/Dockerfile.runtime` (concatenated the same way).
+1. Installs terminfo for proper terminal emulation.
+
+**`TOOLS_ID` computation:** `bin/docker-hash docker/Dockerfile.base docker/Dockerfile.tools` (full-line comments stripped).
+
+**Invalidation (decision):** Changes to `Dockerfile.runtime` alone rebuild the runtime image only; they do not invalidate tools. Run `c0 build` without `-f` for image-only rebuilds. Run `c0 build -f` to force tools re-extract.
+
+Each successful build pins the checkout's `TOOLS_ID` in the tools volume for garbage-collection metadata. Running containers are never deleted by GC.
+
+## Networking
+
+- The guest has outbound network access with host bridging.
+- `host.docker.internal` resolves to the host for local services (for example Ollama).
+- **SSH agent:** host `ssh-add -l` must work (1Password SSH agent or launchd). `c0` never bind-mounts host `$SSH_AUTH_SOCK`; it mounts the OrbStack/Desktop relay **`/run/host-services/ssh-auth.sock`** at the **same path** in the guest (`SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock`). Required for 1Password. Verify in the guest: `echo $SSH_AUTH_SOCK` and `ssh-add -l`. Disable: `C0_SSH_AGENT=0`.
+
+## Security
+
+c0dev is a **single-user local development container**, not a multi-tenant sandbox. It is designed to run **autonomous coding agents** — tools that can execute shell commands, edit files, and reach the network with minimal human approval. The security model is: **contain blast radius on your workstation**, not **prevent a trusted agent from doing its job**.
+
+### Threat model
+
+| Boundary   | Scope |
+| ---------- | ----- |
+| In scope   | Compromised or misbehaving agent inside the guest; accidental credential exposure; limiting what a container escape or Docker misconfiguration could leverage on the host |
+| Out of scope | Operator who already controls the checkout, Docker daemon, or macOS user account |
+| Assumption | One human owns the host, the checkout, and all mounted guest paths (`projects/`, assistant config dirs, `auth/ssh/`, host `~/.gitconfig`, etc.) |
+
+### Capability handling
+
+Runtime containers are **not privileged**. On `c0 start`, compose applies the security overlay (`docker-compose.security-permissive.yaml`):
+
+| Control              | Setting |
+| -------------------- | ------- |
+| Privileged           | `false` |
+| Capabilities         | `cap_drop: ALL`, then add `DAC_OVERRIDE`, `CHOWN`, `FOWNER` |
+| Privilege escalation | `no-new-privileges:true` |
+| Syscalls             | Moby default seccomp profile (vendored under `docker/seccomp/`, checksum-verified at start/build) |
+
+`DAC_OVERRIDE`, `CHOWN`, and `FOWNER` let `c0 root` and package installs work inside the guest without running `sshd` setuid or granting broad Linux capabilities. They are **guest-admin helpers**, not host-root equivalents.
+
+`sshd` listens on guest port `2222` and runs as the `dev` user (no setuid). The host publishes **`127.0.0.1:<port>` only**.
+
+Ephemeral `docker run` invocations during `c0 build` also use `cap_drop: ALL` and `no-new-privileges`.
+
+### Hardening in place
+
+| Control            | Mechanism |
+| ------------------ | --------- |
+| Immutable toolchains | `tools-shared` mounted read-only at `/tools:ro`; caches in host `.cache/` |
+| Loopback SSH       | Pubkey-only inbound login; keys in gitignored `auth/ssh/` |
+| SSH agent relay    | Guest uses OrbStack `/run/host-services/ssh-auth.sock` relay (1Password-safe), not a raw bind of host `$SSH_AUTH_SOCK` |
+| Seccomp integrity  | Tampered or missing vendored profiles block `c0 start` / `c0 build`; run `c0 seccomp-upgrade` to adopt newer Moby profiles deliberately |
+
+### Autonomous agents
+
+**Benefits of running agents in the guest**
+
+| Benefit                      | Effect |
+| ---------------------------- | ------ |
+| Process isolation            | Agent shells, servers, and crashes stay out of the host shell environment |
+| Capability + seccomp baseline | Drops Linux caps and restricts syscalls vs a bare host shell |
+| Immutable `/tools`           | Reduces in-session tampering of prebuilt CLIs |
+| Scoped networking defaults   | Web and SSH ports are explicit; SSH is loopback-only |
+| Reproducible toolchain       | Same Rust, uv, and assistant CLIs across machines and rebuilds |
+
+**Residual agent authority (by design)**
+
+Agents run as `dev` (`uid` 1000) with passwordless `c0 root` available. With network egress and bind mounts, they can:
+
+- Read and write everything under `projects/`, assistant config dirs, `.config/`, `rules/`, and `bin/`
+- Use mounted credentials (API tokens, `~/.gitconfig`, SSH keys in `auth/ssh/`)
+- Use any key currently loaded in the host SSH agent
+- Reach the public internet and `host.docker.internal`
+- Run arbitrary code inside the guest, including as root via `c0 root`
+
+c0dev does not sandbox agents from *your* data; it sandboxes them from *other host processes* and applies a consistent cap/seccomp floor.
+
+**Operational guidance**
+
+- Treat the guest like a **powerful local shell**, not an untrusted multi-tenant VM.
+- Keep secrets in gitignored paths; never commit `auth/ssh/` or assistant token files.
+- Use a dedicated checkout and `projects/` tree for untrusted repos.
+- Disable SSH agent forwarding when not needed: `C0_SSH_AGENT=0`.
+- For secretless or brokered API access, see `c0-aegis`.
+
+### Residual risks
+
+| Risk                     | Note |
+| ------------------------ | ---- |
+| Bind-mounted entrypoint  | `docker-entrypoint.sh` is mounted from the checkout; the same user who runs agents controls startup |
+| Docker group             | Docker daemon access can inspect volumes, override compose, or run privileged containers outside c0dev's profile |
+| Agent + SSH agent        | A compromised session can use any key loaded in the host agent until removed |
+| Build staging permissions | Tools builds briefly use permissive permissions under `/tools/tmp/` on the shared volume; concurrent Docker-level access could race during build |
+
+### Optional hardening
+
+- Restrict `sshd` with `ListenAddress` / `AllowUsers` in guest `sshd_config`
+- Validate `C0_SSH_AUTH_BIND` before writing generated compose fragments
+- Tighten build-time permissions on `/tools/tmp/<id>.partial`
+- Add a stricter cap profile for read-mostly agent sessions (for example drop `DAC_OVERRIDE` / `FOWNER`)
 
 ## Troubleshooting
-- Build failures: confirm Xcode is available for `infocmp`, rerun with `c0 build -f` to force rebuild
-- Volume issues: ensure host directories exist and remain writable before running `c0 build`
 
-## Debug: Tools Garbage Collection
+- Build failures: confirm Xcode is available for `infocmp`; rerun with `c0 build -f` to force rebuild.
+- Volume issues: ensure host directories exist and remain writable before `c0 build`.
+- Empty or stale tools after layout changes: run `c0 build` once to populate `/tools/opt/<TOOLS_ID>/`, then `c0 restart`.
+- Container label `c0dev.instance` identifies the checkout instance.
 
-The c0dev tool implements automatic garbage collection for shared tools volume hashes to prevent unbounded growth while maintaining safety for running containers.
+## Tools garbage collection
 
-### Key Concepts
+Automatic garbage collection for shared tools volume **`TOOLS_ID`** directories prevents unbounded growth while protecting running containers.
 
-**Active Hashes**: Tool hashes currently used by running containers (detected via container labels). Never deleted.
+### Concepts
 
-**Pinned Hashes**: Each folder's "latest successful build" hash, stored in `/tools/pins/<folder-id>.pin` within the shared volume. Persists until:
-- `c0 clean` is run in that folder
-- The folder is deleted from disk (becomes orphaned)
-- A new successful `c0 build` updates the pin
+| Concept            | Definition |
+| ------------------ | ---------- |
+| Active `TOOLS_ID`  | Value used by a running container (`c0dev.tools_hash` label); never deleted |
+| Pinned `TOOLS_ID`  | Latest successful build for a checkout, stored in `/tools/pins/<folder-id>.pin`; updated on successful `c0 build`, cleared by `c0 clean` or checkout deletion |
+| Garbage collection | Removes `/tools/opt/<tools_id>/` directories that are neither active nor pinned; runs after successful `c0 build` or `c0 clean` |
 
-**Garbage Collection**: Automatically removes hash directories from `/tools/opt/<hash>/` that are neither active nor pinned. Triggered only on:
-- Successful `c0 build` completion
-- `c0 clean` execution
+### Staged rebuilds
 
-### Staged Rebuilds
+When forcing a rebuild (`c0 build -f`) of a `TOOLS_ID` currently used by running containers:
 
-When forcing a rebuild (`c0 build -f`) of a hash currently active in running containers:
-- Tools are built and staged to `/tools/tmp/<hash>.next` instead of `/tools/opt/<hash>`
-- Promotion to `/tools/opt/<hash>` happens automatically when no instances use that hash
+- Tools build to `/tools/tmp/<tools_id>.next` instead of `/tools/opt/<tools_id>`
+- Promotion to `/tools/opt/<tools_id>` happens when no instance uses that `TOOLS_ID`
 - Promotion is checked at the start of `c0 build` and `c0 clean`
 
-### Inspecting State
+### Inspecting state
 
-View active hashes from running containers:
+Active `TOOLS_ID` from running containers:
+
 ```bash
-# List running container IDs using tools volume
 docker ps -q --filter "volume=c0dev-tools-shared"
-
-# Check hash label from a container
 docker inspect <container-id> --format '{{ index .Config.Labels "c0dev.tools_hash" }}'
 ```
 
-View pinned hashes in shared volume:
-```bash
-# List all pins
-docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
+Pinned `TOOLS_ID` values:
 
-# Read a specific pin
+```bash
+docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
 docker run --rm -v c0dev-tools-shared:/tools alpine cat /tools/pins/<folder-id>.pin
 ```
 
-View hash directories:
-```bash
-# List tool hash directories
-docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/opt
+`TOOLS_ID` directories:
 
-# List staged .next builds
+```bash
+docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/opt
 docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/tmp
 ```
 
-### Safety Guarantees
+### Safety guarantees
 
-- **Never deletes active hashes**: Running containers always protected
-- **Never modifies pins from containers**: Pin operations are host-only
-- **Never promotes staged builds while active**: Waits for instances to stop
-- **Never triggers GC on build failure**: Only successful builds clean up
-- **Never updates pins on build failure**: Pins represent last known good state
-- **Atomic operations**: Uses `.partial` → rename pattern for all promotions
+- Never deletes active `TOOLS_ID` values used by running containers
+- Never modifies pins from inside the guest
+- Never promotes staged builds while an instance still uses the `TOOLS_ID`
+- Never triggers GC on build failure
+- Never updates pins on build failure
+- Uses `.partial` → rename for atomic promotions

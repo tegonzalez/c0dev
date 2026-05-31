@@ -1,0 +1,17 @@
+# Base stage with system dependencies
+FROM oven/bun:latest AS base
+
+# Install system dependencies once for both stages
+RUN apt update && apt install -y \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    libssl-dev \
+    tzdata
+
+# Rename bun user to dev (keeping same UID/GID); login shell matches c0 sh / c0 ssh
+RUN usermod -l dev bun && groupmod -n dev bun && usermod -d /home/dev -m dev && usermod -s /bin/bash dev
+
+WORKDIR /home/dev
+RUN rmdir app

@@ -1,0 +1,507 @@
+#!/bin/sh
+set -eu
+
+SELF=$(CDPATH= cd -- "$(dirname "$0")" && pwd)/$(basename "$0")
+SCRIPT_NAME=$(basename "$0")
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+BACKUP_BRANCH=
+
+usage() {
+  cat <<EOF
+Isolate one file or directory from mixed commits so path-specific changes can be
+restacked independently. The tool can list mixed commits, split those commits
+directly, and gather the isolated path changes at HEAD without redoing work when
+the branch is already in the desired state.
+
+Usage:
+  $SCRIPT_NAME :<path> refs [upstream]
+  $SCRIPT_NAME :<path> isolate [upstream]
+  $SCRIPT_NAME :<path> gather [upstream]
+
+Commands:
+  refs     Print mixed commits that would be split, oldest first.
+  isolate  Split mixed commits into non-path commits plus adjacent path-only
+           commits.
+  gather   Ensure the path is isolated and move path-only commits to the branch
+           tip in original order.
+
+Notes:
+  path must be ':' for the repository root or ':<repo-root-relative-path>'.
+  Examples: ':', ':docs/', ':docs/b.ts'. Unanchored paths such as '.', 'docs/',
+  './docs/', absolute paths, and paths containing '.' or '..' segments are
+  rejected.
+  upstream is the protected lower bound for the rebase. When upstream is
+  supplied, only commits in upstream..HEAD are inspected and rewritten; upstream
+  itself is not included in the rebase range.
+  When upstream is omitted, the command preserves legacy scope over HEAD history
+  and uses the narrowest rebase base needed for the selected path commits.
+  isolate is a no-op once no mixed commits touch the path.
+  gather is a no-op once all path-only commits for the path form the tail of
+  HEAD.
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+rebase_exec_path() {
+  printf '%s\n' "$SELF"
+}
+
+ensure_clean_worktree() {
+  if ! git diff --quiet --ignore-submodules=dirty || ! git diff --cached --quiet --ignore-submodules=dirty; then
+    die "Worktree must not have tracked modifications before running $SCRIPT_NAME."
+  fi
+}
+
+pathspec_from_user_path() {
+  supplied_path=$1
+
+  case "$supplied_path" in
+    "")
+      die "Path must be ':' for the repository root or ':<repo-root-relative-path>'."
+      ;;
+    ":")
+      printf ':(top)\n'
+      ;;
+    :*)
+      relative_path=${supplied_path#:}
+      case "$relative_path" in
+        ""|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*)
+          die "Path must be ':' for the repository root or ':<repo-root-relative-path>' without '.' or '..' segments: $supplied_path"
+          ;;
+      esac
+      printf ':(top)%s\n' "$relative_path"
+      ;;
+    *)
+      die "Path must be anchored from the repository root as ':' or ':<repo-root-relative-path>': $supplied_path"
+      ;;
+  esac
+}
+
+exclude_pathspec_for_path() {
+  path=$1
+
+  case "$path" in
+    ":(top)")
+      return 1
+      ;;
+    ":(top)"*)
+      printf ':(top,exclude)%s\n' "${path#":(top)"}"
+      ;;
+    *)
+      die "Internal pathspec is not repository-root anchored: $path"
+      ;;
+  esac
+}
+
+path_commits() {
+  path=$1
+  history_range=$2
+  git log "$history_range" --full-history --format=%H -- "$path" | awk '
+    !seen[$0]++ {
+      lines[++count] = $0
+    }
+    END {
+      for (i = count; i >= 1; i--) {
+        print lines[i]
+      }
+    }
+  '
+}
+
+commit_subject() {
+  git show -s --format=%s "$1"
+}
+
+commit_oneline() {
+  commit=$1
+  printf '%s %s\n' "$(git rev-parse --short "$commit")" "$(commit_subject "$commit")"
+}
+
+print_oneline_commits() {
+  commits=$1
+
+  [ -n "$commits" ] || return 0
+  for commit in $commits; do
+    commit_oneline "$commit"
+  done
+}
+
+first_line() {
+  printf '%s\n' "$1" | sed -n '1p'
+}
+
+count_lines() {
+  if [ -z "$1" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$1" | wc -l | tr -d ' '
+  fi
+}
+
+commit_touches_path() {
+  commit=$1
+  path=$2
+
+  ! git diff-tree --root --quiet --no-commit-id -r "$commit" -- "$path"
+}
+
+commit_touches_outside_path() {
+  commit=$1
+  path=$2
+
+  exclude_pathspec=$(exclude_pathspec_for_path "$path") || return 1
+  ! git diff-tree --root --quiet --no-commit-id -r "$commit" -- ":(top)" "$exclude_pathspec"
+}
+
+commit_is_mixed_path() {
+  commit=$1
+  path=$2
+
+  commit_touches_path "$commit" "$path" && commit_touches_outside_path "$commit" "$path"
+}
+
+commit_is_path_only() {
+  commit=$1
+  path=$2
+
+  commit_touches_path "$commit" "$path" && ! commit_touches_outside_path "$commit" "$path"
+}
+
+list_refs_commits() {
+  path=$1
+  history_range=$2
+
+  for commit in $(path_commits "$path" "$history_range"); do
+    if commit_is_mixed_path "$commit" "$path"; then
+      printf '%s\n' "$commit"
+    fi
+  done
+}
+
+ensure_backup_branch() {
+  if [ -n "$BACKUP_BRANCH" ]; then
+    return 0
+  fi
+
+  BACKUP_BRANCH="isolate-rebase-backup-$(date +%Y%m%d-%H%M%S)-$$"
+  git branch "$BACKUP_BRANCH" HEAD >/dev/null
+}
+
+remove_backup_branch() {
+  if [ -z "$BACKUP_BRANCH" ]; then
+    return 0
+  fi
+
+  git branch -D "$BACKUP_BRANCH" >/dev/null 2>&1 || true
+  BACKUP_BRANCH=
+}
+
+compute_rebase_base() {
+  commit=$1
+
+  if git rev-parse --verify "${commit}^" >/dev/null 2>&1; then
+    REBASE_BASE_MODE=commit
+    REBASE_BASE_REF=$(git rev-parse "${commit}^")
+  else
+    REBASE_BASE_MODE=root
+    REBASE_BASE_REF=
+  fi
+}
+
+set_rebase_base_to_upstream() {
+  upstream_commit=$1
+
+  REBASE_BASE_MODE=commit
+  REBASE_BASE_REF=$upstream_commit
+}
+
+run_interactive_rebase() {
+  editor_path=$1
+  mode=$2
+  base_ref=$3
+
+  if [ "$mode" = root ]; then
+    GIT_SEQUENCE_EDITOR="$editor_path" git rebase -i --root
+  else
+    GIT_SEQUENCE_EDITOR="$editor_path" git rebase -i "$base_ref"
+  fi
+}
+
+write_isolate_editor() {
+  editor_file=$1
+  commits_file=$2
+  path=$3
+
+  exec_path=$(rebase_exec_path)
+  self_q=$(shell_quote "$exec_path")
+  path_q=$(shell_quote "$path")
+  exec_line_q=$(shell_quote "exec $self_q --exec-step $path_q")
+  commits_file_q=$(shell_quote "$commits_file")
+
+  cat >"$editor_file" <<EOF
+#!/bin/sh
+set -eu
+todo_file=\$1
+tmp_file=\$(mktemp)
+trap 'rm -f "\$tmp_file"' EXIT HUP INT TERM
+while IFS= read -r line; do
+  action=\$(printf '%s\n' "\$line" | awk '{ print \$1 }')
+  commit=\$(printf '%s\n' "\$line" | awk '{ print \$2 }')
+  printf '%s\n' "\$line" >>"\$tmp_file"
+  case "\$action" in
+    pick|reword|edit)
+      full_commit=\$(git rev-parse "\$commit")
+      if grep -qx "\$full_commit" $commits_file_q; then
+        printf '%s\n' $exec_line_q >>"\$tmp_file"
+      fi
+      ;;
+  esac
+done <"\$todo_file"
+mv "\$tmp_file" "\$todo_file"
+EOF
+
+  chmod +x "$editor_file"
+}
+
+write_gather_editor() {
+  editor_file=$1
+  path=$2
+  path_q=$(shell_quote "$path")
+
+  cat >"$editor_file" <<EOF
+#!/bin/sh
+set -eu
+todo_file=\$1
+keep_file=\$(mktemp)
+move_file=\$(mktemp)
+comment_file=\$(mktemp)
+trap 'rm -f "\$keep_file" "\$move_file" "\$comment_file"' EXIT HUP INT TERM
+
+while IFS= read -r line; do
+  case "\$line" in
+    ""|"#"*)
+      printf '%s\n' "\$line" >>"\$comment_file"
+      continue
+      ;;
+  esac
+
+  commit=\$(printf '%s\n' "\$line" | awk '{ print \$2 }')
+  full_commit=\$(git rev-parse "\$commit")
+  if git diff-tree --root --quiet --no-commit-id -r "\$full_commit" -- $path_q; then
+    printf '%s\n' "\$line" >>"\$keep_file"
+  else
+    printf '%s\n' "\$line" >>"\$move_file"
+  fi
+done <"\$todo_file"
+
+cat "\$move_file" >>"\$keep_file"
+cat "\$comment_file" >>"\$keep_file"
+mv "\$keep_file" "\$todo_file"
+EOF
+
+  chmod +x "$editor_file"
+}
+
+run_isolate_stage() {
+  path=$1
+  history_range=$2
+  upstream_commit=$3
+  supplied_refs_commits=${4:-}
+
+  if [ -n "$supplied_refs_commits" ]; then
+    refs_commits=$supplied_refs_commits
+  else
+    refs_commits=$(list_refs_commits "$path" "$history_range")
+  fi
+  [ -n "$refs_commits" ] || return 1
+
+  ensure_backup_branch
+
+  if [ -n "$upstream_commit" ]; then
+    set_rebase_base_to_upstream "$upstream_commit"
+  else
+    first_commit=$(first_line "$refs_commits")
+    compute_rebase_base "$first_commit"
+  fi
+
+  git_dir=$(git rev-parse --git-dir)
+  commits_file="$git_dir/isolate-rebase-commits-$$.txt"
+  editor_file="$git_dir/isolate-rebase-sequence-editor-$$.sh"
+  trap 'rm -f "$commits_file" "$editor_file"' EXIT HUP INT TERM
+
+  printf '%s\n' "$refs_commits" >"$commits_file"
+  write_isolate_editor "$editor_file" "$commits_file" "$path"
+
+  run_interactive_rebase "$editor_file" "$REBASE_BASE_MODE" "$REBASE_BASE_REF"
+
+  rm -f "$commits_file" "$editor_file"
+  trap - EXIT HUP INT TERM
+  return 0
+}
+
+path_commits_already_gathered() {
+  path=$1
+  history_range=$2
+
+  path_touches=$(path_commits "$path" "$history_range")
+  [ -n "$path_touches" ] || return 1
+  for commit in $path_touches; do
+    commit_is_path_only "$commit" "$path" || return 1
+  done
+
+  path_touch_count=$(count_lines "$path_touches")
+  head_tail=$(git log --format=%H -n "$path_touch_count" --reverse HEAD)
+  [ "$head_tail" = "$path_touches" ]
+}
+
+run_gather_stage() {
+  path=$1
+  history_range=$2
+  upstream_commit=$3
+
+  if path_commits_already_gathered "$path" "$history_range"; then
+    return 1
+  fi
+
+  ensure_backup_branch
+
+  if [ -n "$upstream_commit" ]; then
+    set_rebase_base_to_upstream "$upstream_commit"
+  else
+    first_commit=$(first_line "$(path_commits "$path" "$history_range")")
+    compute_rebase_base "$first_commit"
+  fi
+
+  git_dir=$(git rev-parse --git-dir)
+  editor_file="$git_dir/isolate-rebase-gather-editor-$$.sh"
+  trap 'rm -f "$editor_file"' EXIT HUP INT TERM
+
+  write_gather_editor "$editor_file" "$path"
+  run_interactive_rebase "$editor_file" "$REBASE_BASE_MODE" "$REBASE_BASE_REF"
+
+  rm -f "$editor_file"
+  trap - EXIT HUP INT TERM
+  return 0
+}
+
+if [ "${1:-}" = "--exec-step" ]; then
+  [ $# -eq 2 ] || die "Internal usage error."
+  path=$2
+  worktree_root=$(git rev-parse --show-toplevel) || die "Not inside a Git worktree."
+  cd "$worktree_root" || die "Failed to enter worktree root: $worktree_root"
+
+  if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+    from=$(git rev-parse HEAD^)
+    parent_tree=$(git rev-parse "${from}^{tree}")
+  else
+    from=$EMPTY_TREE
+    parent_tree=$EMPTY_TREE
+  fi
+
+  patch_file=$(mktemp)
+  message_file=$(mktemp)
+  path_message_file=$(mktemp)
+  trap 'rm -f "$patch_file" "$message_file" "$path_message_file"' EXIT HUP INT TERM
+  git diff --binary "$from" HEAD -- "$path" >"$patch_file"
+
+  if [ -s "$patch_file" ]; then
+    subject=$(git log -1 --format=%s HEAD)
+    git log -1 --format=%B HEAD >"$message_file"
+    git apply -R --index "$patch_file"
+    if ! git diff --cached --quiet; then
+      if [ "$(git write-tree)" = "$parent_tree" ]; then
+        git restore --staged --worktree --source=HEAD -- "$path"
+        exit 0
+      fi
+
+      git commit --amend -F "$message_file" >/dev/null
+      git apply --index "$patch_file"
+      {
+        printf 'ISOLATE: %s from %s\n\n' "$path" "$subject"
+        git log -1 --format=%B HEAD
+      } >"$path_message_file"
+      git commit -F "$path_message_file" >/dev/null
+    fi
+  fi
+
+  exit 0
+fi
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+[ $# -ge 2 ] || die "Usage: $SCRIPT_NAME :<path> <refs|isolate|gather> [upstream]"
+[ $# -le 3 ] || die "Usage: $SCRIPT_NAME :<path> <refs|isolate|gather> [upstream]"
+
+path=$1
+command=$2
+upstream=${3:-}
+upstream_commit=
+worktree_root=$(git rev-parse --show-toplevel) || die "Not inside a Git worktree."
+if [ -n "$upstream" ]; then
+  upstream_commit=$(git rev-parse --verify "$upstream^{commit}") || die "Invalid upstream: $upstream"
+  history_range=$upstream_commit..HEAD
+else
+  history_range=HEAD
+fi
+path=$(pathspec_from_user_path "$path")
+cd "$worktree_root" || die "Failed to enter worktree root: $worktree_root"
+
+all_path_commits=$(path_commits "$path" "$history_range")
+[ -n "$all_path_commits" ] || die "No commits touch path: $path"
+
+case "$command" in
+  refs)
+    print_oneline_commits "$all_path_commits"
+    ;;
+  isolate)
+    ensure_clean_worktree
+    refs_commits=$(list_refs_commits "$path" "$history_range")
+    if [ -z "$refs_commits" ]; then
+      exit 0
+    fi
+
+    run_isolate_stage "$path" "$history_range" "$upstream_commit" || die "Failed to isolate path: $path"
+    remove_backup_branch
+    ;;
+  gather)
+    ensure_clean_worktree
+    if path_commits_already_gathered "$path" "$history_range"; then
+      exit 0
+    fi
+
+    refs_commits=$(list_refs_commits "$path" "$history_range")
+    if [ -n "$refs_commits" ]; then
+      run_isolate_stage "$path" "$history_range" "$upstream_commit" "$refs_commits" || die "Failed to isolate path: $path"
+    fi
+
+    refs_commits=$(list_refs_commits "$path" "$history_range")
+    [ -z "$refs_commits" ] || die "Failed to isolate all mixed commits for path: $path"
+
+    if ! run_gather_stage "$path" "$history_range" "$upstream_commit"; then
+      remove_backup_branch
+      exit 0
+    fi
+    remove_backup_branch
+    ;;
+  *)
+    die "Unknown command: $command"
+    ;;
+esac

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Docker entrypoint: dev user (image USER); optional sshd on port 2222 (no root/caps).
-# Immutable toolchains: TOOLS_PREFIX on /tools (read-only). Mutable caches: ~/.cache.
+# Immutable toolchains: TOOLS_PREFIX on /tools (read-only). Mutable home overlays are mounted by c0.
 
 set -e
 
@@ -25,12 +25,6 @@ setup_dev_tools() {
 
     mkdir -p "$HOME/.cache/cargo" "$HOME/.cache/uv"
 
-    export CARGO_HOME="$HOME/.cache/cargo"
-    export UV_CACHE_DIR="$HOME/.cache/uv"
-    export XDG_CACHE_HOME="$HOME/.cache"
-    export RUSTUP_HOME="$TOOLS_PREFIX/.rustup"
-    export RUSTUP_NO_UPDATE=1
-
     if [ -d "$TOOLS_PREFIX/.cargo/bin" ]; then
         mkdir -p "$HOME/.cargo"
         ln -sfn "$TOOLS_PREFIX/.cargo/bin" "$HOME/.cargo/bin"
@@ -40,8 +34,35 @@ setup_dev_tools() {
         ln -sfn "$TOOLS_PREFIX/.rustup" "$HOME/.rustup"
     fi
 
-    export PATH="$TOOLS_PREFIX/.cargo/bin:$TOOLS_PREFIX/.local/bin:${PATH:-}"
-    export CARGO_HOME RUSTUP_HOME UV_CACHE_DIR XDG_CACHE_HOME RUSTUP_NO_UPDATE PATH
+}
+
+wait_for_home_overlays() {
+    local policy_file=/etc/c0dev/home-overlays.conf
+    local guest_rel tools_rel extra target fstype
+    local attempts=0 pending
+
+    [ -r "$policy_file" ] || {
+        echo "error: home overlay policy missing: $policy_file" >&2
+        exit 1
+    }
+
+    while [ "$attempts" -lt 150 ]; do
+        pending=0
+        while IFS='|' read -r guest_rel tools_rel extra; do
+            case "$guest_rel" in
+                ''|'#'*) continue ;;
+            esac
+            target="$HOME/$guest_rel"
+            fstype="$(findmnt -T "$target" -n -o FSTYPE 2>/dev/null || true)"
+            [ "$fstype" = overlay ] || pending=$((pending + 1))
+        done <"$policy_file"
+        [ "$pending" -eq 0 ] && return 0
+        attempts=$((attempts + 1))
+        sleep 0.2
+    done
+
+    echo "error: timed out waiting for c0 home overlays" >&2
+    exit 1
 }
 
 start_sshd() {
@@ -63,6 +84,7 @@ start_sshd() {
 }
 
 setup_dev_tools
+wait_for_home_overlays
 
 if [ -f ~/.profile ]; then
     # shellcheck disable=SC1090

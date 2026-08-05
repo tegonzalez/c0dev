@@ -4,11 +4,18 @@ x-volume-folders: &folders
     - ../.cache:/home/dev/.cache
     - ../.codex:/home/dev/.codex
     - ../.config:/home/dev/.config
+    - ../.local:/home/dev/.local-rw
     - ../rules:/home/dev/rules
     - ../projects:/home/dev/projects
-    - ../bin:/home/dev/bin
+    - ../bin:/home/dev/bin:ro
     - ../auth/ssh:/home/dev/.ssh
-    - tools-shared:/tools:ro
+    - type: volume
+      source: tools-shared
+      target: /tools/current
+      read_only: true
+      volume:
+        subpath: opt/${TOOLS_ID}
+    - home-overlays:/run/c0/overlay-state
 
 services:
   c0dev:
@@ -18,3 +25,5 @@ volumes:
   tools-shared:
     external: true
     name: ${SHARED_TOOLS_VOLUME:-c0dev-tools-shared}
+  home-overlays:
+    name: ${C0_INSTANCE_ID:-c0dev}-home-overlays

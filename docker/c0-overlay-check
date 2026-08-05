@@ -1,0 +1,152 @@
+#!/bin/bash
+
+set -u
+
+policy_file=${C0_HOME_OVERLAYS_FILE:-/etc/c0dev/home-overlays.conf}
+state_root=${C0_OVERLAY_STATE_ROOT:-/run/c0/overlay-state}
+mode=${1:---summary}
+errors=0
+overrides_total=0
+state_total=0
+
+overlay_name() {
+    printf '%s' "${1#.}" | tr '/' '-'
+}
+
+get_xattr() {
+    local path="$1" name="$2"
+    getfattr --only-values -n "$name" "$path" 2>/dev/null || true
+}
+
+has_xattr() {
+    local path="$1" name="$2"
+    getfattr -n "$name" "$path" >/dev/null 2>&1
+}
+
+is_whiteout() {
+    local path="$1"
+    if [ -c "$path" ] && [ "$(stat -c '%t:%T' "$path" 2>/dev/null || true)" = 0:0 ]; then
+        return 0
+    fi
+    has_xattr "$path" user.overlay.whiteout
+}
+
+check_overlay() {
+    local guest_rel="$1" tools_rel="$2"
+    local name target lower upper fstype options
+    local state_count=0 override_count=0 delete_count=0 opaque_count=0
+
+    name="$(overlay_name "$guest_rel")"
+    target="${HOME}/${guest_rel}"
+    lower="${TOOLS_PREFIX}/${tools_rel}"
+    upper="${state_root}/upper/${name}"
+
+    fstype="$(findmnt -T "$target" -n -o FSTYPE 2>/dev/null || true)"
+    options="$(findmnt -T "$target" -n -o OPTIONS 2>/dev/null || true)"
+    if [ "$fstype" != overlay ]; then
+        printf 'c0 overlay error: %s is %s, expected overlay\n' "$target" "${fstype:-unmounted}" >&2
+        errors=$((errors + 1))
+        return
+    fi
+    case ",$options," in
+        *,lowerdir="$lower",*|*,lowerdir="$lower":*) ;;
+        *)
+            printf 'c0 overlay error: %s has unexpected lowerdir\n' "$target" >&2
+            errors=$((errors + 1))
+            ;;
+    esac
+    case ",$(findmnt -T "$lower" -n -o OPTIONS 2>/dev/null || true)," in
+        *,ro,*) ;;
+        *)
+            printf 'c0 overlay error: tools lower is not read-only: %s\n' "$lower" >&2
+            errors=$((errors + 1))
+            ;;
+    esac
+
+    if [ -d "$upper" ]; then
+        while IFS= read -r -d '' path; do
+            local rel status
+            rel=${path#"$upper"/}
+            if is_whiteout "$path"; then
+                delete_count=$((delete_count + 1))
+                status=D
+            elif [ -e "$lower/$rel" ] || [ -L "$lower/$rel" ]; then
+                override_count=$((override_count + 1))
+                status=M
+            else
+                state_count=$((state_count + 1))
+                status=A
+            fi
+            if [ "$mode" = --porcelain ]; then
+                printf '%s\t%s/%s\n' "$status" "$guest_rel" "$rel"
+            fi
+        done < <(find "$upper" -xdev -mindepth 1 ! -type d -print0 2>/dev/null)
+
+        while IFS= read -r -d '' path; do
+            local opaque rel
+            rel=${path#"$upper"/}
+            opaque="$(get_xattr "$path" user.overlay.opaque)"
+            if [ -n "$opaque" ]; then
+                opaque_count=$((opaque_count + 1))
+                if [ "$mode" = --porcelain ]; then
+                    printf 'O\t%s/%s/\n' "$guest_rel" "$rel"
+                fi
+            elif [ "$mode" = --porcelain ] && [ ! -d "$lower/$rel" ]; then
+                printf 'A\t%s/%s/\n' "$guest_rel" "$rel"
+            fi
+        done < <(find "$upper" -xdev -mindepth 1 -type d -print0 2>/dev/null)
+    fi
+
+    state_total=$((state_total + state_count))
+    overrides_total=$((overrides_total + override_count + delete_count + opaque_count))
+
+    if [ "$mode" = --detail ]; then
+        printf '%s: state=%d overrides=%d deletions=%d opaque=%d\n' \
+            "$guest_rel" "$state_count" "$override_count" "$delete_count" "$opaque_count"
+        if [ "$override_count" -gt 0 ] || [ "$delete_count" -gt 0 ] || [ "$opaque_count" -gt 0 ]; then
+            while IFS= read -r -d '' path; do
+                local rel opaque
+                rel=${path#"$upper"/}
+                opaque="$(get_xattr "$path" user.overlay.opaque)"
+                if is_whiteout "$path"; then
+                    printf '  deleted: %s\n' "$rel"
+                elif [ -n "$opaque" ]; then
+                    printf '  opaque: %s\n' "$rel"
+                elif [ ! -d "$path" ] && { [ -e "$lower/$rel" ] || [ -L "$lower/$rel" ]; }; then
+                    printf '  overridden: %s\n' "$rel"
+                fi
+            done < <(find "$upper" -xdev -mindepth 1 -print0 2>/dev/null)
+        fi
+    fi
+}
+
+if [ ! -r "$policy_file" ]; then
+    printf 'c0 overlay error: policy missing: %s\n' "$policy_file" >&2
+    exit 1
+fi
+if [ -z "${TOOLS_PREFIX:-}" ]; then
+    printf 'c0 overlay error: TOOLS_PREFIX is unset\n' >&2
+    exit 1
+fi
+
+while IFS='|' read -r guest_rel tools_rel extra; do
+    case "$guest_rel" in
+        ''|'#'*) continue ;;
+    esac
+    if [ -z "$tools_rel" ] || [ -n "${extra:-}" ]; then
+        printf 'c0 overlay error: invalid policy row: %s|%s\n' "$guest_rel" "$tools_rel" >&2
+        errors=$((errors + 1))
+        continue
+    fi
+    check_overlay "$guest_rel" "$tools_rel"
+done <"$policy_file"
+
+if [ "$mode" = --summary ]; then
+    if [ "$errors" -eq 0 ] && [ "$overrides_total" -eq 0 ]; then
+        printf 'c0 overlays: lower=ro state=%d overrides=0\n' "$state_total"
+    elif [ "$overrides_total" -gt 0 ]; then
+        printf 'c0 overlay warning: %d packaged path(s) overridden; run c0 tools\n' "$overrides_total" >&2
+    fi
+fi
+
+[ "$errors" -eq 0 ]

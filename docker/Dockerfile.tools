@@ -14,6 +14,12 @@ RUN curl -fsS https://cursor.com/install | bash
 # factory.ai droid installs in ~/.local/
 RUN curl -fsSL https://app.factory.ai/cli | sh
 
+# devin.ai installs in ~/.devin/
+RUN curl -fsSL https://cli.devin.ai/install.sh | sed -e 's/^.*COMPILED_BIN_NAME" setup//' | bash
+
+# fnm for nodejs version management
+RUN curl -fsSL https://fnm.vercel.app/install | bash
+
 # graph-code (code-graph-rag) installs in ~/.local/
 # WORKDIR /home/dev/.local/shared/
 # RUN mkdir code-graph-rag

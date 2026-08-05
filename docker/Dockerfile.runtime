@@ -1,14 +1,26 @@
 # Final runtime stage (concatenated with Dockerfile.base at build time)
 FROM base
 
+# Vendored from https://downloads.1password.com/linux/keys/1password.asc (do not fetch at build)
+COPY 1password.asc /usr/share/keyrings/1password-archive-keyring.asc
+# Vendored from curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o cloud.google.gpg
+COPY cloud.google.gpg /usr/share/keyrings/
+
+RUN echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/1password-archive-keyring.asc] https://downloads.1password.com/linux/debian/arm64 stable main' | tee /etc/apt/sources.list.d/1password.list
+RUN echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' | tee /etc/apt/sources.list.d/google-cloud-sdk.list
+
+RUN apt update
+
 RUN apt install -y \
-    locales procps \
+    locales procps attr \
     bc fzf jq yq \
     iproute2 iputils-ping net-tools socat netcat-traditional \
+    strace zsh \
     tmux vim neovim \
     wget bat btop tree \
     pandoc poppler-utils \
-    openssh-server
+    openssh-server \
+    1password-cli
 
 RUN printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/01c0dev-no-sandbox
 
@@ -20,6 +32,7 @@ RUN bun i -g @openai/codex@latest
 RUN bun i -g @anthropic-ai/claude-code@latest
 # > 300s WTAF??
 # RUN bun i -g @google/gemini-cli@latest
+RUN bun i -g @kaitranntt/ccs
 
 # errata: handle bun -g installing as local user garbage
 RUN chmod +rx /root

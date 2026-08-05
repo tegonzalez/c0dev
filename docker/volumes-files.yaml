@@ -3,6 +3,8 @@ x-volume-files: &files
     - ../.claude.json:/home/dev/.claude.json
     - ~/.gitconfig:/home/dev/.gitconfig
     - ../docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
+    - ../docker/home-overlays.conf:/etc/c0dev/home-overlays.conf:ro
+    - ../docker/c0-overlay-check:/usr/local/bin/c0-overlay-check:ro
 
 services:
   c0dev:

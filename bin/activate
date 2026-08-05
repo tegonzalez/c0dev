@@ -3,21 +3,45 @@
 # Intended to be sourced (POSIX): `. ./activate`
 # Works in sh and bash; avoids bash arrays and `source`.
 
+# Drop $1 from PATH so prepend/append can reorder. Insert-if-absent cannot
+# move an entry already placed by /etc/profile, ~/.profile, or a parent shell.
+_path_remove() {
+	PATH=$(
+		out=
+		IFS=:
+		# Intentional split on PATH entries, not whitespace.
+		for dir in $PATH; do
+			[ "$dir" = "$1" ] && continue
+			out=${out:+$out:}$dir
+		done
+		printf '%s' "$out"
+	)
+}
+
 prepend_path() {
 	p=$1
 	[ -n "$p" ] || return 0
 	[ -d "$p" ] || return 0
-	case ":${PATH}:" in
-	*:"$p":*)
-		;;
-	*)
-		if [ -n "${PATH}" ]; then
-			PATH="$p:$PATH"
-		else
-			PATH="$p"
-		fi
-		;;
-	esac
+	_path_remove "$p"
+	if [ -n "${PATH}" ]; then
+		PATH="$p:$PATH"
+	else
+		PATH="$p"
+	fi
+}
+
+# Move-to-end. Used for bun's node shim so a real node (apt, corepack,
+# ~/.local/bin) wins; the shim remains a fallback when none exists.
+append_path() {
+	p=$1
+	[ -n "$p" ] || return 0
+	[ -d "$p" ] || return 0
+	_path_remove "$p"
+	if [ -n "${PATH}" ]; then
+		PATH="$PATH:$p"
+	else
+		PATH="$p"
+	fi
 }
 
 resolve_path() {
@@ -41,22 +65,29 @@ esac
 script_dir=$(resolve_path "$(dirname -- "$script_path")")
 root_dir=$(resolve_path "$script_dir/..")
 
-prepend_path "/usr/local/bun-node-fallback-bin"
+# oven/bun appends this dir; login shells reset PATH, so we must append
+# too or the shim shadows /usr/bin/node and corepack shims.
+append_path "/usr/local/bun-node-fallback-bin"
+prepend_path "$(resolve_path "$root_dir/.local/bin")"
+
+# SSH sessions do not inherit compose env; recover TOOLS_PREFIX from PID 1.
+if [ -z "${TOOLS_PREFIX:-}" ] && [ -r /proc/1/environ ]; then
+	TOOLS_PREFIX=$(tr '\0' '\n' </proc/1/environ 2>/dev/null | sed -n 's/^TOOLS_PREFIX=//p' | head -n 1)
+	[ -n "${TOOLS_PREFIX}" ] && export TOOLS_PREFIX
+fi
 
 if [ -n "${TOOLS_PREFIX:-}" ]; then
-	prepend_path "$TOOLS_PREFIX/.cargo/bin"
-	prepend_path "$TOOLS_PREFIX/.local/bin"
+	prepend_path "${HOME}/.cargo/bin"
 	export RUSTUP_HOME="$TOOLS_PREFIX/.rustup"
 	export CARGO_HOME="${HOME}/.cache/cargo"
 	export UV_CACHE_DIR="${HOME}/.cache/uv"
+	export XDG_CONFIG_HOME="${HOME}/.config"
 	export XDG_CACHE_HOME="${HOME}/.cache"
+	export XDG_DATA_HOME="${HOME}/.local-rw/share"
+	export XDG_STATE_HOME="${HOME}/.local-rw/state"
 	export RUSTUP_NO_UPDATE=1
-	if [ -d "$TOOLS_PREFIX/.rustup" ]; then
-		ln -sfn "$TOOLS_PREFIX/.rustup" "${HOME}/.rustup"
-	fi
 else
 	prepend_path "$(resolve_path "$root_dir/.cargo/bin")"
-	prepend_path "$(resolve_path "$root_dir/.local/bin")"
 fi
 
 prepend_path "$(resolve_path "$root_dir/bin")"

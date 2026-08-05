@@ -12,7 +12,8 @@ rules
 .cursor
 .opencode
 .config
-.local
+.local/*
+!.local/.gitkeep
 .rustup
 .terminfo
 docker/.compose.ssh-auth.yaml

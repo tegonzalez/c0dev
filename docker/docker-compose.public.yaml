@@ -5,13 +5,12 @@ x-environment-base: &env-base
   LLM_PROVIDER: ollama
   OLLAMA_MODEL: gpt-oss:20b
   TERM: ${TERM}
-  # OrbStack/Desktop relay path (same in guest as VM); bind added by c0 when host agent is ready.
-  SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
   # Immutable toolchains on shared volume (RO at runtime); mutable caches in ~/.cache
   TOOLS_PREFIX: ${TOOLS_PREFIX:-/tools/opt/default}
 
 services:
   c0dev:
+    init: true
     build:
       context: .
       dockerfile: .Dockerfile.build

@@ -1,3 +1,7 @@
+---
+doc-graph: "When there is an intention to amend this document, first Adhere to [dc-doc-readme]; otherwise, do not modify."
+---
+
 # c0dev
 
 A containerized development environment for AI-assisted coding and full-stack work, packaged as a reproducible Docker image with modern CLI tooling.
@@ -12,26 +16,153 @@ A containerized development environment for AI-assisted coding and full-stack wo
 
 **Non-goals:** Multi-tenant isolation, production deployment, or sandboxing agents from your own mounted data and credentials.
 
+Documentation questions route through the [c0dev authority index](docs/index.md). README is an onboarding summary, not the owner of detailed behavior or architecture.
+
+### Command-oriented architecture
+
+```text
+CONTAINER LIFETIMES
+
+                                               +-----------+
+c0 build [-f]  +-------------- install ------->|   tools   |
+               |                               +-----+-----+
+               |                                     |
+               |                                     X
+                                               +-----------+
+               +--------------- image -------->|   build   |
+                                               +-----+-----+
+                                                     |
+                                                     X
+
+
+                                                               +-----------+
+c0 start/restart  +------------------- lifecycle ------------->|  runtime  |
+                  |                                            +-----+-----+
+                  |                                                  |
+                                         +-----------+               |
+                  +------- create ------>|  overlay  |               |
+                                         +-----+-----+               |
+                                               +---- mount --------->|
+                                               X                     |
+                                                                     |
+c0 sh/ssh      |------------------------- dev exec ----------------->|
+                                                                     |
+                                                                     |
+c0 root        |------------------------- uid 0 exec --------------->|
+                                                                     |
+                                                                     |
+c0 status      |------------------------- inspect ------------------>|
+                                                                     |
+                                                                     |
+c0 stop        |---------------------------- stop ------------------>X
+
+
+PERSISTENT STORAGE ACCESS
+
+                           +-----------+
+                           |   tools   |------ RW ---------+
+                           +-----+-----+                   |
+                                                           |
+                                                           |      /-------------\
+                           +-----------+                   |     /              \
+                           |  overlay  |------ RO lower ---+---->| tools-volume |
+                           +-----+-----+                   |     \              /
+                                                           |      \-------------/
+ /-------------\                                           |
+/              \           +-----------+                   |
+|  host-mount  |--- RW --->|  runtime  |------ RO ---------+
+\              /           +-----+-----+                   |
+ \-------------/                                           |
+                                                           |
+c0 status      |----------------- RO inspect --------------+
+                                                           |
+c0 clean       |----------------- GC ----------------------+
+```
+
+#### `build`
+
+- Type: Guest instance used for runtime-image construction.
+- Lifetime: Bounded by the runtime-image phase of `c0 build`; exits afterward.
+- User: Root for apt and image setup; the resulting runtime image switches to `dev`.
+- Security: Docker/BuildKit build profile.
+- Network: Build network for apt and package retrieval.
+- Storage: Writes image layers only.
+- Use: Produces the image consumed by a later runtime create or restart.
+
+#### `tools`
+
+- Type: Guest instance used for tool installation and extraction.
+- Lifetime: Bounded by the tools phase of `c0 build`; exits afterward.
+- User: `dev` for uv, Cursor, Droid, Devin, Semgrep, Rustup, and Cargo installers.
+- Security: Extraction runs with dropped capabilities and NNP; the tools-builder stage starts after `USER dev`.
+- Network: Build network for vendor and package downloads.
+- Storage: Writes `tools-volume` only during construction and extraction.
+- Use: Populates the shared canonical tool payload.
+
+#### `overlay`
+
+- Type: Short-lived guest instance used for the current writable-`.local` compatibility mount.
+- Lifetime: Created during start or restart when the runtime overlay is absent; exits after mounting.
+- User: UID 0.
+- Security: `SYS_ADMIN`, `SYS_PTRACE`, `SYS_CHROOT`, DAC/ownership capabilities, NNP, and unconfined seccomp.
+- Network: None.
+- Storage: Reads the selected tools lower and writes the per-instance overlay-stage volume while entering the runtime mount namespace.
+- Use: Mounts writable `.local` into `runtime`; the helper exits immediately after the mount succeeds.
+
+#### `runtime`
+
+- Type: Long-running development guest instance.
+- Lifetime: Starts or recreates through `c0 start` or `c0 restart`; ends through stop or recreation.
+- User: `dev`; `c0 root` enters UID 0 inside the same instance.
+- Security: `cap_drop: ALL`, then `CHOWN`, `DAC_OVERRIDE`, `FOWNER`; NNP; vendored Moby seccomp.
+- Network: Normal guest egress with loopback-published web and SSH ports.
+- Storage: Reads only its selected tools-volume subpath RO and writes host mounts, its overlay stage, and the runtime layer.
+- Use: Runs shells, agents, services, and apt administration.
+
+#### `tools-volume`
+
+- Type: Persistent Docker volume.
+- Lifetime: Independent of every guest instance.
+- User: Access depends on the operating guest or host volume operation.
+- Security: Only the selected `/tools/opt/<TOOLS_ID>` subpath is mounted read-only in `runtime`.
+- Network: Not applicable.
+- Storage: Written during build or explicit stage acceptance and eligible cleanup; inspected read-only by status.
+- Use: Stores immutable build toolsets, accepted snapshots, pins, and temporary publication paths.
+
+#### `host-mount`
+
+- Type: Persistent host bind set.
+- Lifetime: Independent of every guest instance.
+- User: Host ownership mapped for `dev` access in `runtime`.
+- Security: Ordinary bind-mount permissions; contents are deliberately guest-writable.
+- Network: Not applicable.
+- Storage: Config, auth, cache, logs, XDG state, projects, rules, and credentials.
+- Use: Preserves user state across runtime stop, restart, and recreation.
+
+Not shown as nodes: `c0 root` is an exec lane inside `runtime`; `c0 tools accept` briefly pauses and recreates `runtime` while using the existing overlay-helper class plus a separate networkless publisher; `tools-volume-helper` is an unnamed one-operation `--rm` process; SSH relay, logs, `cp-term`, seccomp update, and key generation are implementation or maintenance details.
+
 ## Terms
 
-| Term            | Meaning |
-| --------------- | ------- |
-| checkout        | Your clone of this repository on the host |
-| guest           | The running c0dev container |
-| dev user        | Default shell user inside the guest (`uid` 1000); use `c0 sh` |
-| `TOOLS_ID`      | Content hash of `docker/Dockerfile.base` + `docker/Dockerfile.tools`; selects the immutable toolchain directory on the shared tools volume |
-| tools volume    | Docker volume `c0dev-tools-shared` (override: `SHARED_TOOLS_VOLUME`); holds `/tools/opt/<TOOLS_ID>/` |
-| instance        | Per-checkout container identity (`c0dev.instance` label); ports and hostname are allocated per instance |
+| Term              | Meaning                                                                                                                                  |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| checkout          | Your clone of this repository on the host                                                                                                |
+| guest             | The running c0dev container                                                                                                              |
+| dev user          | Default shell user inside the guest (`uid` 1000); use `c0 sh`                                                                            |
+| `TOOLS_BUILD_ID`  | Content hash of `Dockerfile.base` and `Dockerfile.tools`; identifies the build-produced toolset                                          |
+| `TOOLS_ID`        | Complete build toolset or accepted-stage snapshot selected for one checkout                                                              |
+| tools volume      | Docker volume `c0dev-tools-shared` (override: `SHARED_TOOLS_VOLUME`); holds immutable `/tools/opt/<TOOLS_ID>/` snapshots                 |
+| writable stage    | Per-instance OverlayFS upper containing every runtime write beneath the overlaid tool-home paths                                         |
+| instance          | Per-checkout container identity (`c0dev.instance` label); ports and hostname are allocated per instance                                  |
 
 ## Host requirements
 
 **Status (fact):** Alpha — validated on the author's workstation only.
 
-| Requirement | Version or note |
-| ----------- | --------------- |
-| macOS       | Apple M-series, Tahoe v26.5 |
-| OrbStack    | orbctl 2.2.1 (2020100) |
-| Terminal    | Ghostty v1.3.1 |
+| Requirement | Version or note                           |
+| ----------- | ----------------------------------------- |
+| macOS       | Apple M-series, Tahoe v26.6.2             |
+| OrbStack    | orbctl 2.2.3 (20963)                      |
+| Terminal    | Ghostty v1.3.1                            |
 | Xcode       | Required for `infocmp` during image build |
 
 ## Image summary
@@ -46,18 +177,19 @@ A containerized development environment for AI-assisted coding and full-stack wo
 
 ### Built from source (Cargo)
 
-| Tool          | Version | Role |
-| ------------- | ------- | ---- |
-| `fd`          | 10.3.0  | Fast file finder |
-| `ripgrep`     | 14.1.1  | Recursive search |
-| `ast-grep`    | 0.39.4  | Structural code search |
-| `zellij`      | 0.43.1  | Terminal multiplexer |
-| `cargo-cache` | —       | Cargo cache management |
+| Tool          | Role                   |
+| ------------- | ---------------------- |
+| `fd`          | Fast file finder       |
+| `rg`          | Recursive search       |
+| `ast-grep`    | Structural code search |
+| `zellij`      | Terminal multiplexer   |
+| `nu`          | Structured shell       |
+| `cargo-cache` | Cargo cache management |
 
 ### Installed via package managers
 
-- Python: `uv`, `code-graph-rag` (commit 0037ad4)
-- Bun globals: `@anthropic-ai/claude-code`, `@openai/codex`, `opencode-ai`
+- Standalone/tool managers: `uv`, `uvx`, Cursor Agent, Factory Droid, Devin CLI, Semgrep
+- Bun globals: `@anthropic-ai/claude-code`, `@openai/codex`, `opencode-ai`, `@kaitranntt/ccs`
 - System utilities: `build-essential`, `cmake`, `git`, `curl`, `wget`, `fzf`, `jq`, `yq`, `bc`, `bat`, `btop`, `iproute2`, `iputils-ping`, `net-tools`, `socat`, `netcat`, `vim`, `tmux`
 - Rust toolchain: `rustup` with `wasm32-unknown-unknown` target (registry cache cleaned post-build)
 
@@ -92,6 +224,10 @@ c0 restart                # Restart services
 c0 logs                   # Show logs
 c0 status                 # Service status, volume mappings, workspaces
 c0 build [-f]             # Build tools and image (-f forces tools re-extract)
+c0 tools                  # Summarize the writable tools stage
+c0 tools --detail         # List every staged path
+c0 tools accept           # Seal the stage as a new immutable snapshot
+c0 tools restore          # Discard the stage and restore the selected snapshot
 c0 ssh                    # SSH as dev (loopback only; keys in auth/ssh/)
 c0 ssh --keygen           # Regenerate auth/ssh keys
 ```
@@ -116,71 +252,75 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 
 ### Claude Code
 
-1. Run `claude setup-token` inside the guest.
-1. Follow the browser prompt (Ghostty: CMD+click the URL) and approve long-term access. From host: `open $(pbpaste 2>/dev/null | tr -d '\n' || echo '(paste URL)')`
-1. Confirm the token is stored under `/home/dev/.claude.json` (persisted via the host volume).
+`claude setup-token`
 
 ### Codex CLI
 
-Run `codex login --device-auth` inside the guest and follow the prompts.
+`codex login --device-auth`
+
+### Devin CLI
+
+`devin setup`
 
 ### OpenCode CLI
 
-1. Run `opencode auth login` inside the guest.
-1. Choose your provider (or supply a URL) and finish the browser flow.
-1. Credentials are saved under `/home/dev/.config/opencode` for reuse.
+`opencode auth login`
 
 ## Volume mappings
 
-Persistent host ↔ guest paths for credentials, tooling, and projects:
+Persistent host ↔ guest paths for credentials, tooling, and projects: see `./docker/volumes-folders.yaml`, eg:
 
-| Host path        | Guest path              | Role |
-| ---------------- | ----------------------- | ---- |
-| `.claude/`       | `/home/dev/.claude`     | Assistant state |
-| `.cache/`        | `/home/dev/.cache`      | Mutable tool caches (cargo registry, uv); `c0` never purges |
-| `.config/`       | `/home/dev/.config`     | Application config |
-| `.codex/`        | `/home/dev/.codex`      | Assistant state |
-| `rules/`         | `/home/dev/rules`       | Project rules |
-| `projects/`      | `/home/dev/projects`    | Sources and build outputs |
-| `bin/`           | `/home/dev/bin`         | Host helper scripts |
-| `auth/ssh/`      | `/home/dev/.ssh`        | SSH keys and `sshd` config (gitignored) |
-| `.claude.json`   | `/home/dev/.claude.json`| Assistant credentials file |
-| `tools-shared`   | `/tools:ro`             | Immutable toolchains (rustup, cargo bins, uv tools) |
+| Host path      | Guest path               | Role                                                           |
+| -------------- | ------------------------ | -------------------------------------------------------------- |
+| `.claude/`     | `/home/dev/.claude`      | Assistant state                                                |
+| `.cache/`      | `/home/dev/.cache`       | Mutable tool caches (cargo registry, uv); `c0` never purges    |
+| `.config/`     | `/home/dev/.config`      | Application config                                             |
+| `.codex/`      | `/home/dev/.codex`       | Assistant state                                                |
+| `.local/`      | `/home/dev/.local-rw`    | Host-visible XDG data and state                                |
+| `rules/`       | `/home/dev/rules`        | Project rules                                                  |
+| `projects/`    | `/home/dev/projects`     | Sources and build outputs                                      |
+| `bin/`         | `/home/dev/bin:ro`       | Read-only host router and guest-safe helper scripts            |
+| `auth/ssh/`    | `/home/dev/.ssh`         | SSH keys and `sshd` config (gitignored)                        |
+| `.claude.json` | `/home/dev/.claude.json` | Assistant credentials file                                     |
+| `tools-shared` | `/tools/current:ro`      | Only this checkout's selected immutable tool snapshot          |
+| `home-overlays`| `/run/c0/overlay-state`  | Per-instance writable tool stage and OverlayFS work data       |
 
-Immutable Rust and uv binaries live on the read-only tools volume. Download caches live under host `.cache/` (`CARGO_HOME=~/.cache/cargo`, `UV_CACHE_DIR=~/.cache/uv`). After a toolchain upgrade, purge incompatible cache manually (for example `rm -rf .cache/cargo`).
+Canonical executables and resources come from the selected read-only tools snapshot. Native writes beneath an overlaid tool-home path enter the per-instance writable stage. XDG data/state is redirected to the host `.local/`; direct writers that ignore XDG remain part of the stage and are therefore included by `c0 tools accept` or removed by `c0 tools restore`.
+
+`PATH` resolves `.local` tools through merged `/home/dev/.local/bin`, so a staged native upgrade is effective immediately while the selected lower remains unchanged.
 
 ## Environment defaults
 
-| Setting        | Default |
-| -------------- | ------- |
-| Locale         | `en_US.UTF-8` |
-| Timezone       | `America/Los_Angeles` (`TZ` build arg overrides) |
-| Web port       | `host:<auto> -> guest:3000` (range `3000–4000`; override `C0DEV_WEB_PORT`) |
-| SSH port       | `127.0.0.1:<auto> -> guest:2222` (range `2222–2322`; override `C0DEV_SSH_PORT`) |
-| LLM provider   | Ollama at `http://host.docker.internal:11434` |
-| Default model  | `gpt-oss:20b` |
+| Setting       | Default                                                                         |
+| ------------- | ------------------------------------------------------------------------------- |
+| Locale        | `en_US.UTF-8`                                                                   |
+| Timezone      | `America/Los_Angeles` (`TZ` build arg overrides)                                |
+| Web port      | `host:<auto> -> guest:3000` (range `3000–4000`; override `C0DEV_WEB_PORT`)      |
+| SSH port      | `127.0.0.1:<auto> -> guest:2222` (range `2222–2322`; override `C0DEV_SSH_PORT`) |
+| LLM provider  | Ollama at `http://host.docker.internal:11434`                                   |
+| Default model | `gpt-oss:20b`                                                                   |
 
 ## Build pipeline
 
 On `c0 build`:
 
 1. Ensures host mount directories exist (prevents Docker from creating them as root-owned paths).
-1. Builds `tools-builder` from `docker/Dockerfile.base` + `docker/Dockerfile.tools` via `bin/dockerfile-concat` (OrbStack-compatible; no BuildKit include).
-1. Extracts immutable tool artifacts to the shared tools volume at `/tools/opt/<TOOLS_ID>/`.
 1. Builds the runtime image from `docker/Dockerfile.base` + `docker/Dockerfile.runtime` (concatenated the same way).
+1. Builds the UID-1000 tools-builder stage from the supported base path.
+1. Packs `.cargo/bin`, `.rustup`, and the complete builder-created `.local` tree.
+1. Extracts the payload through a temporary path and writes the completeness marker last.
+1. Pins the completed build toolset for this checkout.
 1. Installs terminfo for proper terminal emulation.
 
-**`TOOLS_ID` computation:** `bin/docker-hash docker/Dockerfile.base docker/Dockerfile.tools` (full-line comments stripped).
+`c0 build -f` reruns the same Dockerfile installer path without cache. `c0 tools` is not another build or installer command; it manages writes captured from the running restricted guest.
 
-**Invalidation (decision):** Changes to `Dockerfile.runtime` alone rebuild the runtime image only; they do not invalidate tools. Run `c0 build` without `-f` for image-only rebuilds. Run `c0 build -f` to force tools re-extract.
-
-Each successful build pins the checkout's `TOOLS_ID` in the tools volume for garbage-collection metadata. Running containers are never deleted by GC.
+See the [Tool-store contract](docs/tool-store-contract.md) for exact identity, transaction, publication, rollback, and collection law.
 
 ## Networking
 
 - The guest has outbound network access with host bridging.
 - `host.docker.internal` resolves to the host for local services (for example Ollama).
-- **SSH agent:** host `ssh-add -l` must work (1Password SSH agent or launchd). `c0` never bind-mounts host `$SSH_AUTH_SOCK`; it mounts the OrbStack/Desktop relay **`/run/host-services/ssh-auth.sock`** at the **same path** in the guest (`SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock`). Required for 1Password. Verify in the guest: `echo $SSH_AUTH_SOCK` and `ssh-add -l`. Disable: `C0_SSH_AGENT=0`.
+- **SSH agent:** host `ssh-add -l` must work (1Password SSH agent or launchd). `c0` bind-mounts OrbStack's VM relay **`/run/host-services/ssh-auth.sock`** at the same guest path and sets `SSH_AUTH_SOCK`; it never mounts the macOS launchd path. Verify with `c0 ssh "ssh-add -l"`. Disable with `C0_SSH_AGENT=0`.
 
 ## Security
 
@@ -188,49 +328,51 @@ c0dev is a **single-user local development container**, not a multi-tenant sandb
 
 ### Threat model
 
-| Boundary   | Scope |
-| ---------- | ----- |
-| In scope   | Compromised or misbehaving agent inside the guest; accidental credential exposure; limiting what a container escape or Docker misconfiguration could leverage on the host |
-| Out of scope | Operator who already controls the checkout, Docker daemon, or macOS user account |
-| Assumption | One human owns the host, the checkout, and all mounted guest paths (`projects/`, assistant config dirs, `auth/ssh/`, host `~/.gitconfig`, etc.) |
+| Boundary     | Scope                                                                                                                                                                     |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In scope     | Compromised or misbehaving agent inside the guest; accidental credential exposure; limiting what a container escape or Docker misconfiguration could leverage on the host |
+| Out of scope | Operator who already controls the checkout, Docker daemon, or macOS user account                                                                                          |
+| Assumption   | One human owns the host, the checkout, and all mounted guest paths (`projects/`, assistant config dirs, `auth/ssh/`, host `~/.gitconfig`, etc.)                           |
 
 ### Capability handling
 
 Runtime containers are **not privileged**. On `c0 start`, compose applies the security overlay (`docker-compose.security-permissive.yaml`):
 
-| Control              | Setting |
-| -------------------- | ------- |
-| Privileged           | `false` |
-| Capabilities         | `cap_drop: ALL`, then add `DAC_OVERRIDE`, `CHOWN`, `FOWNER` |
-| Privilege escalation | `no-new-privileges:true` |
+| Control              | Setting                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------- |
+| Privileged           | `false`                                                                                           |
+| Capabilities         | `cap_drop: ALL`, then add `DAC_OVERRIDE`, `CHOWN`, `FOWNER`                                       |
+| Privilege escalation | `no-new-privileges:true`                                                                          |
 | Syscalls             | Moby default seccomp profile (vendored under `docker/seccomp/`, checksum-verified at start/build) |
 
 `DAC_OVERRIDE`, `CHOWN`, and `FOWNER` let `c0 root` and package installs work inside the guest without running `sshd` setuid or granting broad Linux capabilities. They are **guest-admin helpers**, not host-root equivalents.
 
 `sshd` listens on guest port `2222` and runs as the `dev` user (no setuid). The host publishes **`127.0.0.1:<port>` only**.
 
-Ephemeral `docker run` invocations during `c0 build` also use `cap_drop: ALL` and `no-new-privileges`.
+Native upgrades run inside the existing restricted runtime and can write only its OverlayFS upper, not the shared tools volume. `c0 tools accept` pauses the runtime for a consistent snapshot, uses the existing networkless namespace helper to read the merged view, and invokes a separate networkless publisher. The publisher creates a new immutable snapshot and selects it for this checkout; it never modifies the selected snapshot in place.
 
 ### Hardening in place
 
-| Control            | Mechanism |
-| ------------------ | --------- |
-| Immutable toolchains | `tools-shared` mounted read-only at `/tools:ro`; caches in host `.cache/` |
-| Loopback SSH       | Pubkey-only inbound login; keys in gitignored `auth/ssh/` |
-| SSH agent relay    | Guest uses OrbStack `/run/host-services/ssh-auth.sock` relay (1Password-safe), not a raw bind of host `$SSH_AUTH_SOCK` |
-| Seccomp integrity  | Tampered or missing vendored profiles block `c0 start` / `c0 build`; run `c0 seccomp-upgrade` to adopt newer Moby profiles deliberately |
+| Control                   | Mechanism                                                                                                                                 |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------   |
+| Immutable accepted tools  | Runtime mounts only `/tools/opt/<TOOLS_ID>` at `/tools/current:ro`; other shared snapshots are not visible                                |
+| Explicit publication      | Runtime writes remain in its upper until the host operator runs `c0 tools accept`; runtime processes never receive volume-write authority |
+| Restore boundary          | `c0 tools restore` discards the entire visible upper and recreates the runtime against the selected snapshot                              |
+| Loopback SSH              | Pubkey-only inbound login; keys in gitignored `auth/ssh/`                                                                                 |
+| SSH agent relay           | OrbStack relay bound at `/run/host-services/ssh-auth.sock`; SSH sessions receive the same guest `SSH_AUTH_SOCK` path                      |
+| Seccomp integrity         | Tampered or missing vendored profiles block `c0 start` / `c0 build`; run `c0 seccomp-upgrade` to adopt newer Moby profiles deliberately   |
 
 ### Autonomous agents
 
 **Benefits of running agents in the guest**
 
-| Benefit                      | Effect |
-| ---------------------------- | ------ |
-| Process isolation            | Agent shells, servers, and crashes stay out of the host shell environment |
-| Capability + seccomp baseline | Drops Linux caps and restricts syscalls vs a bare host shell |
-| Immutable `/tools`           | Reduces in-session tampering of prebuilt CLIs |
-| Scoped networking defaults   | Web and SSH ports are explicit; SSH is loopback-only |
-| Reproducible toolchain       | Same Rust, uv, and assistant CLIs across machines and rebuilds |
+| Benefit                       | Effect                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------- |
+| Process isolation             | Agent shells, servers, and crashes stay out of the host shell environment |
+| Capability + seccomp baseline | Drops Linux caps and restricts syscalls vs a bare host shell              |
+| Immutable `/tools`            | Reduces in-session tampering of prebuilt CLIs                             |
+| Scoped networking defaults    | Web and SSH ports are explicit; SSH is loopback-only                      |
+| Reproducible toolchain        | Same Rust, uv, and assistant CLIs across machines and rebuilds            |
 
 **Residual agent authority (by design)**
 
@@ -254,54 +396,57 @@ c0dev does not sandbox agents from *your* data; it sandboxes them from *other ho
 
 ### Residual risks
 
-| Risk                     | Note |
-| ------------------------ | ---- |
-| Bind-mounted entrypoint  | `docker-entrypoint.sh` is mounted from the checkout; the same user who runs agents controls startup |
-| Docker group             | Docker daemon access can inspect volumes, override compose, or run privileged containers outside c0dev's profile |
-| Agent + SSH agent        | A compromised session can use any key loaded in the host agent until removed |
-| Build staging permissions | Tools builds briefly use permissive permissions under `/tools/tmp/` on the shared volume; concurrent Docker-level access could race during build |
+| Risk                     | Note                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Host orchestrator source | Guest-write exposure of host `c0`, publisher, adapters, locks, or security profiles would become delayed Docker-authority execution              |
+| Docker group             | Docker daemon access can inspect volumes, override compose, or run privileged containers outside c0dev's profile                                 |
+| Runtime tool updater     | Fetched updater code can alter the writable stage but cannot publish it or write the shared tools volume without a host-side `accept`            |
+| Agent + SSH agent        | A compromised session can use any key loaded in the host agent until removed                                                                     |
+| User tool override       | Mutable host tools can shadow effective commands when explicitly selected; they are outside canonical integrity                                  |
 
 ### Optional hardening
 
 - Restrict `sshd` with `ListenAddress` / `AllowUsers` in guest `sshd_config`
-- Validate `C0_SSH_AUTH_BIND` before writing generated compose fragments
-- Tighten build-time permissions on `/tools/tmp/<id>.partial`
+- Keep host orchestration and publisher source unavailable for guest writes
 - Add a stricter cap profile for read-mostly agent sessions (for example drop `DAC_OVERRIDE` / `FOWNER`)
 
 ## Troubleshooting
 
 - Build failures: confirm Xcode is available for `infocmp`; rerun with `c0 build -f` to force rebuild.
 - Volume issues: ensure host directories exist and remain writable before `c0 build`.
-- Empty or stale tools after layout changes: run `c0 build` once to populate `/tools/opt/<TOOLS_ID>/`, then `c0 restart`.
+- Inspect tool changes with `c0 tools`; use `--detail` when the added-path summary needs expansion.
+- If staged changes are wanted, run `c0 tools accept`; otherwise run `c0 tools restore`. Both commands recreate the runtime.
+- A failed accept leaves the previously selected snapshot complete and does not clear the writable stage.
 - Container label `c0dev.instance` identifies the checkout instance.
 
 ## Tools garbage collection
 
-Automatic garbage collection for shared tools volume **`TOOLS_ID`** directories prevents unbounded growth while protecting running containers.
+Build-produced and accepted tool snapshots are immutable. The current checkout pin and running-container labels protect selected snapshots from garbage collection.
 
 ### Concepts
 
-| Concept            | Definition |
-| ------------------ | ---------- |
-| Active `TOOLS_ID`  | Value used by a running container (`c0dev.tools_hash` label); never deleted |
-| Pinned `TOOLS_ID`  | Latest successful build for a checkout, stored in `/tools/pins/<folder-id>.pin`; updated on successful `c0 build`, cleared by `c0 clean` or checkout deletion |
-| Garbage collection | Removes `/tools/opt/<tools_id>/` directories that are neither active nor pinned; runs after successful `c0 build` or `c0 clean` |
+| Concept            | Definition                                                                 |
+| ------------------ | -------------------------------------------------------------------------- |
+| Build toolset      | Immutable payload identified by `TOOLS_BUILD_ID`                           |
+| Accepted snapshot  | Immutable merged tool-home snapshot derived from the selected `TOOLS_ID`   |
+| Writable stage     | Complete OverlayFS upper reported by `c0 tools`                            |
+| Pin                | Per-checkout selection and garbage-collection claim                        |
+| Active label       | Running-container claim protecting its selected snapshot                   |
+| Garbage collection | Removes complete snapshots protected by neither a valid pin nor active use |
 
-### Staged rebuilds
+### Stage acceptance
 
-When forcing a rebuild (`c0 build -f`) of a `TOOLS_ID` currently used by running containers:
+`c0 tools accept` operates on the complete stage shown by `c0 tools --detail`; there are no hidden path exclusions. It pauses the runtime, snapshots each configured merged home overlay, copies the selected immutable snapshot to a new 64-hex path, replaces its overlaid paths with the merged snapshot, records the parent and stage digest, writes `.c0dev-complete` last, and updates the checkout pin. It then clears the upper and recreates the runtime against the accepted snapshot.
 
-- Tools build to `/tools/tmp/<tools_id>.next` instead of `/tools/opt/<tools_id>`
-- Promotion to `/tools/opt/<tools_id>` happens when no instance uses that `TOOLS_ID`
-- Promotion is checked at the start of `c0 build` and `c0 clean`
+`c0 tools restore` recreates the runtime after clearing the same complete upper. It does not change the selected snapshot. Because the entire upper is the stage, direct writers that place logs, credentials, generated bytecode, or configuration beneath the overlay are included in either operation.
 
 ### Inspecting state
 
-Active `TOOLS_ID` from running containers:
+Current stage:
 
 ```bash
-docker ps -q --filter "volume=c0dev-tools-shared"
-docker inspect <container-id> --format '{{ index .Config.Labels "c0dev.tools_hash" }}'
+c0 tools
+c0 tools --detail
 ```
 
 Pinned `TOOLS_ID` values:
@@ -311,7 +456,7 @@ docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
 docker run --rm -v c0dev-tools-shared:/tools alpine cat /tools/pins/<folder-id>.pin
 ```
 
-`TOOLS_ID` directories:
+Toolset directories:
 
 ```bash
 docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/opt
@@ -320,9 +465,12 @@ docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/tmp
 
 ### Safety guarantees
 
-- Never deletes active `TOOLS_ID` values used by running containers
+- Never gives the runtime guest tools-volume write access
+- Never replaces a complete selected snapshot in place
 - Never modifies pins from inside the guest
-- Never promotes staged builds while an instance still uses the `TOOLS_ID`
+- Never accepts or restores without an explicit host command
 - Never triggers GC on build failure
 - Never updates pins on build failure
-- Uses `.partial` → rename for atomic promotions
+- Writes the accepted snapshot completeness marker last, then updates the checkout pin
+
+See the [Tool-store contract](docs/tool-store-contract.md) for exact state transitions and protection law.

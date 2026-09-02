@@ -773,6 +773,21 @@ get_mapped_ssh_port_from_container() {
     docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "2222/tcp"}}{{range $conf}}{{if eq .HostIp "127.0.0.1"}}{{.HostPort}}{{end}}{{end}}{{end}}{{end}}' "$container_id" 2>/dev/null || true
 }
 
+# Guest IPv4 as seen from the host (compose network). Empty if unknown.
+get_c0_container_ip() {
+    local container_id="${1:-}"
+    [[ -z "$container_id" ]] && container_id="$(get_c0_container_id_any)"
+    [[ -z "$container_id" ]] && return 0
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}}{{println}}{{end}}{{end}}' "$container_id" 2>/dev/null | awk 'NF { print; exit }'
+}
+
+# SSH remote shown in status/start output: user@<host-relative-ip>:2222
+ssh_remote_display() {
+    local ip
+    ip="$(get_c0_container_ip "${1:-}")"
+    echo "dev@${ip:-127.0.0.1}:2222"
+}
+
 get_current_ssh_port() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         return 0
@@ -860,7 +875,7 @@ print_ssh_server_mapping() {
     local port
     port="$(get_current_ssh_port || true)"
     if [[ -n "$port" ]]; then
-        echo -e "🔐 SSH: ${YELLOW}127.0.0.1:${port}${NC} -> ${YELLOW}dev@guest:2222${NC} (${CYAN}c0 ssh${NC})"
+        echo -e "🔐 SSH: ${YELLOW}127.0.0.1:${port}${NC} -> ${YELLOW}$(ssh_remote_display)${NC} (${CYAN}c0 ssh${NC})"
     fi
 }
 
@@ -883,6 +898,7 @@ UsePAM no
 LogLevel INFO
 AcceptEnv *
 SetEnv SSH_AUTH_SOCK=${C0_SSH_AUTH_SOCK_PATH}
+X11Forwarding yes
 EOF
     chmod 644 "$ssh_dir/sshd_config"
 }
@@ -1045,7 +1061,7 @@ c0_mount_home_overlay() {
                 esac
             fi
             if mountpoint -q "$target" 2>/dev/null; then
-                [ "$(findmnt -T "$target" -n -o FSTYPE)" = overlay ] || {
+                findmnt -T "$target" -n -o FSTYPE | grep -qx overlay || {
                     echo "error: non-overlay mount already exists at $target" >&2
                     exit 1
                 }
@@ -1059,9 +1075,8 @@ c0_mount_home_overlay() {
             chown 1000:1000 "$target"
 
             mount -t overlay overlay \
-                -o "lowerdir=$lower,upperdir=$upper,workdir=$work,userxattr,index=off,metacopy=off,redirect_dir=nofollow" \
+                -o "rw,lowerdir=$lower,upperdir=$upper,workdir=$work,userxattr,index=off,metacopy=off,redirect_dir=nofollow" \
                 "$target"
-            [ "$(findmnt -T "$target" -n -o FSTYPE)" = overlay ]
         ' c0-overlay-mount "$guest_rel" "$tools_rel" "$TOOLS_PREFIX" "$TOOLS_ID"
 }
 
@@ -1071,9 +1086,6 @@ c0_setup_home_overlays() {
     if ! c0_container_has_overlay_state_volume "$cid"; then
         echo "error: container lacks writable home-overlays volume — run 'c0 restart'" >&2
         return 1
-    fi
-    if docker exec -u 1000 "$cid" /usr/local/bin/c0-overlay-check --quiet >/dev/null 2>&1; then
-        return 0
     fi
 
     while IFS='|' read -r guest_rel tools_rel extra; do
@@ -1086,18 +1098,6 @@ c0_setup_home_overlays() {
             return 1
         fi
     done <"$HOME_OVERLAYS_FILE"
-
-    docker exec -u 1000 "$cid" /usr/local/bin/c0-overlay-check --quiet >/dev/null
-}
-
-c0_require_home_overlays() {
-    local cid
-    cid="$(get_c0_container_id)"
-    [[ -n "$cid" ]] || return 1
-    if ! docker exec -u 1000 "$cid" /usr/local/bin/c0-overlay-check --quiet >/dev/null 2>&1; then
-        echo "error: home overlays are not ready — run 'c0 restart'" >&2
-        return 1
-    fi
 }
 
 c0_overlay_name() {
@@ -1271,9 +1271,17 @@ cmd_ssh() {
         return 0
     fi
 
+    local trusted_x11=false
+    if [[ "${1:-}" == "-Y" ]]; then
+        trusted_x11=true
+        shift
+        if [[ "${1:-}" == "--" ]]; then
+            shift
+        fi
+    fi
+
     c0_ssh_ensure_keys
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     # Attach: host auth/.env → this session via SendEnv (no sshd_config mutate, no HUP).
     c0_auth_env_load_exec_args
     c0_auth_env_export_for_sendenv
@@ -1293,6 +1301,12 @@ cmd_ssh() {
         -o "UserKnownHostsFile=$C0_SSH_DIR/known_hosts"
         -p "$port"
     )
+    if [[ "$trusted_x11" == true ]]; then
+        ssh_args+=(-Y)
+        if [[ -z "${DISPLAY:-}" ]]; then
+            echo "warning: DISPLAY is unset; start an X server on the host before using c0 ssh -Y" >&2
+        fi
+    fi
     local _sendenv_name
     if [[ ${#C0_AUTH_ENV_NAMES[@]} -gt 0 ]]; then
         for _sendenv_name in "${C0_AUTH_ENV_NAMES[@]}"; do
@@ -2354,7 +2368,7 @@ cmd_status() {
         echo -e "  🌐 ${YELLOW}(none)${NC}"
     fi
     if [[ -n "$mapped_ssh_port" ]]; then
-        echo -e "  🔐 ${YELLOW}127.0.0.1:${mapped_ssh_port}${NC} -> ${YELLOW}dev@guest:2222${NC}"
+        echo -e "  🔐 ${YELLOW}127.0.0.1:${mapped_ssh_port}${NC} -> ${YELLOW}$(ssh_remote_display)${NC}"
     else
         echo -e "  🔐 ${YELLOW}(none)${NC}"
     fi
@@ -2457,17 +2471,7 @@ cmd_status() {
     echo ""
 
     echo -e "${BOLD}home overlays:${NC}"
-    if [[ -n "$container_cid" && "$container_state" == "running" ]]; then
-        local overlay_output
-        if overlay_output="$(docker exec -u 1000 "$container_cid" /usr/local/bin/c0-overlay-check --summary 2>&1)"; then
-            printf '%s\n' "$overlay_output" | sed 's/^/  /'
-        else
-            printf '%s\n' "$overlay_output" | sed 's/^/  /'
-            echo -e "  ${RED}overlay validation failed${NC}"
-        fi
-    else
-        echo -e "  ${YELLOW}(container not running)${NC}"
-    fi
+    echo -e "  ${YELLOW}c0 tools${NC}"
     echo ""
 
     echo -e "${BOLD}tools:${NC}"
@@ -2548,7 +2552,6 @@ cmd_tools_stage_output() {
     local cid changes counts added modified deleted opaque total
 
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     cid="$(get_c0_container_id)"
     changes="$(c0_home_overlay_porcelain "$cid")"
 
@@ -2601,7 +2604,6 @@ cmd_tools_accept() {
     local cid changes snapshot_dir stage_sha accepted_id folder_id
 
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     cid="$(get_c0_container_id)"
     changes="$(c0_home_overlay_porcelain "$cid")"
     if [[ -z "$changes" ]]; then
@@ -2658,7 +2660,6 @@ cmd_tools_restore() {
     local cid changes
 
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     cid="$(get_c0_container_id)"
     changes="$(c0_home_overlay_porcelain "$cid")"
     if [[ -z "$changes" ]]; then
@@ -2700,7 +2701,6 @@ cmd_sh() {
     require_host "sh"
     local project_path
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     c0_auth_env_load_exec_args
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
@@ -2718,7 +2718,6 @@ cmd_root() {
     require_host "root"
     local project_path
     c0_require_container_running || exit 1
-    c0_require_home_overlays || exit 1
     c0_auth_env_load_exec_args
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
@@ -2914,9 +2913,10 @@ Commands:
                 snapshot, or discard it and restore the accepted snapshot
   sh            Shell as dev user (uid 1000); loads auth/.env if present
   root          Shell as root (uid 0); loads auth/.env if present
-  ssh [--keygen]
+  ssh [-Y] [command...] | ssh --keygen
                 SSH as dev (127.0.0.1). Each attach forwards auth/.env via SendEnv.
-                sshd_config AcceptEnv * is written on c0 start (bind-mounted). --keygen.
+                -Y enables trusted X11 forwarding; --keygen regenerates SSH keys.
+                sshd_config AcceptEnv * is written on c0 start (bind-mounted).
   cp-term       Copy terminfo into container
   build [-f]    Build tools and image (-f forces tools re-extract)
                 TOOLS_BUILD_ID = hash(Dockerfile.base + Dockerfile.tools).
@@ -2950,6 +2950,7 @@ Notes:
     guest path and sets SSH_AUTH_SOCK. Requires host \$SSH_AUTH_SOCK. C0_SSH_AGENT=0 disables.
   - SSH login: host -> dev via 127.0.0.1:<port> (auto 2222-2322 -> guest:2222). Keys in auth/ssh/.
     sshd runs as dev; loopback publish only. Override: C0DEV_SSH_PORT.
+  - X11: c0 ssh -Y tunnels trusted X11 to the host DISPLAY; requires a running host X server.
   - auth/.env (optional, gitignored): NAME="value" or export NAME="value" per line; host-only.
     c0 sh / c0 root: docker exec -e. c0 ssh: on each attach, load into host c0 environ and
     forward via OpenSSH SendEnv (values not on remote argv). auth/ssh/sshd_config (bind-mounted)

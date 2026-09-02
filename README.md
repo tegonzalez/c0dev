@@ -229,6 +229,7 @@ c0 tools --detail         # List every staged path
 c0 tools accept           # Seal the stage as a new immutable snapshot
 c0 tools restore          # Discard the stage and restore the selected snapshot
 c0 ssh                    # SSH as dev (loopback only; keys in auth/ssh/)
+c0 ssh -Y                 # SSH with trusted X11 forwarding (host X server required)
 c0 ssh --keygen           # Regenerate auth/ssh keys
 ```
 
@@ -247,6 +248,7 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 - Range: `2222–2322` (same gap-fill rule as web ports). Shown on `c0 start`, `c0 restart`, and `c0 status`.
 - Keys and host key live under gitignored `auth/ssh/` (created on first `c0 start` or `c0 build`). Pubkey auth only.
 - Connect: `c0 ssh` (same project-path behavior as `c0 sh`). Override: `C0DEV_SSH_PORT=2223 c0 start`.
+- Trusted X11: start a host X server, ensure `DISPLAY` is set, then connect with `c0 ssh -Y`. The image includes `xauth`, and c0 enables `X11Forwarding` in its generated guest `sshd_config`.
 
 ## Authenticate assistants
 
@@ -279,7 +281,7 @@ Persistent host ↔ guest paths for credentials, tooling, and projects: see `./d
 | `.local/`      | `/home/dev/.local-rw`    | Host-visible XDG data and state                                |
 | `rules/`       | `/home/dev/rules`        | Project rules                                                  |
 | `projects/`    | `/home/dev/projects`     | Sources and build outputs                                      |
-| `bin/`         | `/home/dev/bin:ro`       | Read-only host router and guest-safe helper scripts            |
+| `bin/`         | `/home/dev/bin`          | Host router and guest-safe helper scripts; RW bind like other host folders |
 | `auth/ssh/`    | `/home/dev/.ssh`         | SSH keys and `sshd` config (gitignored)                        |
 | `.claude.json` | `/home/dev/.claude.json` | Assistant credentials file                                     |
 | `tools-shared` | `/tools/current:ro`      | Only this checkout's selected immutable tool snapshot          |
@@ -299,13 +301,14 @@ Canonical executables and resources come from the selected read-only tools snaps
 | SSH port      | `127.0.0.1:<auto> -> guest:2222` (range `2222–2322`; override `C0DEV_SSH_PORT`) |
 | LLM provider  | Ollama at `http://host.docker.internal:11434`                                   |
 | Default model | `gpt-oss:20b`                                                                   |
+| Electron      | `ELECTRON_DISABLE_SANDBOX=1` (required by c0's no-new-privileges isolation)    |
 
 ## Build pipeline
 
 On `c0 build`:
 
 1. Ensures host mount directories exist (prevents Docker from creating them as root-owned paths).
-1. Builds the runtime image from `docker/Dockerfile.base` + `docker/Dockerfile.runtime` (concatenated the same way).
+1. Builds the runtime image from `docker/Dockerfile.base` + `docker/Dockerfile.runtime`, downloading the pinned Orca 1.4.192 arm64 package, verifying its SHA-256, and installing its headless Electron/Xvfb dependencies.
 1. Builds the UID-1000 tools-builder stage from the supported base path.
 1. Packs `.cargo/bin`, `.rustup`, and the complete builder-created `.local` tree.
 1. Extracts the payload through a temporary path and writes the completeness marker last.

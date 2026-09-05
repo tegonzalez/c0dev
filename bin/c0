@@ -36,6 +36,7 @@ REQUIRED_FILES=(
     "$C0ROOT/docker/Dockerfile.runtime"
     "$C0ROOT/docker/Dockerfile.base"
     "$C0ROOT/docker/Dockerfile.tools"
+    "$C0ROOT/docker/install-orca.sh"
     "$C0ROOT/docker/home-overlays.conf"
     "$C0ROOT/docker/c0-overlay-check"
     "$C0ROOT/bin/docker-hash"
@@ -73,6 +74,7 @@ C0DEV_WEB_PORT_MIN=3000
 C0DEV_WEB_PORT_MAX=4000
 C0DEV_SSH_PORT_MIN=2222
 C0DEV_SSH_PORT_MAX=2322
+C0DEV_ORCA_GUEST_PORT=6768
 C0_SSH_DIR="$C0ROOT/auth/ssh"
 C0_AUTH_ENV_FILE="$C0ROOT/auth/.env"
 
@@ -144,6 +146,9 @@ HOME_OVERLAYS_FILE="$C0ROOT/docker/home-overlays.conf"
 HOME_OVERLAYS_VOLUME="${C0_INSTANCE_ID}-home-overlays"
 MAIN_SERVICE="c0dev"
 CONTAINER_DEV_HOME="/home/dev"
+C0_ORCA_PID_GUEST="${CONTAINER_DEV_HOME}/.local-rw/c0-orca-serve.pid"
+C0_ORCA_LOG_GUEST="${CONTAINER_DEV_HOME}/.local-rw/c0-orca-serve.log"
+C0_ORCA_LOG_HOST="${C0ROOT}/.local/c0-orca-serve.log"
 
 # Vendored Moby reference seccomp (tag in docker/seccomp/moby-seccomp.tag)
 SECCOMP_DIR="$C0ROOT/docker/seccomp"
@@ -788,6 +793,14 @@ ssh_remote_display() {
     echo "dev@${ip:-127.0.0.1}:2222"
 }
 
+# Orca advertised endpoint: <host-relative-ip>:6768 (same IP as ssh_remote_display)
+orca_remote_display() {
+    local ip
+    ip="$(get_c0_container_ip "${1:-}")"
+    [[ -n "$ip" ]] || return 0
+    echo "${ip}:${C0DEV_ORCA_GUEST_PORT}"
+}
+
 get_current_ssh_port() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         return 0
@@ -876,6 +889,17 @@ print_ssh_server_mapping() {
     port="$(get_current_ssh_port || true)"
     if [[ -n "$port" ]]; then
         echo -e "🔐 SSH: ${YELLOW}127.0.0.1:${port}${NC} -> ${YELLOW}$(ssh_remote_display)${NC} (${CYAN}c0 ssh${NC})"
+    fi
+}
+
+print_orca_endpoint() {
+    if [[ "$IN_CONTAINER" == "true" ]]; then
+        return 0
+    fi
+    local ep
+    ep="$(orca_remote_display)"
+    if [[ -n "$ep" ]]; then
+        echo -e "🐋 Orca: ${YELLOW}${ep}${NC} (${CYAN}c0 orca${NC})"
     fi
 }
 
@@ -1342,6 +1366,222 @@ cmd_ssh() {
         remote_script="exec bash -l"
         exec ssh "${ssh_args[@]}" -t dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
     fi
+}
+
+cmd_orca() {
+    require_host "orca"
+
+    case "${1:-}" in
+        --help|-h)
+            cat <<EOF
+Usage: c0 orca [start|stop|status]
+
+  c0 orca         Status (not start).
+  c0 orca start   Start guest \`orca serve\` in the background; print Orca's own URLs.
+  c0 orca stop    Stop guest orca serve.
+  c0 orca status  Same as c0 orca.
+
+  ELECTRON_DISABLE_SANDBOX=1 orca serve --port ${C0DEV_ORCA_GUEST_PORT} --pairing-address <compose-ipv4> --project-root ${CONTAINER_DEV_HOME}/projects
+
+Host reaches serve at compose-ipv4:${C0DEV_ORCA_GUEST_PORT} (same IP as c0 ssh's dev@ip:2222). No host port publish.
+EOF
+            return 0
+            ;;
+        ""|status) cmd_orca_status ;;
+        start) shift; cmd_orca_start "$@" ;;
+        stop) cmd_orca_stop ;;
+        *)
+            echo "error: usage: c0 orca [start|stop|status]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+c0_orca_ssh() {
+    local remote_script="$1"
+    local ssh_port
+    ssh_port="$(get_current_ssh_port || true)"
+    if [[ -z "$ssh_port" ]]; then
+        echo "error: SSH port unknown — run 'c0 start' first" >&2
+        return 1
+    fi
+
+    local -a ssh_args=(
+        -i "$C0_SSH_DIR/id_ed25519"
+        -o "StrictHostKeyChecking=accept-new"
+        -o "UserKnownHostsFile=$C0_SSH_DIR/known_hosts"
+        -o "BatchMode=yes"
+        -p "$ssh_port"
+    )
+    local _sendenv_name
+    if [[ ${#C0_AUTH_ENV_NAMES[@]} -gt 0 ]]; then
+        for _sendenv_name in "${C0_AUTH_ENV_NAMES[@]}"; do
+            ssh_args+=(-o "SendEnv=${_sendenv_name}")
+        done
+    fi
+    ssh "${ssh_args[@]}" dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
+}
+
+c0_orca_drop_stale_localhost_forward() {
+    local pidfile="${C0ROOT}/.local/c0-orca-forward.pid" pid
+    if [[ -f "$pidfile" ]]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+    fi
+    # Old c0 orca start used SSH -L onto a host loopback port. Kill leftovers.
+    pkill -f -- "-L 127.0.0.1:.*:127.0.0.1:${C0DEV_ORCA_GUEST_PORT}" 2>/dev/null || true
+}
+
+c0_orca_guest_listening() {
+    c0_orca_ssh "nc -z -w 1 127.0.0.1 ${C0DEV_ORCA_GUEST_PORT}" >/dev/null 2>&1
+}
+
+c0_orca_print_serve_output() {
+    if [[ -f "$C0_ORCA_LOG_HOST" ]]; then
+        cat "$C0_ORCA_LOG_HOST"
+    fi
+}
+
+c0_orca_wait_for_urls() {
+    local n=0 printed=0 lines
+    while true; do
+        if [[ -f "$C0_ORCA_LOG_HOST" ]]; then
+            lines="$(wc -l < "$C0_ORCA_LOG_HOST" | tr -d ' ')"
+            lines="${lines:-0}"
+            if [[ "$lines" -gt "$printed" ]]; then
+                tail -n +"$((printed + 1))" "$C0_ORCA_LOG_HOST"
+                printed="$lines"
+            fi
+            if grep -q '^Pairing URL:' "$C0_ORCA_LOG_HOST" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        n=$((n + 1))
+        if [[ "$n" -gt 80 ]]; then
+            echo "error: orca serve did not print a Pairing URL on $(orca_remote_display)" >&2
+            return 1
+        fi
+        sleep 0.25
+    done
+}
+
+cmd_orca_status() {
+    c0_ssh_ensure_keys
+    c0_require_container_running || exit 1
+    c0_orca_drop_stale_localhost_forward
+    print_orca_endpoint
+    if c0_orca_guest_listening; then
+        echo -e "   serve: ${GREEN}running${NC}"
+        c0_orca_print_serve_output
+        return 0
+    fi
+    echo -e "   serve: ${YELLOW}stopped${NC} (${CYAN}c0 orca start${NC})"
+    return 1
+}
+
+cmd_orca_start() {
+    c0_ssh_ensure_keys
+    c0_require_container_running || exit 1
+    c0_auth_env_load_exec_args
+    c0_auth_env_export_for_sendenv
+    c0_orca_drop_stale_localhost_forward
+
+    local ip extra remote_script
+    ip="$(get_c0_container_ip)"
+    if [[ -z "$ip" ]]; then
+        echo "error: guest IPv4 unknown" >&2
+        exit 1
+    fi
+
+    extra=""
+    if [[ $# -gt 0 ]]; then
+        extra="$(printf '%q ' "$@")"
+    fi
+
+    print_orca_endpoint
+    echo "   ELECTRON_DISABLE_SANDBOX=1 orca serve --port ${C0DEV_ORCA_GUEST_PORT} --pairing-address ${ip} --project-root ${CONTAINER_DEV_HOME}/projects"
+
+    if c0_orca_guest_listening; then
+        echo -e "   serve: ${GREEN}already running${NC}"
+        c0_orca_print_serve_output
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$C0_ORCA_LOG_HOST")"
+    : >"$C0_ORCA_LOG_HOST"
+
+    remote_script="$(cat <<EOF
+set -euo pipefail
+if [ -f "\$HOME/bin/activate" ]; then
+  . "\$HOME/bin/activate"
+fi
+if ! command -v orca >/dev/null 2>&1; then
+  echo "error: orca CLI is not on PATH in the guest (need \`orca serve\`, not orca-ide)" >&2
+  exit 1
+fi
+mkdir -p "\$HOME/.local-rw"
+cd $(printf '%q' "${CONTAINER_DEV_HOME}/projects")
+set +m
+nohup env ELECTRON_DISABLE_SANDBOX=1 orca serve --port ${C0DEV_ORCA_GUEST_PORT} --pairing-address $(printf '%q' "$ip") --project-root $(printf '%q' "${CONTAINER_DEV_HOME}/projects") ${extra} >>$(printf '%q' "$C0_ORCA_LOG_GUEST") 2>&1 </dev/null &
+echo \$! > $(printf '%q' "$C0_ORCA_PID_GUEST")
+disown || true
+EOF
+)"
+    if ! c0_orca_ssh "$remote_script"; then
+        echo "error: failed to launch orca serve in the guest" >&2
+        exit 1
+    fi
+
+    c0_orca_wait_for_urls
+}
+
+cmd_orca_stop() {
+    c0_ssh_ensure_keys
+    c0_require_container_running || exit 1
+    c0_auth_env_load_exec_args
+    c0_auth_env_export_for_sendenv
+    c0_orca_drop_stale_localhost_forward
+
+    local remote_script
+    remote_script="$(cat <<EOF
+set +e
+pidfile=$(printf '%q' "$C0_ORCA_PID_GUEST")
+if [ -f "\$pidfile" ]; then
+  pid=\$(cat "\$pidfile" 2>/dev/null)
+  if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then
+    kill "\$pid" 2>/dev/null
+    i=0
+    while kill -0 "\$pid" 2>/dev/null && [ "\$i" -lt 25 ]; do
+      sleep 0.2
+      i=\$((i + 1))
+    done
+    kill -9 "\$pid" 2>/dev/null
+  fi
+  rm -f "\$pidfile"
+fi
+pkill -f 'serve --port ${C0DEV_ORCA_GUEST_PORT}' 2>/dev/null
+pkill -f 'serve-port ${C0DEV_ORCA_GUEST_PORT}' 2>/dev/null
+pkill -f '${CONTAINER_DEV_HOME}/.local/opt/Orca/orca-ide' 2>/dev/null
+exit 0
+EOF
+)"
+
+    c0_orca_ssh "$remote_script" || true
+
+    local n=0
+    while c0_orca_guest_listening; do
+        n=$((n + 1))
+        if [[ "$n" -gt 20 ]]; then
+            echo "error: orca still listening on $(orca_remote_display)" >&2
+            exit 1
+        fi
+        sleep 0.25
+    done
+    echo -e "🐋 Orca: ${YELLOW}stopped${NC}"
 }
 
 # Resolve a host path from a docker volume mapping into an absolute path.
@@ -2211,6 +2451,7 @@ cmd_start() {
         print_security_mode
         print_ssh_auth_mapping
         print_ssh_server_mapping
+        print_orca_endpoint
         print_web_port_mapping
         return 0
     fi
@@ -2234,6 +2475,7 @@ cmd_start() {
         print_security_mode
         print_ssh_auth_mapping
         print_ssh_server_mapping
+        print_orca_endpoint
         print_web_port_mapping
         echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC} (existing container, not recreated)"
         return 0
@@ -2277,6 +2519,7 @@ cmd_start() {
     print_security_mode
     print_ssh_auth_mapping
     print_ssh_server_mapping
+    print_orca_endpoint
     print_web_port_mapping
     echo -e "✅ Started: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -2334,6 +2577,7 @@ cmd_restart() {
     print_security_mode
     print_ssh_auth_mapping
     print_ssh_server_mapping
+    print_orca_endpoint
     print_web_port_mapping
     echo -e "✅ Restarted: ${GREEN}$MAIN_SERVICE${NC}"
 }
@@ -2359,9 +2603,10 @@ cmd_status() {
 
     # Port mapping (if container exists)
     echo -e "${BOLD}ports:${NC}"
-    local mapped_port mapped_ssh_port
+    local mapped_port mapped_ssh_port orca_endpoint
     mapped_port="$(get_current_web_port || true)"
     mapped_ssh_port="$(get_current_ssh_port || true)"
+    orca_endpoint="$(orca_remote_display)"
     if [[ -n "$mapped_port" ]]; then
         echo -e "  🌐 ${YELLOW}host:${mapped_port}${NC} -> ${YELLOW}guest:3000${NC}"
     else
@@ -2371,6 +2616,9 @@ cmd_status() {
         echo -e "  🔐 ${YELLOW}127.0.0.1:${mapped_ssh_port}${NC} -> ${YELLOW}$(ssh_remote_display)${NC}"
     else
         echo -e "  🔐 ${YELLOW}(none)${NC}"
+    fi
+    if [[ -n "$orca_endpoint" ]]; then
+        echo -e "  🐋 ${YELLOW}${orca_endpoint}${NC}"
     fi
     echo ""
 
@@ -2897,7 +3145,7 @@ Note: Running inside container. Use 'exit' to return to host.
 EOF
     else
         cat <<EOF
-Usage: c0 {start|stop|restart|logs|status|tools|sh|root|ssh|cp-term|build|clean|seccomp-upgrade|help}
+Usage: c0 {start|stop|restart|logs|status|tools|sh|root|ssh|orca|cp-term|build|clean|seccomp-upgrade|help}
 
 Commands:
   start [--cap-drop-all]
@@ -2917,6 +3165,11 @@ Commands:
                 SSH as dev (127.0.0.1). Each attach forwards auth/.env via SendEnv.
                 -Y enables trusted X11 forwarding; --keygen regenerates SSH keys.
                 sshd_config AcceptEnv * is written on c0 start (bind-mounted).
+  orca [start|stop|status]
+                Guest orca serve. Bare \`c0 orca\` is status, not start.
+                start backgrounds serve with --pairing-address <compose-ipv4>
+                and prints Orca's own URLs. Host attaches at compose-ipv4:6768
+                (same IP as ssh's dev@ip:2222). No localhost mapping.
   cp-term       Copy terminfo into container
   build [-f]    Build tools and image (-f forces tools re-extract)
                 TOOLS_BUILD_ID = hash(Dockerfile.base + Dockerfile.tools).
@@ -2951,6 +3204,10 @@ Notes:
   - SSH login: host -> dev via 127.0.0.1:<port> (auto 2222-2322 -> guest:2222). Keys in auth/ssh/.
     sshd runs as dev; loopback publish only. Override: C0DEV_SSH_PORT.
   - X11: c0 ssh -Y tunnels trusted X11 to the host DISPLAY; requires a running host X server.
+  - Orca: c0 orca is status. c0 orca start backgrounds guest serve at
+    compose-ipv4:6768 (--pairing-address is that IPv4; cwd/--project-root
+    /home/dev/projects). No SSH -L and no host localhost port. Pairing,
+    advertised, and web URLs are Orca's own stdout.
   - auth/.env (optional, gitignored): NAME="value" or export NAME="value" per line; host-only.
     c0 sh / c0 root: docker exec -e. c0 ssh: on each attach, load into host c0 environ and
     forward via OpenSSH SendEnv (values not on remote argv). auth/ssh/sshd_config (bind-mounted)
@@ -2975,6 +3232,7 @@ case "${1:-}" in
     sh)         cmd_sh ;;
     root)       cmd_root ;;
     ssh)        shift; cmd_ssh "$@" ;;
+    orca)       shift; cmd_orca "$@" ;;
     cp-term)    cmd_cp_term ;;
     build)      shift; cmd_build "$@" ;;
     clean)      shift; cmd_clean "$@" ;;

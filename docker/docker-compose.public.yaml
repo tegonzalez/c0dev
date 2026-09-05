@@ -22,6 +22,7 @@ services:
     tty: true
     environment:
       <<: *env-base
+      ELECTRON_DISABLE_SANDBOX: "1"
     entrypoint:
       - /bin/bash
       - /usr/local/bin/docker-entrypoint.sh

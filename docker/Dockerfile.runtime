@@ -1,6 +1,9 @@
 # Final runtime stage (concatenated with Dockerfile.base at build time)
 FROM base
 
+# c0 runs with no-new-privileges and without bwrap isolation; Electron's sandbox cannot initialize.
+ENV ELECTRON_DISABLE_SANDBOX=1
+
 # Vendored from https://downloads.1password.com/linux/keys/1password.asc (do not fetch at build)
 COPY 1password.asc /usr/share/keyrings/1password-archive-keyring.asc
 # Vendored from curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o cloud.google.gpg
@@ -19,8 +22,16 @@ RUN apt install -y \
     tmux vim neovim \
     wget bat btop tree \
     pandoc poppler-utils \
-    openssh-server \
-    1password-cli
+    openssh-server xauth \
+    1password-cli \
+    file xvfb dbus dbus-x11 zlib1g-dev ca-certificates \
+    libgtk-3-0t64 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libgbm1 libasound2t64 \
+    libxtst6 libcups2t64 libdrm2 libxkbcommon0 libpango-1.0-0 libcairo2 libatspi2.0-0t64 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxrender1 libx11-xcb1 \
+    libxcb-dri3-0 libxss1
+
+COPY install-orca.sh /usr/local/libexec/install-orca.sh
+RUN /bin/sh /usr/local/libexec/install-orca.sh
 
 RUN printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/01c0dev-no-sandbox
 

@@ -1,0 +1,28 @@
+version = 1
+
+[[annotations]]
+path = [
+  "README.md",
+  ".gitignore",
+  "docker/*.yaml",
+  "docker/home-overlays.conf",
+  "docker/seccomp/moby-default-seccomp.sha256",
+  "docker/seccomp/moby-seccomp.tag",
+  "THIRD-PARTY-NOTICES.txt",
+  ".cache/.gitkeep",
+  ".claude/.gitkeep",
+  ".codex/.gitkeep",
+  ".config/.gitkeep",
+  ".local/.gitkeep",
+  "projects/.gitkeep",
+  "rules/.gitkeep",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Tomas Gonzalez"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "docker/seccomp/moby-default-seccomp.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "The Moby Authors"
+SPDX-License-Identifier = "Apache-2.0"

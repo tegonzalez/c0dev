@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 set -eu
 
 orca_version=1.4.192

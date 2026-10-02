@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 # Concatenate Dockerfile fragments for docker build.
 # OrbStack/Docker stable frontends do not support BuildKit "include"; join base + stage files instead.
 #

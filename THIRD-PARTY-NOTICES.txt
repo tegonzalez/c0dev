@@ -1,0 +1,25 @@
+Third-party material
+====================
+
+Moby seccomp profile
+--------------------
+
+docker/seccomp/moby-default-seccomp.json is based on the Moby Profiles
+seccomp/default.json at https://github.com/moby/profiles/tree/seccomp/v0.2.3.
+The upstream project licenses this material under Apache-2.0. Its root at that
+tag lists LICENSE and no NOTICE file. The complete license text is in
+LICENSES/Apache-2.0.txt.
+
+Provider signing keys
+---------------------
+
+docker/1password.asc is the 1Password public key sourced from
+https://downloads.1password.com/linux/keys/1password.asc.
+
+docker/cloud.google.gpg is the Google Cloud package signing key produced from
+https://packages.cloud.google.com/apt/doc/apt-key.gpg.
+
+The licensing terms for these public-key files have not been established from
+an authoritative source. They are intentionally excluded from REUSE license
+coverage and no license expression is asserted for them. Their bytes are kept
+unchanged.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 # Intended to be sourced (POSIX): `. ./activate`
 # Works in sh and bash; avoids bash arrays and `source`.

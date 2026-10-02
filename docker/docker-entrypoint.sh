@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 # Docker entrypoint: dev user (image USER); optional sshd on port 2222 (no root/caps).
 # Immutable toolchains: TOOLS_PREFIX on /tools (read-only). Mutable home overlays are mounted by c0.

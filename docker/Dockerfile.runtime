@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 # Final runtime stage (concatenated with Dockerfile.base at build time)
 FROM base
 

@@ -16,7 +16,17 @@ A containerized development environment for AI-assisted coding and full-stack wo
 
 **Non-goals:** Multi-tenant isolation, production deployment, or sandboxing agents from your own mounted data and credentials.
 
-Documentation questions route through the [c0dev authority index](docs/index.md). README is an onboarding summary, not the owner of detailed behavior or architecture.
+Run `bash ./env.sh c0 help` for available commands and options; implementations are in `bin/c0` and `docker/`. Every `c0` command in this README is host-side: run it in the child Bash started by `bash ./env.sh`, or prefix a single command with `bash ./env.sh`. The helper changes `PATH` only in its child; exiting it returns to the parent shell. This README is an onboarding summary.
+
+## Features
+
+| Feature              | Purpose                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------- |
+| Reproducible guest   | Build a Linux development container with assistant CLIs and toolchains.                     |
+| Persistent workspace | Keep configured credentials, caches, projects, and user state on host mounts.               |
+| Per-checkout runtime | Manage an isolated container instance with loopback-published web and SSH ports.            |
+| Staged tool updates  | Inspect tool changes, accept them as immutable snapshots, or restore the selected snapshot. |
+| Runtime restrictions | Apply capability limits, no-new-privileges, and the vendored Moby seccomp profile.          |
 
 ### Command-oriented architecture
 
@@ -195,23 +205,44 @@ Not shown as nodes: `c0 root` is an exec lane inside `runtime`; `c0 tools accept
 
 ## Quick start
 
-1. Clone: `git clone https://github.com/tegonzalez/c0dev.git`
-1. Enter the checkout: `cd c0dev`
-1. Load helper scripts: `./env.sh`
-1. Build the image: `c0 build` (~10 minutes on first run)
-1. Start services: `c0 start`
-1. Open a shell: `c0 sh` (auto-navigates to a matching project directory under `projects/`)
+Run this in a terminal from a source checkout. The first command starts a child Bash with the checkout's `bin/` directory on `PATH`; it does not change the current shell's `PATH`.
 
 ```bash
 git clone https://github.com/tegonzalez/c0dev.git
 cd c0dev
-./env.sh
+bash ./env.sh
+```
+
+At the helper shell prompt, build and start the runtime, then open the guest shell:
+
+```bash
 c0 build
 c0 start
 c0 sh
 ```
 
+A successful final command opens the guest shell as `dev` (UID 1000); `c0 sh` auto-navigates to a matching project directory under `projects/`. Exiting the guest shell returns to the helper Bash; exiting the helper returns to the parent shell.
+
+## Commands
+
+| Command                                   | Purpose                                                                           |
+| ----------------------------------------- | --------------------------------------------------------------------------------- |
+| `c0 build [-f]`                           | Build tools and the runtime image; `-f` forces tool re-extraction.                |
+| `c0 start [--cap-drop-all]`               | Start this checkout's runtime, creating it if absent.                             |
+| `c0 stop` / `c0 restart [--cap-drop-all]` | Stop or recreate this checkout's runtime.                                         |
+| `c0 sh` / `c0 root` / `c0 ssh`            | Open a guest shell as `dev`, a guest root shell, or an SSH session.               |
+| `c0 status` / `c0 logs [svc]`             | Inspect this instance or view service logs.                                       |
+| `c0 tools`                                | Inspect staged tool changes, accept a snapshot, or restore the selected snapshot. |
+| `c0 orca`                                 | Check or manage the guest Orca service.                                           |
+| `c0 seccomp-upgrade [--dry-run]`          | Check for or apply a newer Moby seccomp profile.                                  |
+| `c0 clean [-a]`                           | Remove unpinned tool snapshots; `-a` removes the shared tools volume.             |
+| `c0 cp-term`                              | Copy host terminfo into the guest.                                                |
+
+Run this command table in the host helper Bash started by `bash ./env.sh`. From the parent shell, invoke one command with `bash ./env.sh c0 help`, replacing `help` with the desired command and arguments.
+
 ## Usage
+
+Usage recipes below run in the host helper Bash unless they explicitly identify a guest command.
 
 ### Service management
 
@@ -223,7 +254,7 @@ c0 stop                   # Stop all services
 c0 restart                # Restart services
 c0 logs                   # Show logs
 c0 status                 # Service status, volume mappings, workspaces
-c0 build [-f]             # Build tools and image (-f forces tools re-extract)
+c0 build                  # Build tools and image
 c0 tools                  # Summarize the writable tools stage
 c0 tools --detail         # List every staged path
 c0 tools accept           # Seal the stage as a new immutable snapshot
@@ -232,6 +263,8 @@ c0 ssh                    # SSH as dev (loopback only; keys in auth/ssh/)
 c0 ssh -Y                 # SSH with trusted X11 forwarding (host X server required)
 c0 ssh --keygen           # Regenerate auth/ssh keys
 ```
+
+Use `c0 build -f` to force tool re-extraction.
 
 Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps running in the background (`docker attach` does not open a shell).
 
@@ -272,20 +305,20 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 
 Persistent host ↔ guest paths for credentials, tooling, and projects: see `./docker/volumes-folders.yaml`, eg:
 
-| Host path      | Guest path               | Role                                                           |
-| -------------- | ------------------------ | -------------------------------------------------------------- |
-| `.claude/`     | `/home/dev/.claude`      | Assistant state                                                |
-| `.cache/`      | `/home/dev/.cache`       | Mutable tool caches (cargo registry, uv); `c0` never purges    |
-| `.config/`     | `/home/dev/.config`      | Application config                                             |
-| `.codex/`      | `/home/dev/.codex`       | Assistant state                                                |
-| `.local/`      | `/home/dev/.local-rw`    | Host-visible XDG data and state                                |
-| `rules/`       | `/home/dev/rules`        | Project rules                                                  |
-| `projects/`    | `/home/dev/projects`     | Sources and build outputs                                      |
-| `bin/`         | `/home/dev/bin`          | Host router and guest-safe helper scripts; RW bind like other host folders |
-| `auth/ssh/`    | `/home/dev/.ssh`         | SSH keys and `sshd` config (gitignored)                        |
-| `.claude.json` | `/home/dev/.claude.json` | Assistant credentials file                                     |
-| `tools-shared` | `/tools/current:ro`      | Only this checkout's selected immutable tool snapshot          |
-| `home-overlays`| `/run/c0/overlay-state`  | Per-instance writable tool stage and OverlayFS work data       |
+| Host path       | Guest path               | Role                                                                       |
+| --------------- | ------------------------ | -------------------------------------------------------------------------- |
+| `.claude/`      | `/home/dev/.claude`      | Assistant state                                                            |
+| `.cache/`       | `/home/dev/.cache`       | Mutable tool caches (cargo registry, uv); `c0` never purges                |
+| `.config/`      | `/home/dev/.config`      | Application config                                                         |
+| `.codex/`       | `/home/dev/.codex`       | Assistant state                                                            |
+| `.local/`       | `/home/dev/.local-rw`    | Host-visible XDG data and state                                            |
+| `rules/`        | `/home/dev/rules`        | Project rules                                                              |
+| `projects/`     | `/home/dev/projects`     | Sources and build outputs                                                  |
+| `bin/`          | `/home/dev/bin`          | Host router and guest-safe helper scripts; RW bind like other host folders |
+| `auth/ssh/`     | `/home/dev/.ssh`         | SSH keys and `sshd` config (gitignored)                                    |
+| `.claude.json`  | `/home/dev/.claude.json` | Assistant credentials file                                                 |
+| `tools-shared`  | `/tools/current:ro`      | Only this checkout's selected immutable tool snapshot                      |
+| `home-overlays` | `/run/c0/overlay-state`  | Per-instance writable tool stage and OverlayFS work data                   |
 
 Canonical executables and resources come from the selected read-only tools snapshot. Native writes beneath an overlaid tool-home path enter the per-instance writable stage. XDG data/state is redirected to the host `.local/`; direct writers that ignore XDG remain part of the stage and are therefore included by `c0 tools accept` or removed by `c0 tools restore`.
 
@@ -301,7 +334,7 @@ Canonical executables and resources come from the selected read-only tools snaps
 | SSH port      | `127.0.0.1:<auto> -> guest:2222` (range `2222–2322`; override `C0DEV_SSH_PORT`) |
 | LLM provider  | Ollama at `http://host.docker.internal:11434`                                   |
 | Default model | `gpt-oss:20b`                                                                   |
-| Electron      | `ELECTRON_DISABLE_SANDBOX=1` (required by c0's no-new-privileges isolation)    |
+| Electron      | `ELECTRON_DISABLE_SANDBOX=1` (required by c0's no-new-privileges isolation)     |
 
 ## Build pipeline
 
@@ -317,7 +350,7 @@ On `c0 build`:
 
 `c0 build -f` reruns the same Dockerfile installer path without cache. `c0 tools` is not another build or installer command; it manages writes captured from the running restricted guest.
 
-See the [Tool-store contract](docs/tool-store-contract.md) for exact identity, transaction, publication, rollback, and collection law.
+The `c0 tools` implementation in `bin/c0` defines snapshot identity, publication, restore, and collection behavior.
 
 ## Networking
 
@@ -456,7 +489,8 @@ Pinned `TOOLS_ID` values:
 
 ```bash
 docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
-docker run --rm -v c0dev-tools-shared:/tools alpine cat /tools/pins/<folder-id>.pin
+read -rp 'Folder ID from the list above: ' folder_id
+docker run --rm -v c0dev-tools-shared:/tools alpine cat "/tools/pins/${folder_id}.pin"
 ```
 
 Toolset directories:
@@ -476,4 +510,8 @@ docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/tmp
 - Never updates pins on build failure
 - Writes the accepted snapshot completeness marker last, then updates the checkout pin
 
-See the [Tool-store contract](docs/tool-store-contract.md) for exact state transitions and protection law.
+The `tools` command behavior and state transitions are implemented in `bin/c0`.
+
+## License
+
+Licensed under the [MIT License](LICENSE). SPDX identifier: `MIT`. Third-party terms and unresolved licensing status are recorded in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).

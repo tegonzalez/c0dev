@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 # Tools builder stage (concatenated with Dockerfile.base at build time)
 FROM base AS tools-builder
 

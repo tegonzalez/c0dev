@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
 
 # Strip script: Clean up text files by removing trailing spaces and converting Unicode characters
 # Usage: ./strip.sh file1 [file2 file3 ...]

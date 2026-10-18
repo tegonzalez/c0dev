@@ -70,6 +70,7 @@ root_dir=$(resolve_path "$script_dir/..")
 # oven/bun appends this dir; login shells reset PATH, so we must append
 # too or the shim shadows /usr/bin/node and corepack shims.
 append_path "/usr/local/bun-node-fallback-bin"
+append_path "$root_dir/.local/share/fnm"
 prepend_path "$(resolve_path "$root_dir/.local/bin")"
 
 # SSH sessions do not inherit compose env; recover TOOLS_PREFIX from PID 1.
@@ -91,5 +92,7 @@ else
 fi
 
 prepend_path "$(resolve_path "$root_dir/bin")"
+
+eval $(fnm env)
 
 export PATH

@@ -2947,37 +2947,52 @@ cmd_tools() {
     esac
 }
 
+# Host umask for exec'd shells. runc applies no default umask to exec
+# processes, so they inherit the engine daemon's (0000 under OrbStack), and
+# Compose has no `umask` key to set HostConfig.Umask. Carry the host's value.
+c0_host_umask() {
+    local m
+    m="$(umask)"
+    if [[ ! "$m" =~ ^[0-7]{3,4}$ ]]; then
+        echo "error: unexpected host umask: $m" >&2
+        return 1
+    fi
+    echo "$m"
+}
+
 cmd_sh() {
     require_host "sh"
-    local project_path
+    local project_path host_umask
     c0_require_container_running || exit 1
     c0_auth_env_load_exec_args
+    host_umask="$(c0_host_umask)" || exit 1
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
         print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
-        dc exec -u 1000 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash -l"
+        dc exec -u 1000 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "umask $host_umask && cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash -l"
     else
         print_web_port_mapping
         echo -e "🐚 Shell: ${CYAN}$MAIN_SERVICE${NC} (dev)"
-        dc exec -u 1000 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -l
+        dc exec -u 1000 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "umask $host_umask && exec bash -l"
     fi
 }
 
 cmd_root() {
     require_host "root"
-    local project_path
+    local project_path host_umask
     c0_require_container_running || exit 1
     c0_auth_env_load_exec_args
+    host_umask="$(c0_host_umask)" || exit 1
     project_path=$(get_project_path)
     if [[ -n "$project_path" ]]; then
         print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC}) @ ${YELLOW}projects/$project_path${NC}"
-        dc exec -u 0 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash"
+        dc exec -u 0 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "umask $host_umask && cd $CONTAINER_DEV_HOME/projects/$project_path && exec bash"
     else
         print_web_port_mapping
         echo -e "🔧 Shell: ${CYAN}$MAIN_SERVICE${NC} (${RED}root${NC})"
-        dc exec -u 0 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash
+        dc exec -u 0 "${C0_AUTH_ENV_EXEC_ARGS[@]}" "$MAIN_SERVICE" bash -c "umask $host_umask && exec bash"
     fi
 }
 

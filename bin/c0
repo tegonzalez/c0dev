@@ -1937,6 +1937,12 @@ tools_volume_sh() {
     c0_docker_run --network none -v "$SHARED_TOOLS_VOLUME:/tools" alpine sh -c "$*"
 }
 
+# Rotation/GC of dev-owned snapshots: root needs DAC_OVERRIDE+FOWNER under cap_drop ALL.
+tools_volume_admin_sh() {
+    c0_docker_run --network none --cap-add DAC_OVERRIDE --cap-add FOWNER \
+        -v "$SHARED_TOOLS_VOLUME:/tools" alpine sh -c "$*"
+}
+
 # List running container IDs using the shared tools volume
 list_running_container_ids_using_tools_volume() {
     docker ps -q --filter "volume=$SHARED_TOOLS_VOLUME" 2>/dev/null || true
@@ -2231,7 +2237,7 @@ gc_tools_hashes() {
         fi
 
         # Not protected - remove it
-        if tools_volume_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
+        if tools_volume_admin_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
             echo -e "  🗑️  GC: ${YELLOW}${hash:0:12}...${NC}"
         fi
     done <<<"$hash_dirs"
@@ -2265,7 +2271,7 @@ maybe_promote_staged_next() {
 
     # Safe to promote
     echo -e "  📥 Promoting staged build..."
-    if tools_volume_sh "
+    if tools_volume_admin_sh "
         set -e
         mkdir -p /tools/opt
         rm -rf '/tools/opt/$hash.old'
@@ -2312,7 +2318,7 @@ build_tools_volume() {
         echo -e "\n${RED}build interrupted${NC}" >&2
         docker rmi "$TAG" 2>/dev/null || true
         # Remove partial temp dir
-        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        tools_volume_admin_sh "rm -rf '/tools/tmp/$H.partial'" 2>/dev/null || true
         exit 130
     }
     trap _build_cleanup INT TERM
@@ -2331,7 +2337,7 @@ build_tools_volume() {
 
     # 3) Pack immutable paths and extract to tools volume as dev (image USER; no chown under cap_drop)
     echo -e "  📤 Extracting to temp..."
-    if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
+    if ! tools_volume_admin_sh "
             set -e
             rm -rf '/tools/tmp/$H.partial'
             mkdir -p '/tools/tmp' '/tools/tmp/$H.partial'
@@ -2361,7 +2367,7 @@ build_tools_volume() {
             tar -cf - \$paths | tar -C '/tools/tmp/$H.partial' --no-same-owner -xf -
         "; then
         trap - INT TERM
-        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        tools_volume_admin_sh "rm -rf '/tools/tmp/$H.partial'" 2>/dev/null || true
         return 1
     fi
 
@@ -2369,7 +2375,7 @@ build_tools_volume() {
     echo -e "  ✓ Marking complete..."
     if ! c0_docker_run -u dev -v "$VOL:/tools" "$TAG" touch "/tools/tmp/$H.partial/.c0dev-complete"; then
         trap - INT TERM
-        c0_docker_run -v "$VOL:/tools" alpine rm -rf "/tools/tmp/$H.partial" 2>/dev/null || true
+        tools_volume_admin_sh "rm -rf '/tools/tmp/$H.partial'" 2>/dev/null || true
         return 1
     fi
 
@@ -2384,7 +2390,7 @@ build_tools_volume() {
     if [[ "$is_active" == "true" && "$force" == "true" ]]; then
         # Stage to .next instead of promoting
         echo -e "  📦 Staging (hash is active)..."
-        if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
+        if ! tools_volume_admin_sh "
             set -e
             mkdir -p /tools/tmp
             rm -rf '/tools/tmp/$H.next.old'
@@ -2401,7 +2407,7 @@ build_tools_volume() {
     else
         # Safe to promote directly
         echo -e "  📥 Promoting..."
-        if ! c0_docker_run -v "$VOL:/tools" alpine sh -c "
+        if ! tools_volume_admin_sh "
             set -e
             mkdir -p /tools/opt
             rm -rf '/tools/opt/$H.old'
@@ -3210,7 +3216,8 @@ Notes:
   - Each folder pins tools_id on successful build (GC metadata; not startup validation)
   - Active tools_ids (from running containers) are never garbage collected
   - Force rebuild of active tools_id stages to .next, promotes after stop
-  - Ephemeral docker runs during build use --cap-drop ALL and no-new-privileges
+  - Ephemeral docker runs during build use --cap-drop ALL and no-new-privileges; tools-volume
+    rotation/GC helpers add back only DAC_OVERRIDE and FOWNER to remove dev-owned snapshots
   - Home OverlayFS mounts use a one-shot capability-scoped helper that joins only the container
     mount namespace, mounts read-only tool lowers over per-instance writable state, then exits
   - Runtime: cap_drop ALL then guest-admin caps (DAC_OVERRIDE, CHOWN, FOWNER); not host root

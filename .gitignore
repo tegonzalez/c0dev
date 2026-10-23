@@ -14,6 +14,8 @@ rules
 .config
 .local/*
 !.local/.gitkeep
+.kimi-code/*
+!.kimi-code/.gitkeep
 .rustup
 .terminfo
 docker/.compose.ssh-auth.yaml

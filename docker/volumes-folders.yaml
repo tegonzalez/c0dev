@@ -3,6 +3,7 @@ x-volume-folders: &folders
     - ../.claude:/home/dev/.claude
     - ../.cache:/home/dev/.cache
     - ../.codex:/home/dev/.codex
+    - ../.kimi-code:/home/dev/.kimi-code
     - ../.config:/home/dev/.config
     - ../.local:/home/dev/.local-rw
     - ../rules:/home/dev/rules

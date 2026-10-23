@@ -225,6 +225,7 @@ docx_to_md() {
   media_dir="$MD_CONVERT_ATTACHMENTS_DIR/$stem"
   mkdir -p "$media_dir"
   pandoc -s "$in_docx" \
+    --track-changes=all \
     --wrap=none \
     --extract-media="$media_dir" \
     --to gfm+hard_line_breaks \

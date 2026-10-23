@@ -1,0 +1,1233 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_NAME=$(basename "$0")
+
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME <branch,branch,...> groups
+  $SCRIPT_NAME <branch,branch,...> step [--option N] [--commands]
+  $SCRIPT_NAME <branch,branch,...> sync [--step] [--option N] [--dry-run]
+  $SCRIPT_NAME <branch,branch,...> adopt
+
+Synchronize a set of worktree branches by converging listed refs into one
+shared linear history. Merge commits are prohibited.
+
+Commands:
+  groups  Show current exact-tip groups.
+  step    Show the next group-unification step.
+  sync    Execute group-unification steps until all listed refs are aligned.
+  adopt   Print commands that move every listed branch to the current HEAD
+          commit; nothing is changed. The plan goes to standard error first:
+          for each branch, old tip -> HEAD and the commits the move drops.
+          Standard output then holds only forward commands, one per branch,
+          each targeting HEAD and ending in "# undo: <old tip>", the commit
+          to restore to reverse that move.
+          A worktree branch gets reset --keep, which changes nothing if a
+          local change conflicts. It is skipped (exit 1) when git would not
+          protect it: staged changes, an operation in progress, or an
+          untracked or ignored file at a path the move would write. Any other
+          branch gets update-ref.
+
+Step options prefer the direction that strands the fewest listed ancestor
+groups, then the smallest source delta, then listed branch order. Sync chooses
+option 1 unless --option is supplied.
+
+Options:
+  --option N   Select option N for the next step. Implies one-step sync.
+  --commands   With step, print concrete commands for the selected option.
+  --step       With sync, execute one selected step and stop.
+  --dry-run    With sync, print concrete commands for the selected step.
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_git_repo() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 \
+    || die "$SCRIPT_NAME must run inside a git repository."
+}
+
+short_commit() {
+  git rev-parse --short "$1"
+}
+
+csv_first() {
+  printf '%s\n' "$1" | cut -d, -f1
+}
+
+csv_without_ref() {
+  refs=$1
+  remove_ref=$2
+  printf '%s\n' "$refs" | tr ',' '\n' | awk -v remove="$remove_ref" '
+    $0 != remove {
+      if (out != "") {
+        out = out "," $0
+      } else {
+        out = $0
+      }
+    }
+    END {
+      print out
+    }
+  '
+}
+
+csv_join_refs_for_tips() {
+  meta_file=$1
+  group_file=$2
+  target_tip=$3
+  awk -F '\t' -v tip="$target_tip" '
+    NR == FNR {
+      group_tip[$1] = $2
+      next
+    }
+    group_tip[$4] == tip {
+      if (out != "") {
+        out = out "," $1
+      } else {
+        out = $1
+      }
+    }
+    END {
+      print out
+    }
+  ' "$group_file" "$meta_file"
+}
+
+worktree_branch_ref() {
+  worktree_path=$1
+
+  current_ref=$(git -C "$worktree_path" symbolic-ref --quiet HEAD 2>/dev/null || true)
+  if [ -n "$current_ref" ]; then
+    printf '%s\n' "$current_ref"
+    return 0
+  fi
+
+  for rebase_state in rebase-merge rebase-apply; do
+    head_name_path=$(git -C "$worktree_path" rev-parse --path-format=absolute --git-path "$rebase_state/head-name" 2>/dev/null || true)
+    [ -n "$head_name_path" ] || continue
+    [ -f "$head_name_path" ] || continue
+    current_ref=$(sed -n '1p' "$head_name_path")
+    if [ -n "$current_ref" ]; then
+      printf '%s\n' "$current_ref"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+worktree_has_rebase_state() {
+  worktree_path=$1
+
+  for rebase_state in rebase-merge rebase-apply; do
+    rebase_path=$(git -C "$worktree_path" rev-parse --path-format=absolute --git-path "$rebase_state" 2>/dev/null || true)
+    [ -n "$rebase_path" ] || continue
+    [ -d "$rebase_path" ] && return 0
+  done
+
+  return 1
+}
+
+branch_worktree_path() {
+  target_branch=$1
+  target_ref="refs/heads/$target_branch"
+
+  path=$(
+    git worktree list --porcelain | awk -v target="$target_ref" '
+      $1 == "worktree" {
+        path = substr($0, length("worktree") + 2)
+        next
+      }
+      $1 == "branch" {
+        branch = $2
+        if (branch == target) {
+          print path
+          exit
+        }
+      }
+    '
+  )
+  if [ -n "$path" ]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  git worktree list --porcelain | awk '
+    $1 == "worktree" {
+      print substr($0, length("worktree") + 2)
+    }
+  ' | while IFS= read -r worktree_path; do
+    [ -n "$worktree_path" ] || continue
+    current_ref=$(worktree_branch_ref "$worktree_path" || true)
+    if [ "$current_ref" = "$target_ref" ]; then
+      printf '%s\n' "$worktree_path"
+      exit 0
+    fi
+  done
+}
+
+checked_out_branch_issue() {
+  issue_path=$1
+  issue_branch=$2
+  current_branch_ref=$(worktree_branch_ref "$issue_path" || true)
+  current_branch=
+  if [ -n "$current_branch_ref" ]; then
+    current_branch=${current_branch_ref#refs/heads/}
+  fi
+  [ "$current_branch_ref" = "refs/heads/$issue_branch" ] || {
+    printf 'wrong-head:%s\n' "$current_branch"
+    return 1
+  }
+  [ -z "$(git -C "$issue_path" diff --name-only --diff-filter=U)" ] || {
+    printf 'unresolved-merges\n'
+    return 1
+  }
+  if worktree_has_rebase_state "$issue_path"; then
+    printf 'rebase-in-progress\n'
+    return 1
+  fi
+  git -C "$issue_path" diff --quiet --ignore-submodules -- || {
+    printf 'dirty-unstaged\n'
+    return 1
+  }
+  git -C "$issue_path" diff --cached --quiet --ignore-submodules -- || {
+    printf 'dirty-staged\n'
+    return 1
+  }
+  return 0
+}
+
+load_refs() {
+  branch_csv=$1
+  meta_file=$2
+
+  : >"$meta_file"
+  index=0
+
+  printf '%s\n' "$branch_csv" | tr ',' '\n' | while IFS= read -r raw_branch; do
+    branch=$(printf '%s' "$raw_branch" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$branch" ] || die "Branch list contains an empty entry."
+    git rev-parse --verify --quiet "$branch^{commit}" >/dev/null 2>&1 \
+      || die "Unknown branch or commit ref: $branch"
+    if awk -F '\t' -v branch="$branch" '$1 == branch { found = 1 } END { exit found ? 0 : 1 }' "$meta_file"
+    then
+      die "Duplicate branch in branch list: $branch"
+    fi
+    tip=$(git rev-parse "$branch^{commit}")
+    printf '%s\t%s\t%s\n' "$branch" "$index" "$tip" >>"$meta_file"
+    index=$((index + 1))
+  done
+
+  [ -s "$meta_file" ] || die "No branches were provided."
+}
+
+compute_groups() {
+  branch_csv=$1
+  meta_file=$2
+  group_file=$3
+
+  raw_group_file="$tmp_dir/groups.raw.tsv"
+  load_refs "$branch_csv" "$meta_file"
+
+  awk -F '\t' '
+    {
+      branch = $1
+      input_index = $2 + 0
+      tip = $3
+      if (!(tip in group_id)) {
+        count += 1
+        group_id[tip] = "G" count
+        group_tip[count] = tip
+        first_index[count] = input_index
+        refs[count] = branch
+        size[count] = 1
+      } else {
+        id = substr(group_id[tip], 2) + 0
+        refs[id] = refs[id] "," branch
+        size[id] += 1
+      }
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        print "G" i "\t" group_tip[i] "\t" first_index[i] "\t" size[i] "\t" refs[i]
+      }
+    }
+  ' "$meta_file" >"$raw_group_file"
+
+  : >"$group_file"
+  while IFS="$(printf '\t')" read -r group_id tip first_index size refs; do
+    frontier=frontier
+    while IFS="$(printf '\t')" read -r other_id other_tip other_first other_size other_refs; do
+      [ "$tip" = "$other_tip" ] && continue
+      if git merge-base --is-ancestor "$tip" "$other_tip"; then
+        frontier=ancestor
+        break
+      fi
+    done <"$raw_group_file"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$group_id" "$tip" "$first_index" "$size" "$frontier" "$refs" >>"$group_file"
+  done <"$raw_group_file"
+}
+
+render_groups() {
+  group_file=$1
+  output_file="$tmp_dir/groups.out.tsv"
+  : >"$output_file"
+
+  while IFS="$(printf '\t')" read -r group_id tip first_index size frontier refs; do
+    printf '%s\t%s\t%s\t%s\n' "$group_id" "$(short_commit "$tip")" "$frontier" "$refs" >>"$output_file"
+  done <"$group_file"
+
+  print_aligned "$output_file"
+}
+
+diff_metrics() {
+  metric_base=$1
+  metric_tip=$2
+
+  git diff --numstat "$metric_base" "$metric_tip" | awk '
+    BEGIN {
+      files = 0
+      insertions = 0
+      deletions = 0
+    }
+    {
+      files += 1
+      if ($1 != "-") {
+        insertions += $1
+      }
+      if ($2 != "-") {
+        deletions += $2
+      }
+    }
+    END {
+      printf "%d\t%d\t%d\n", files, insertions, deletions
+    }
+  '
+}
+
+probe_counter=0
+
+record_probe_branch() {
+  branch=$1
+  [ -n "${probe_branch_file:-}" ] || return 0
+  printf '%s\n' "$branch" >>"$probe_branch_file"
+}
+
+record_probe_worktree() {
+  path=$1
+  [ -n "${probe_worktree_file:-}" ] || return 0
+  printf '%s\n' "$path" >>"$probe_worktree_file"
+}
+
+cleanup_probe_artifacts() {
+  if [ -n "${probe_worktree_file:-}" ] && [ -f "$probe_worktree_file" ]; then
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      git worktree remove --force "$path" >/dev/null 2>&1 || true
+    done <"$probe_worktree_file"
+  fi
+
+  if [ -n "${probe_branch_file:-}" ] && [ -f "$probe_branch_file" ]; then
+    while IFS= read -r branch; do
+      [ -n "$branch" ] || continue
+      git branch -D "$branch" >/dev/null 2>&1 || true
+    done <"$probe_branch_file"
+  fi
+}
+
+cleanup() {
+  cleanup_probe_artifacts
+  if [ -n "${tmp_dir:-}" ]; then
+    rm -rf "$tmp_dir"
+  fi
+}
+
+signal_cleanup() {
+  status=$1
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit "$status"
+}
+
+probe_rebase() {
+  probe_branch_source=$1
+  probe_target_ref=$2
+  probe_base=$3
+
+  probe_counter=$((probe_counter + 1))
+  probe_branch="wt-sync-probe-$$-$probe_counter"
+  probe_path="$tmp_dir/probe-$probe_counter"
+
+  git branch "$probe_branch" "$probe_branch_source" >/dev/null 2>&1 \
+    || die "Failed to create probe branch for $probe_branch_source."
+  record_probe_branch "$probe_branch"
+  git worktree add "$probe_path" "$probe_branch" >/dev/null 2>&1 \
+    || {
+      git branch -D "$probe_branch" >/dev/null 2>&1 || true
+      die "Failed to create probe worktree for $probe_branch_source."
+    }
+  record_probe_worktree "$probe_path"
+
+  if git -C "$probe_path" rebase --onto "$probe_target_ref" "$probe_base" >/dev/null 2>&1
+  then
+    probe_tip=$(git -C "$probe_path" rev-parse HEAD)
+    git worktree remove --force "$probe_path" >/dev/null 2>&1 || true
+    git branch -D "$probe_branch" >/dev/null 2>&1 || true
+    printf '%s\n' "$probe_tip"
+    return 0
+  fi
+
+  git -C "$probe_path" rebase --abort >/dev/null 2>&1 || true
+  git worktree remove --force "$probe_path" >/dev/null 2>&1 || true
+  git branch -D "$probe_branch" >/dev/null 2>&1 || true
+  return 1
+}
+
+group_field() {
+  group_file=$1
+  group_id=$2
+  field_number=$3
+  awk -F '\t' -v group_id="$group_id" -v field_number="$field_number" '
+    $1 == group_id {
+      print $field_number
+      found = 1
+      exit
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "$group_file"
+}
+
+candidate_graph_score() {
+  score_group_file=$1
+  score_source_group=$2
+  score_source_tip=$3
+  score_target_tip=$4
+
+  stranded_groups=0
+  stranded_refs=0
+  target_closure_refs=0
+
+  while IFS="$(printf '\t')" read -r group_id tip first_index size frontier refs; do
+    if git merge-base --is-ancestor "$tip" "$score_target_tip"; then
+      target_closure_refs=$((target_closure_refs + size))
+    fi
+
+    [ "$group_id" = "$score_source_group" ] && continue
+    if git merge-base --is-ancestor "$tip" "$score_source_tip" &&
+      ! git merge-base --is-ancestor "$tip" "$score_target_tip"; then
+      stranded_groups=$((stranded_groups + 1))
+      stranded_refs=$((stranded_refs + size))
+    fi
+  done <"$score_group_file"
+
+  target_closure_rank=$((1000000 - target_closure_refs))
+  printf '%s\t%s\t%s\n' "$stranded_groups" "$stranded_refs" "$target_closure_rank"
+}
+
+append_group_ff_ops() {
+  option=$1
+  phase=$2
+  source_group=$3
+  target_group=$4
+  target_ref=$5
+  step_file=$6
+
+  source_tip=$(group_field "$group_file" "$source_group" 2)
+  source_refs=$(group_field "$group_file" "$source_group" 6)
+  printf '%s\n' "$source_refs" | tr ',' '\n' | while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    printf 'op\t%s\t%s\tff\t%s\t%s\t%s\t%s\n' \
+      "$option" "$phase" "$ref" "$target_ref" "$source_tip" "$target_group" >>"$step_file"
+  done
+}
+
+compute_ff_cleanup_step() {
+  group_file=$1
+  step_file=$2
+  step_type_file=$3
+
+  target_group=$(awk -F '\t' '$5 == "frontier" { print $1; exit }' "$group_file")
+  target_tip=$(group_field "$group_file" "$target_group" 2)
+  target_refs=$(group_field "$group_file" "$target_group" 6)
+  target_ref=$(csv_first "$target_refs")
+  moving_refs=
+
+  while IFS="$(printf '\t')" read -r group_id tip first_index size frontier refs; do
+    [ "$group_id" = "$target_group" ] && continue
+    git merge-base --is-ancestor "$tip" "$target_tip" \
+      || die "Group $group_id cannot fast-forward to $target_group."
+    if [ -n "$moving_refs" ]; then
+      moving_refs="$moving_refs,$refs"
+    else
+      moving_refs=$refs
+    fi
+    append_group_ff_ops 1 1 "$group_id" "$target_group" "$target_ref" "$step_file"
+  done <"$group_file"
+
+  if [ -z "$moving_refs" ]; then
+    printf 'done\n' >"$step_type_file"
+    return 0
+  fi
+
+  printf 'choice\t1\tff\t-\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t%s\t%s\n' \
+    "$target_group" "$moving_refs" "$target_refs" "$target_ref" >>"$step_file"
+  printf 'ff\n' >"$step_type_file"
+}
+
+compute_rebase_choices() {
+  group_file=$1
+  step_file=$2
+  step_type_file=$3
+
+  candidate_file="$tmp_dir/step-candidates.tsv"
+  sorted_candidate_file="$tmp_dir/step-candidates.sorted.tsv"
+  : >"$candidate_file"
+
+  while IFS="$(printf '\t')" read -r source_group source_tip source_first source_size source_frontier source_refs; do
+    [ "$source_frontier" = "frontier" ] || continue
+    source_ref=$(csv_first "$source_refs")
+
+    while IFS="$(printf '\t')" read -r target_group target_tip target_first target_size target_frontier target_refs; do
+      [ "$target_frontier" = "frontier" ] || continue
+      [ "$source_group" = "$target_group" ] && continue
+      target_ref=$(csv_first "$target_refs")
+
+      base=$(git merge-base "$source_tip" "$target_tip")
+      metrics=$(diff_metrics "$base" "$source_tip")
+      files=$(printf '%s' "$metrics" | cut -f1)
+      insertions=$(printf '%s' "$metrics" | cut -f2)
+      deletions=$(printf '%s' "$metrics" | cut -f3)
+      commits=$(git rev-list --count "$base..$source_tip")
+      changes=$((insertions + deletions))
+      graph_score=$(candidate_graph_score "$group_file" "$source_group" "$source_tip" "$target_tip")
+      stranded_groups=$(printf '%s' "$graph_score" | cut -f1)
+      stranded_refs=$(printf '%s' "$graph_score" | cut -f2)
+      target_closure_rank=$(printf '%s' "$graph_score" | cut -f3)
+      probe_tip=$(probe_rebase "$source_ref" "$target_ref" "$base" 2>/dev/null || true)
+      option_file="$tmp_dir/choice-$source_group-$target_group.tsv"
+      : >"$option_file"
+      if [ -z "${probe_tip:-}" ]; then
+        printf 'choice\tOPTION\tblocked\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$source_group" "$target_group" "$source_refs" "$target_refs" "$base" \
+          "$source_tip" "$target_tip" "$commits" "$files" "$insertions" "$deletions" \
+          "$source_ref" "$target_ref" >>"$option_file"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$stranded_groups" "$stranded_refs" "$commits" "$files" "$changes" \
+          "$target_closure_rank" 1 "$source_first" "$target_first" "$option_file" >>"$candidate_file"
+        continue
+      fi
+
+      printf 'choice\tOPTION\trebase\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$source_group" "$target_group" "$source_refs" "$target_refs" "$base" \
+        "$source_tip" "$target_tip" "$commits" "$files" "$insertions" "$deletions" \
+        "$source_ref" "$target_ref" >>"$option_file"
+      printf 'op\tOPTION\t1\trebase\t%s\t%s\t%s\t%s\n' \
+        "$source_ref" "$target_ref" "$base" "$source_tip" >>"$option_file"
+
+      aliases=$(csv_without_ref "$source_refs" "$source_ref")
+      if [ -n "$aliases" ]; then
+        printf '%s\n' "$aliases" | tr ',' '\n' | while IFS= read -r alias_ref; do
+          [ -n "$alias_ref" ] || continue
+          printf 'op\tOPTION\t2\tcarry\t%s\t%s\t%s\t%s\n' \
+            "$alias_ref" "$source_ref" "$source_tip" "$source_group" >>"$option_file"
+        done
+      fi
+
+      while IFS="$(printf '\t')" read -r group_id tip first_index size frontier refs; do
+        [ "$group_id" = "$source_group" ] && continue
+        if git merge-base --is-ancestor "$tip" "$probe_tip"; then
+          printf '%s\n' "$refs" | tr ',' '\n' | while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            printf 'op\tOPTION\t2\tff\t%s\t%s\t%s\t%s\n' \
+              "$ref" "$source_ref" "$tip" "$group_id" >>"$option_file"
+          done
+        fi
+      done <"$group_file"
+
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$stranded_groups" "$stranded_refs" "$commits" "$files" "$changes" \
+        "$target_closure_rank" 0 "$source_first" "$target_first" "$option_file" >>"$candidate_file"
+    done <"$group_file"
+  done <"$group_file"
+
+  [ -s "$candidate_file" ] || {
+    printf 'blocked\n' >"$step_type_file"
+    return 0
+  }
+
+  sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n -k7,7n -k8,8n -k9,9n "$candidate_file" >"$sorted_candidate_file"
+
+  option=1
+  while IFS="$(printf '\t')" read -r stranded_groups stranded_refs commits files changes target_closure_rank status_rank source_first target_first option_file; do
+    sed "s/OPTION/$option/g" "$option_file" >>"$step_file"
+    option=$((option + 1))
+  done <"$sorted_candidate_file"
+
+  printf 'choices\n' >"$step_type_file"
+}
+
+compute_step() {
+  group_file=$1
+  step_file=$2
+  step_type_file=$3
+
+  : >"$step_file"
+  group_count=$(wc -l <"$group_file" | tr -d ' ')
+  frontier_count=$(awk -F '\t' '$5 == "frontier" { count += 1 } END { print count + 0 }' "$group_file")
+
+  if [ "$group_count" -le 1 ]; then
+    printf 'done\n' >"$step_type_file"
+    return 0
+  fi
+
+  if [ "$frontier_count" -le 1 ]; then
+    compute_ff_cleanup_step "$group_file" "$step_file" "$step_type_file"
+    return 0
+  fi
+
+  compute_rebase_choices "$group_file" "$step_file" "$step_type_file"
+}
+
+print_aligned() {
+  input_file=$1
+  awk -F '\t' '
+    {
+      rows[NR] = $0
+      fields[NR] = NF
+      for (i = 1; i <= NF; i++) {
+        if (length($i) > width[i]) {
+          width[i] = length($i)
+        }
+      }
+    }
+    END {
+      for (row = 1; row <= NR; row++) {
+        split(rows[row], value, FS)
+        for (i = 1; i <= fields[row]; i++) {
+          if (i < fields[row]) {
+            printf "%-*s  ", width[i], value[i]
+          } else {
+            printf "%s", value[i]
+          }
+        }
+        printf "\n"
+      }
+    }
+  ' "$input_file"
+}
+
+render_step() {
+  step_file=$1
+  step_type_file=$2
+
+  step_type=$(cat "$step_type_file")
+  [ "$step_type" = "done" ] && return 0
+  [ "$step_type" = "blocked" ] && die "No legal group-unification step is available."
+
+  while IFS="$(printf '\t')" read -r kind option action source_group target_group source_refs target_refs base source_tip target_tip commits files insertions deletions source_ref target_ref; do
+    [ "$kind" = "choice" ] || continue
+    case "$action" in
+      ff)
+        case "$target_group" in
+          G*) ;;
+          *) continue ;;
+        esac
+        printf '%s  ff      [%s] -> %s[%s]\n' "$option" "$source_refs" "$target_group" "$target_refs"
+        ;;
+      rebase)
+        case "$source_group:$target_group" in
+          G*:G*) ;;
+          *) continue ;;
+        esac
+        [ -n "$base" ] || continue
+        printf '%s  rebase  %s[%s] -> %s[%s]  base %s  delta %sc %sf +%s -%s\n' \
+          "$option" "$source_group" "$source_refs" "$target_group" "$target_refs" \
+          "$(short_commit "$base")" "$commits" "$files" "$insertions" "$deletions"
+        carry_refs=$(
+          awk -F '\t' -v option="$option" '$1 == "op" && $2 == option && $4 == "carry" {
+            if (out != "") {
+              out = out "," $5
+            } else {
+              out = $5
+            }
+          } END { print out }' "$step_file"
+        )
+        ff_refs=$(
+          awk -F '\t' -v option="$option" '$1 == "op" && $2 == option && $4 == "ff" {
+            if (out != "") {
+              out = out "," $5
+            } else {
+              out = $5
+            }
+          } END { print out }' "$step_file"
+        )
+        if [ -n "$carry_refs" ] || [ -n "$ff_refs" ]; then
+          printf '   then'
+          if [ -n "$carry_refs" ]; then
+            printf ' carry %s with %s' "$carry_refs" "$source_ref"
+          fi
+          if [ -n "$ff_refs" ]; then
+            [ -n "$carry_refs" ] && printf ';'
+            printf ' ff %s -> %s' "$ff_refs" "$source_ref"
+          fi
+          printf '\n'
+        fi
+        ;;
+      blocked)
+        case "$source_group:$target_group" in
+          G*:G*) ;;
+          *) continue ;;
+        esac
+        [ -n "$base" ] || continue
+        printf '%s  blocked %s[%s] -> %s[%s]  base %s  delta %sc %sf +%s -%s\n' \
+          "$option" "$source_group" "$source_refs" "$target_group" "$target_refs" \
+          "$(short_commit "$base")" "$commits" "$files" "$insertions" "$deletions"
+        ;;
+      *)
+        die "Unknown step action: $action"
+        ;;
+    esac
+  done <"$step_file"
+}
+
+selected_option_exists() {
+  step_file=$1
+  option=$2
+  awk -F '\t' -v option="$option" '$1 == "choice" && $2 == option { found = 1 } END { exit found ? 0 : 1 }' "$step_file"
+}
+
+selected_option_has_ops() {
+  step_file=$1
+  option=$2
+  awk -F '\t' -v option="$option" '$1 == "op" && $2 == option { found = 1 } END { exit found ? 0 : 1 }' "$step_file"
+}
+
+selected_option_is_blocked() {
+  step_file=$1
+  option=$2
+  awk -F '\t' -v option="$option" '$1 == "choice" && $2 == option && $3 == "blocked" { found = 1 } END { exit found ? 0 : 1 }' "$step_file"
+}
+
+print_rebase_command() {
+  branch=$1
+  target_ref=$2
+  base=$3
+  path=$(branch_worktree_path "$branch")
+  if [ -n "$path" ]; then
+    printf 'git -C %s rebase --onto %s %s\n' "$path" "$target_ref" "$(short_commit "$base")"
+  else
+    printf 'git rebase --onto %s %s %s\n' "$target_ref" "$(short_commit "$base")" "$branch"
+  fi
+}
+
+print_ff_command() {
+  branch=$1
+  target_ref=$2
+  old_tip=$3
+  path=$(branch_worktree_path "$branch")
+  if [ -n "$path" ]; then
+    printf 'git -C %s merge --ff-only %s\n' "$path" "$target_ref"
+  else
+    printf 'git update-ref refs/heads/%s $(git rev-parse %s) %s\n' \
+      "$branch" "$target_ref" "$(short_commit "$old_tip")"
+  fi
+}
+
+print_carry_command() {
+  branch=$1
+  target_ref=$2
+  old_tip=$3
+  path=$(branch_worktree_path "$branch")
+  if [ -n "$path" ]; then
+    printf 'git -C %s reset --keep %s\n' "$path" "$target_ref"
+  else
+    printf 'git update-ref refs/heads/%s $(git rev-parse %s) %s\n' \
+      "$branch" "$target_ref" "$(short_commit "$old_tip")"
+  fi
+}
+
+adopt_worktree_issue() {
+  issue_path=$1
+  issue_branch=$2
+  issue_old=$3
+  issue_new=$4
+
+  if worktree_has_rebase_state "$issue_path"; then
+    printf 'rebase in progress\n'
+    return 1
+  fi
+  for state_file in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    state_path=$(git -C "$issue_path" rev-parse --path-format=absolute --git-path "$state_file")
+    if [ -e "$state_path" ]; then
+      printf '%s present (operation in progress)\n' "$state_file"
+      return 1
+    fi
+  done
+
+  head_ref=$(git -C "$issue_path" symbolic-ref --quiet HEAD 2>/dev/null || true)
+  if [ "$head_ref" != "refs/heads/$issue_branch" ]; then
+    printf 'worktree HEAD is %s, not %s\n' "${head_ref:-detached}" "$issue_branch"
+    return 1
+  fi
+
+  if ! git -C "$issue_path" diff --cached --quiet --ignore-submodules --; then
+    printf 'staged changes (reset --keep discards staged versions)\n'
+    return 1
+  fi
+
+  moving_file="$tmp_dir/adopt-moving.txt"
+  modified_file="$tmp_dir/adopt-modified.txt"
+  git -c core.quotePath=false diff --name-only --no-renames "$issue_old" "$issue_new" | sort >"$moving_file"
+  git -C "$issue_path" -c core.quotePath=false diff --name-only --no-renames --ignore-submodules -- | sort >"$modified_file"
+  overlap=$(comm -12 "$moving_file" "$modified_file" | head -n 1)
+  if [ -n "$overlap" ]; then
+    printf 'uncommitted changes to a file the move would update: %s\n' "$overlap"
+    return 1
+  fi
+
+  added_file="$tmp_dir/adopt-added.txt"
+  git -c core.quotePath=false diff --name-only --no-renames --diff-filter=A "$issue_old" "$issue_new" >"$added_file"
+  while IFS= read -r added_path; do
+    [ -n "$added_path" ] || continue
+    if [ -e "$issue_path/$added_path" ] || [ -L "$issue_path/$added_path" ]; then
+      printf 'untracked or ignored file would be overwritten: %s\n' "$added_path"
+      return 1
+    fi
+    parent_path=$added_path
+    while :; do
+      case "$parent_path" in
+        */*) parent_path=${parent_path%/*} ;;
+        *) break ;;
+      esac
+      git cat-file -e "$issue_old:$parent_path" 2>/dev/null && continue
+      if [ -L "$issue_path/$parent_path" ] ||
+        { [ -e "$issue_path/$parent_path" ] && [ ! -d "$issue_path/$parent_path" ]; }; then
+        printf 'untracked or ignored file would be overwritten: %s\n' "$parent_path"
+        return 1
+      fi
+    done
+  done <"$added_file"
+
+  return 0
+}
+
+describe_commit() {
+  git log -1 --format='%h %s' "$1"
+}
+
+render_adopt_commands() {
+  branch_csv=$1
+  adopt_meta_file=$2
+
+  load_refs "$branch_csv" "$adopt_meta_file"
+  target_tip=$(git rev-parse HEAD)
+  target_short=$(short_commit "$target_tip")
+
+  while IFS="$(printf '\t')" read -r branch input_index branch_tip; do
+    git show-ref --verify --quiet "refs/heads/$branch" \
+      || die "adopt accepts local branch names only: $branch"
+  done <"$adopt_meta_file"
+
+  plan_file="$tmp_dir/adopt-plan.txt"
+  command_file="$tmp_dir/adopt-commands.txt"
+  printf 'adopt target HEAD: %s\n' "$(describe_commit "$target_tip")" >"$plan_file"
+  : >"$command_file"
+
+  skipped=0
+  while IFS="$(printf '\t')" read -r branch input_index branch_tip; do
+    if [ "$branch_tip" = "$target_tip" ]; then
+      printf '  %s: already at %s\n' "$branch" "$target_short" >>"$plan_file"
+      continue
+    fi
+
+    path=$(branch_worktree_path "$branch")
+    if [ -n "$path" ]; then
+      issue=$(adopt_worktree_issue "$path" "$branch" "$branch_tip" "$target_tip" || true)
+      if [ -n "$issue" ]; then
+        printf '  %s: SKIP, %s (%s)\n' "$branch" "$issue" "$path" >>"$plan_file"
+        skipped=1
+        continue
+      fi
+      location="worktree $path"
+    else
+      location="not checked out"
+    fi
+
+    branch_short=$(short_commit "$branch_tip")
+    dropped=$(git rev-list --count "$target_tip..$branch_tip")
+    gained=$(git rev-list --count "$branch_tip..$target_tip")
+    printf '  %s: %s -> %s, drops %s, gains %s, %s\n' \
+      "$branch" "$branch_short" "$target_short" "$dropped" "$gained" "$location" >>"$plan_file"
+    git log --format='    drop %h %s' -n 10 "$target_tip..$branch_tip" >>"$plan_file"
+    [ "$dropped" -le 10 ] || printf '    drop ... %s more\n' "$((dropped - 10))" >>"$plan_file"
+
+    if [ -n "$path" ]; then
+      printf 'git -C %s reset --keep %s  # undo: %s\n' \
+        "$path" "$target_short" "$branch_short" >>"$command_file"
+    else
+      printf 'git update-ref refs/heads/%s %s %s  # undo: %s\n' \
+        "$branch" "$target_short" "$branch_short" "$branch_short" >>"$command_file"
+    fi
+  done <"$adopt_meta_file"
+
+  cat "$plan_file" >&2
+  cat "$command_file"
+
+  [ "$skipped" = "0" ]
+}
+
+render_blocked_step_command() {
+  step_file=$1
+  option=$2
+
+  awk -F '\t' -v option="$option" '$1 == "choice" && $2 == option && $3 == "blocked" { print $15 "\t" $16 "\t" $8; exit }' "$step_file" | \
+    while IFS="$(printf '\t')" read -r source_ref target_ref base; do
+      print_rebase_command "$source_ref" "$target_ref" "$base"
+    done
+}
+
+render_step_commands() {
+  step_file=$1
+  option=$2
+
+  selected_option_exists "$step_file" "$option" || die "Unknown option: $option"
+  if ! selected_option_has_ops "$step_file" "$option"; then
+    selected_option_is_blocked "$step_file" "$option" || die "Selected option $option has no executable operations."
+    render_blocked_step_command "$step_file" "$option"
+    return 0
+  fi
+  phases_file="$tmp_dir/phases-$option.txt"
+  awk -F '\t' -v option="$option" '$1 == "op" && $2 == option { print $3 }' "$step_file" | sort -n -u >"$phases_file"
+
+  while IFS= read -r phase; do
+    [ -n "$phase" ] || continue
+    awk -F '\t' -v option="$option" -v phase="$phase" '$1 == "op" && $2 == option && $3 == phase { print }' "$step_file" | \
+      while IFS="$(printf '\t')" read -r kind row_option row_phase op branch target_ref arg old_tip; do
+        case "$op" in
+          rebase)
+            print_rebase_command "$branch" "$target_ref" "$arg"
+            ;;
+          ff)
+            print_ff_command "$branch" "$target_ref" "$arg"
+            ;;
+          carry)
+            print_carry_command "$branch" "$target_ref" "$arg"
+            ;;
+          *)
+            die "Unknown op: $op"
+            ;;
+        esac
+      done
+  done <"$phases_file"
+}
+
+precheck_selected_option() {
+  step_file=$1
+  option=$2
+
+  awk -F '\t' -v option="$option" '$1 == "op" && $2 == option { print }' "$step_file" | \
+    while IFS="$(printf '\t')" read -r kind row_option row_phase op branch target_ref arg extra; do
+      case "$op" in
+        rebase|ff|carry)
+          expected_tip=$extra
+          [ "$op" = "rebase" ] && expected_tip=$extra
+          [ "$op" = "ff" ] && expected_tip=$arg
+          [ "$op" = "carry" ] && expected_tip=$arg
+          current_tip=$(git rev-parse "$branch^{commit}")
+          [ "$current_tip" = "$expected_tip" ] || {
+            printf 'fail\t%s\tstale-tip\n' "$branch" >&2
+            exit 1
+          }
+          path=$(branch_worktree_path "$branch")
+          if [ -n "$path" ]; then
+            issue=$(checked_out_branch_issue "$path" "$branch" || true)
+            if [ -n "$issue" ]; then
+              printf 'fail\t%s\t%s\n' "$branch" "$issue" >&2
+              exit 1
+            fi
+          fi
+          ;;
+        *)
+          printf 'fail\t%s\tunknown-op:%s\n' "$branch" "$op" >&2
+          exit 1
+          ;;
+      esac
+    done
+}
+
+execute_op() {
+  op=$1
+  branch=$2
+  target_ref=$3
+  arg=$4
+  expected_tip=$5
+
+  path=$(branch_worktree_path "$branch")
+
+  case "$op" in
+    rebase)
+      if [ -n "$path" ]; then
+        git -C "$path" rebase --onto "$target_ref" "$arg" >/dev/null 2>&1 || {
+          printf 'fail\t%s\trebase\n' "$branch" >&2
+          print_rebase_command "$branch" "$target_ref" "$arg" >&2
+          return 1
+        }
+      else
+        git rebase --onto "$target_ref" "$arg" "$branch" >/dev/null 2>&1 || {
+          printf 'fail\t%s\trebase\n' "$branch" >&2
+          print_rebase_command "$branch" "$target_ref" "$arg" >&2
+          return 1
+        }
+      fi
+      ;;
+    ff)
+      target_tip=$(git rev-parse "$target_ref^{commit}")
+      git merge-base --is-ancestor "$expected_tip" "$target_tip" || {
+        printf 'fail\t%s\tff-only\n' "$branch" >&2
+        return 1
+      }
+      if [ -n "$path" ]; then
+        git -C "$path" merge --ff-only "$target_ref" >/dev/null 2>&1 || {
+          printf 'fail\t%s\tff-only\n' "$branch" >&2
+          return 1
+        }
+      else
+        git update-ref "refs/heads/$branch" "$target_tip" "$expected_tip" || {
+          printf 'fail\t%s\tupdate-ref\n' "$branch" >&2
+          return 1
+        }
+      fi
+      ;;
+    carry)
+      target_tip=$(git rev-parse "$target_ref^{commit}")
+      if [ -n "$path" ]; then
+        git -C "$path" reset --keep "$target_ref" >/dev/null 2>&1 || {
+          printf 'fail\t%s\tcarry\n' "$branch" >&2
+          return 1
+        }
+      else
+        git update-ref "refs/heads/$branch" "$target_tip" "$expected_tip" || {
+          printf 'fail\t%s\tupdate-ref\n' "$branch" >&2
+          return 1
+        }
+      fi
+      ;;
+    *)
+      die "Unknown op: $op"
+      ;;
+  esac
+
+  printf 'ok\t%s\n' "$branch"
+}
+
+execute_step() {
+  step_file=$1
+  option=$2
+  dry_run=$3
+
+  selected_option_exists "$step_file" "$option" || die "Unknown option: $option"
+
+  if [ "$dry_run" = "1" ]; then
+    render_step_commands "$step_file" "$option"
+    return 0
+  fi
+
+  if ! selected_option_has_ops "$step_file" "$option"; then
+    selected_option_is_blocked "$step_file" "$option" || die "Selected option $option has no executable operations."
+    printf 'fail\toption-%s\tblocked\n' "$option" >&2
+    render_blocked_step_command "$step_file" "$option" >&2
+    return 1
+  fi
+
+  precheck_selected_option "$step_file" "$option" || return 1
+
+  phases_file="$tmp_dir/execute-phases-$option.txt"
+  awk -F '\t' -v option="$option" '$1 == "op" && $2 == option { print $3 }' "$step_file" | sort -n -u >"$phases_file"
+
+  while IFS= read -r phase; do
+    [ -n "$phase" ] || continue
+    awk -F '\t' -v option="$option" -v phase="$phase" '$1 == "op" && $2 == option && $3 == phase { print }' "$step_file" | \
+      while IFS="$(printf '\t')" read -r kind row_option row_phase op branch target_ref arg expected_tip; do
+        case "$op" in
+          rebase)
+            op_expected_tip=$expected_tip
+            ;;
+          ff|carry)
+            op_expected_tip=$arg
+            ;;
+          *)
+            op_expected_tip=$expected_tip
+            ;;
+        esac
+        execute_op "$op" "$branch" "$target_ref" "$arg" "$op_expected_tip" || exit 1
+      done
+  done <"$phases_file"
+}
+
+run_sync() {
+  branch_csv=$1
+  one_step=$2
+  selected_option=$3
+  dry_run=$4
+
+  first_iteration=1
+  while :; do
+    compute_groups "$branch_csv" "$meta_file" "$group_file"
+    before_count=$(wc -l <"$group_file" | tr -d ' ')
+    compute_step "$group_file" "$step_file" "$step_type_file"
+    step_type=$(cat "$step_type_file")
+
+    case "$step_type" in
+      done)
+        return 0
+        ;;
+      blocked)
+        die "No legal group-unification step is available."
+        ;;
+    esac
+
+    option=1
+    if [ "$first_iteration" = "1" ] && [ -n "$selected_option" ]; then
+      option=$selected_option
+    fi
+
+    execute_step "$step_file" "$option" "$dry_run" || return 1
+    [ "$dry_run" = "1" ] && return 0
+
+    compute_groups "$branch_csv" "$after_meta_file" "$after_group_file"
+    after_count=$(wc -l <"$after_group_file" | tr -d ' ')
+    [ "$after_count" -lt "$before_count" ] || {
+      printf 'fail\tprogress\tgroup-count-not-reduced\n' >&2
+      return 1
+    }
+
+    if [ "$one_step" = "1" ] || [ -n "$selected_option" ]; then
+      return 0
+    fi
+    first_iteration=0
+  done
+}
+
+require_git_repo
+
+case "${1:-}" in
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+[ $# -ge 2 ] || {
+  usage >&2
+  exit 1
+}
+
+branch_csv=$1
+command=$2
+shift 2
+
+tmp_dir=$(mktemp -d)
+probe_branch_file="$tmp_dir/probe-branches.txt"
+probe_worktree_file="$tmp_dir/probe-worktrees.txt"
+: >"$probe_branch_file"
+: >"$probe_worktree_file"
+trap cleanup EXIT
+trap 'signal_cleanup 129' HUP
+trap 'signal_cleanup 130' INT
+trap 'signal_cleanup 143' TERM
+
+meta_file="$tmp_dir/refs.tsv"
+group_file="$tmp_dir/groups.tsv"
+after_meta_file="$tmp_dir/refs-after.tsv"
+after_group_file="$tmp_dir/groups-after.tsv"
+step_file="$tmp_dir/step.tsv"
+step_type_file="$tmp_dir/step-type.txt"
+
+case "$command" in
+  groups)
+    compute_groups "$branch_csv" "$meta_file" "$group_file"
+    render_groups "$group_file"
+    ;;
+  step)
+    selected_option=1
+    show_commands=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --option)
+          [ $# -ge 2 ] || die "--option requires a number."
+          selected_option=$2
+          shift 2
+          ;;
+        --option=*)
+          selected_option=${1#--option=}
+          shift
+          ;;
+        --commands)
+          show_commands=1
+          shift
+          ;;
+        *)
+          die "Unknown step option: $1"
+          ;;
+      esac
+    done
+    compute_groups "$branch_csv" "$meta_file" "$group_file"
+    compute_step "$group_file" "$step_file" "$step_type_file"
+    if [ "$show_commands" = "1" ]; then
+      step_type=$(cat "$step_type_file")
+      [ "$step_type" = "done" ] && exit 0
+      [ "$step_type" = "blocked" ] && die "No legal group-unification step is available."
+      render_step_commands "$step_file" "$selected_option"
+    else
+      render_step "$step_file" "$step_type_file"
+    fi
+    ;;
+  sync)
+    one_step=0
+    selected_option=
+    dry_run=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --step)
+          one_step=1
+          shift
+          ;;
+        --option)
+          [ $# -ge 2 ] || die "--option requires a number."
+          selected_option=$2
+          one_step=1
+          shift 2
+          ;;
+        --option=*)
+          selected_option=${1#--option=}
+          one_step=1
+          shift
+          ;;
+        --dry-run)
+          dry_run=1
+          shift
+          ;;
+        *)
+          die "Unknown sync option: $1"
+          ;;
+      esac
+    done
+    run_sync "$branch_csv" "$one_step" "$selected_option" "$dry_run"
+    ;;
+  adopt)
+    [ $# -eq 0 ] || die "Unknown adopt option: $1"
+    render_adopt_commands "$branch_csv" "$meta_file"
+    ;;
+  *)
+    die "Unknown command: $command"
+    ;;
+esac

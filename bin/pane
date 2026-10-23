@@ -1,0 +1,324 @@
+#!/usr/bin/env nu
+
+# Zellij pane/grid helper implemented in Nushell.
+
+const usage = "usage: ./pane <4|6|9|fit|kdl|size|id|watch>
+       ./pane <cols>x<rows>
+       ./pane fit [<cols>x<rows>]
+       ./pane kdl <cols>x<rows>|<4|6|9>
+       ./pane watch [--interval <seconds>] [--idle-after <seconds>] [--json] <pane>...
+
+  4          apply a 2x2 KDL grid to the active tab
+  6          apply a 3x2 KDL grid to the active tab
+  9          apply a 3x3 KDL grid to the active tab
+  <c>x<r>    apply an explicit KDL grid, eg. 4x3
+  fit        infer a grid from the current active-tab pane count and re-apply KDL
+  fit <c>x<r> force current panes into an explicit grid
+  kdl        print generated KDL instead of applying it
+  size       print current pane id, tty, terminal columns, and terminal rows
+  id         print current Zellij terminal pane id
+  watch      poll target panes and report active/idle/waiting transitions"
+
+def main [shape?: string] {
+  if ($shape | is-empty) {
+    print $usage
+    return
+  }
+
+  let parsed = shape_for_spec $shape
+  create_grid $parsed.cols $parsed.rows
+}
+
+def "main fit" [shape?: string] {
+  let parsed = if ($shape | is-empty) {
+    let count = current_pane_count
+    shape_for_count $count
+  } else {
+    shape_for_spec $shape
+  }
+
+  create_grid $parsed.cols $parsed.rows
+}
+
+def "main kdl" [shape: string] {
+  let parsed = shape_for_spec $shape
+  generate_kdl $parsed.cols $parsed.rows
+}
+
+def "main size" [] {
+  let tty_info = (tty | complete)
+  let cols_info = (tput cols | complete)
+  let rows_info = (tput lines | complete)
+  let tty_value = if $tty_info.exit_code == 0 { $tty_info.stdout | str trim } else { "not a tty" }
+  let cols_value = if $cols_info.exit_code == 0 { $cols_info.stdout | str trim } else { "?" }
+  let rows_value = if $rows_info.exit_code == 0 { $rows_info.stdout | str trim } else { "?" }
+  print $"pane=($env.ZELLIJ_PANE_ID? | default '?') tty=($tty_value) cols=($cols_value) rows=($rows_value)"
+}
+
+def "main id" [] {
+  print $"terminal_($env.ZELLIJ_PANE_ID? | default '?')"
+}
+
+def "main watch" [
+  --interval: int = 2,
+  --idle-after: int = 1,
+  --json,
+  --verbose,
+  --waiting-patterns: string = "password:|Press enter|\\? $",
+  ...targets: string
+] {
+  if ($targets | is-empty) {
+    error make { msg: "watch requires at least one pane id" }
+  }
+
+  mut states = []
+  let now = now_epoch
+
+  for target in $targets {
+    let resolved = resolve_target $target
+    let exists = target_exists $resolved
+    let dump = if $exists { dump_target $resolved } else { { stdout: "", stderr: "target pane not found", exit_code: 1 } }
+    let initial = if $dump.exit_code == 0 {
+      classify_initial_state $dump.stdout $waiting_patterns
+    } else {
+      { state: "error", label: ($dump.stderr | str trim), report: true }
+    }
+    let hash = if $dump.exit_code == 0 { $dump.stdout | hash sha256 } else { "" }
+    if $initial.report {
+      emit_transition $json $resolved.label "unknown" $initial.state 0 $initial.label
+    }
+    $states = ($states | append {
+      target: $resolved.label,
+      session: $resolved.session,
+      pane: $resolved.pane,
+      hash: $hash,
+      last_changed: $now,
+      last_reported: $initial.state
+    })
+  }
+
+  loop {
+    sleep ($"($interval)sec" | into duration)
+    let tick = now_epoch
+    mut next_states = []
+
+    for state in $states {
+      let resolved = { session: $state.session, pane: $state.pane, label: $state.target }
+      let exists = target_exists $resolved
+      let dump = if $exists { dump_target $resolved } else { { stdout: "", stderr: "target pane not found", exit_code: 1 } }
+      let next = if $dump.exit_code == 0 {
+        let new_hash = ($dump.stdout | hash sha256)
+        let changed = ($new_hash != $state.hash)
+        let last_changed = if $changed { $tick } else { $state.last_changed }
+        let idle_seconds = ($tick - $last_changed)
+        let classified = classify_state $dump.stdout $changed $idle_seconds $idle_after $waiting_patterns
+        let stable_below_threshold = ((not $changed) and $idle_seconds < $idle_after and $classified.state == "active")
+        {
+          hash: $new_hash,
+          changed: $changed,
+          last_changed: $last_changed,
+          idle_seconds: $idle_seconds,
+          state: (if $stable_below_threshold { $state.last_reported } else { $classified.state }),
+          label: $classified.label
+        }
+      } else {
+        {
+          hash: $state.hash,
+          changed: false,
+          last_changed: $state.last_changed,
+          idle_seconds: ($tick - $state.last_changed),
+          state: "error",
+          label: ($dump.stderr | str trim)
+        }
+      }
+
+      if $verbose {
+        emit_poll $json $state.target $next.state $next.changed $next.idle_seconds $next.label
+      }
+
+      if ($next.state != $state.last_reported) {
+        let from_state = if ($state.last_reported == "unknown" and $next.state == "idle") { "active" } else { $state.last_reported }
+        emit_transition $json $state.target $from_state $next.state $next.idle_seconds $next.label
+      }
+
+      $next_states = ($next_states | append {
+        target: $state.target,
+        session: $state.session,
+        pane: $state.pane,
+        hash: $next.hash,
+        last_changed: $next.last_changed,
+        last_reported: $next.state
+      })
+    }
+
+    $states = $next_states
+  }
+}
+
+def shape_for_spec [spec: string] {
+  match $spec {
+    "4" => { cols: 2, rows: 2 },
+    "6" => { cols: 3, rows: 2 },
+    "9" => { cols: 3, rows: 3 },
+    _ => {
+      if ($spec =~ '^[1-9][0-9]*x[1-9][0-9]*$') {
+        let parts = ($spec | split row "x")
+        { cols: (($parts | get 0) | into int), rows: (($parts | get 1) | into int) }
+      } else {
+        error make { msg: "expected 4, 6, 9, or <cols>x<rows>" }
+      }
+    }
+  }
+}
+
+def shape_for_count [count: int] {
+  if $count <= 1 {
+    { cols: 1, rows: 1 }
+  } else if $count == 2 {
+    { cols: 2, rows: 1 }
+  } else if $count == 3 {
+    { cols: 3, rows: 1 }
+  } else if $count == 4 {
+    { cols: 2, rows: 2 }
+  } else if $count <= 6 {
+    { cols: 3, rows: 2 }
+  } else if $count <= 9 {
+    { cols: 3, rows: 3 }
+  } else if $count <= 12 {
+    { cols: 4, rows: 3 }
+  } else if $count <= 16 {
+    { cols: 4, rows: 4 }
+  } else {
+    mut cols = 1
+    while ($cols * $cols) < $count {
+      $cols = ($cols + 1)
+    }
+    let rows = (($count + $cols - 1) // $cols)
+    { cols: $cols, rows: $rows }
+  }
+}
+
+def pane_percent [index: int, count: int] {
+  let start = (($index * 100) // $count)
+  let end = ((($index + 1) * 100) // $count)
+  $end - $start
+}
+
+def generate_kdl [cols: int, rows: int] {
+  mut lines = []
+  $lines = ($lines | append "layout {")
+  $lines = ($lines | append "    pane split_direction=\"horizontal\" {")
+
+  for row in (0..<$rows) {
+    let row_size = pane_percent $row $rows
+    $lines = ($lines | append $"        pane size=\"($row_size)%\" split_direction=\"vertical\" {")
+    for col in (0..<$cols) {
+      let col_size = pane_percent $col $cols
+      $lines = ($lines | append $"            pane size=\"($col_size)%\"")
+    }
+    $lines = ($lines | append "        }")
+  }
+
+  $lines = ($lines | append "    }")
+  $lines = ($lines | append "}")
+  $lines | str join "\n"
+}
+
+def create_grid [cols: int, rows: int] {
+  require_zellij
+  let layout = generate_kdl $cols $rows
+  ^zellij action override-layout --apply-only-to-active-tab --retain-existing-terminal-panes --layout-string $layout
+}
+
+def current_pane_count [] {
+  require_zellij
+  let panes = (^zellij action list-panes --json --state --tab | from json)
+  let active_id = ($env.ZELLIJ_PANE_ID | into int)
+  let active_tab = ($panes | where is_plugin == false and id == $active_id | first | get tab_id)
+  $panes
+  | where is_plugin == false and is_floating == false and is_suppressed == false and tab_id == $active_tab
+  | length
+}
+
+def require_zellij [] {
+  if not ("ZELLIJ_PANE_ID" in $env) {
+    error make { msg: "./pane must be run from inside an existing Zellij pane" }
+  }
+}
+
+def resolve_target [target: string] {
+  let parts = ($target | split row ":")
+  let has_session = (($parts | length) == 2)
+  let session = if $has_session { $parts.0 } else { null }
+  let raw_pane = if $has_session { $parts.1 } else { $parts.0 }
+  let pane = if ($raw_pane | str starts-with "terminal_") { $raw_pane } else { $"terminal_($raw_pane)" }
+  let label = if $has_session { $"($session):($pane)" } else { $pane }
+  { session: $session, pane: $pane, label: $label }
+}
+
+def dump_target [target: record] {
+  if ($target.session | is-empty) {
+    ^zellij action dump-screen --pane-id $target.pane | complete
+  } else {
+    ^zellij --session $target.session action dump-screen --pane-id $target.pane | complete
+  }
+}
+
+def target_exists [target: record] {
+  let pane_id = ($target.pane | str replace "terminal_" "" | into int)
+  let result = if ($target.session | is-empty) {
+    ^zellij action list-panes --json --state --tab | complete
+  } else {
+    ^zellij --session $target.session action list-panes --json --state --tab | complete
+  }
+
+  if $result.exit_code != 0 {
+    false
+  } else {
+    let panes = ($result.stdout | from json)
+    (($panes | where is_plugin == false and id == $pane_id | length) > 0)
+  }
+}
+
+def classify_initial_state [screen: string, waiting_patterns: string] {
+  if ($screen =~ $waiting_patterns) {
+    { state: "waiting", label: "matched waiting pattern", report: true }
+  } else {
+    # The first successful dump is only a baseline. It is not activity.
+    { state: "unknown", label: "baseline captured", report: false }
+  }
+}
+
+def classify_state [screen: string, changed: bool, idle_seconds: int, idle_after: int, waiting_patterns: string] {
+  if ($screen =~ $waiting_patterns) {
+    { state: "waiting", label: "matched waiting pattern" }
+  } else if $changed {
+    { state: "active", label: "screen changed" }
+  } else if $idle_seconds >= $idle_after {
+    { state: "idle", label: $"idle_for=($idle_seconds)s" }
+  } else {
+    { state: "active", label: "within idle threshold" }
+  }
+}
+
+def emit_transition [as_json: bool, target: string, from: string, to: string, idle_seconds: int, label: string] {
+  let time = (date now | format date "%H:%M:%S")
+  if $as_json {
+    { time: $time, target: $target, from: $from, to: $to, idle_seconds: $idle_seconds, label: $label } | to json --raw
+  } else {
+    print $"($time) ($target) ($from) -> ($to) idle_for=($idle_seconds)s label=\"($label)\""
+  }
+}
+
+def emit_poll [as_json: bool, target: string, state: string, changed: bool, idle_seconds: int, label: string] {
+  let time = (date now | format date "%H:%M:%S")
+  if $as_json {
+    { time: $time, target: $target, event: "poll", state: $state, changed: $changed, idle_seconds: $idle_seconds, label: $label } | to json --raw
+  } else {
+    print $"($time) ($target) poll state=($state) changed=($changed) idle_for=($idle_seconds)s label=\"($label)\""
+  }
+}
+
+def now_epoch [] {
+  date now | format date "%s" | into int
+}

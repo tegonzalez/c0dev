@@ -1,150 +1,164 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
-"""Runtime removal retains the validated instance volume selection."""
+"""Home storage is derived from Docker objects, without a saved selector."""
+import json
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
+import shutil
+import uuid
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'bin/c0').read_text()
-INSTANCE = 'c0dev-storage-test'
-CANONICAL = INSTANCE + '-home-overlays'
-GENERATION = CANONICAL + '-' + 'a' * 32
 
 
 def function(name):
     return re.search(r'^' + name + r'\(\) \{\n.*?^\}', SOURCE, re.M | re.S).group()
 
 
-HELPERS = '\n'.join(function(name) for name in (
-    'c0_validate_overlay_volume', 'c0_overlay_volume_for_container',
-    'c0_overlay_selection_path', 'c0_write_overlay_selection',
-    'c0_read_overlay_selection', 'c0_stop_instance', 'c0_create_runtime'))
-STUBS = r'''
-C0ROOT="$TEST_ROOT"
-C0_INSTANCE_ID="$TEST_INSTANCE"
-MAIN_SERVICE=c0dev
-c0_require_docker() { return 0; }
-c0_validate_container_mounts() { return 0; }
-get_c0_container_id_any() { [[ -f "$TEST_ROOT/removed" ]] || echo existing; return 0; }
-docker() {
-    case "$1:$2" in
-        inspect:-f)
-            # No stale container label may override the actual mounted volume.
-            [[ "$3" != *Config.Labels* ]] || return 91
-            printf '%s\n' "$TEST_ACTUAL"
-            ;;
-        volume:inspect)
-            case "$*" in
-                *c0dev.instance*) printf '%s\n' "$TEST_OWNER" ;;
-                *c0dev.overlay_generation*) printf '%s\n' "${TEST_ACTUAL##*-}" ;;
-                *) [[ "$TEST_MISSING" != yes ]] ;;
-            esac
-            ;;
-        stop:*) printf 'stop:%s\n' "$2" >>"$TEST_ROOT/trace" ;;
-        rm:*)
-            printf 'rm:%s\n' "$2" >>"$TEST_ROOT/trace"
-            touch "$TEST_ROOT/removed"
-            ;;
-        *) echo "unexpected Docker call: $*" >&2; return 92 ;;
-    esac
-}
-dc() { printf '%s\t%s\n' "$C0_HOME_OVERLAYS_VOLUME" "$C0_HOME_OVERLAYS_EXTERNAL" >>"$TEST_ROOT/trace"; }
-'''
-
-
 class OverlayStorage(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix='c0-storage-selection-')
-        self.root = Path(self.directory.name)
-        self.record = self.root / '.local/c0' / (INSTANCE + '.home-overlays-volume')
+    def discover(self, volumes):
+        with tempfile.TemporaryDirectory(prefix='c0-docker-storage-') as directory:
+            root = Path(directory)
+            binary = root / 'docker'
+            binary.write_text('#!' + sys.executable + '\n' + r'''
+import json, os, sys
+args = sys.argv[1:]
+volumes = json.loads(os.environ['TEST_VOLUMES'])
+if args[:2] == ['volume', 'ls']:
+    print('\n'.join(volumes))
+elif args[:2] == ['volume', 'inspect']:
+    labels = volumes[args[-1]]
+    expression = args[3]
+    for key in ('c0dev.instance', 'c0dev.overlay_generation', 'c0dev.overlay_source'):
+        if key in expression:
+            print(labels.get(key, '<no value>'))
+            break
+    else: sys.exit(2)
+else: sys.exit('unexpected mutation: '+repr(args))
+''')
+            binary.chmod(0o755)
+            script = '\n'.join(function(name) for name in
+                               ('c0_validate_overlay_volume', 'c0_discover_home_storage'))
+            script += '\nC0_WORKSPACE_ID=workspace\nC0_INSTANCE_ID=build-workspace\nc0_discover_home_storage\n'
+            result = subprocess.run(['/bin/bash', '-c', script], capture_output=True,
+                                    text=True, timeout=5,
+                                    env=dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
+                                             TEST_VOLUMES=json.dumps(volumes)), cwd=root)
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ['docker'])
+            return result
 
-    def tearDown(self):
-        self.directory.cleanup()
-
-    def run_script(self, script, *, actual=GENERATION, owner=INSTANCE, missing=False):
-        env = dict(os.environ, TEST_ROOT=str(self.root), TEST_INSTANCE=INSTANCE,
-                   TEST_ACTUAL=actual, TEST_OWNER=owner,
-                   TEST_MISSING='yes' if missing else 'no',
-                   C0_HOME_OVERLAYS_VOLUME='caller-controlled-volume',
-                   C0_HOME_OVERLAYS_EXTERNAL='caller-controlled-value')
-        return subprocess.run(['/bin/bash', '-c', HELPERS + '\n' + STUBS + '\n' + script],
-                              env=env, cwd=self.root, capture_output=True, text=True, timeout=5)
-
-    def write_record(self, payload):
-        self.record.parent.mkdir(parents=True, exist_ok=True)
-        self.record.write_text(payload)
-
-    def trace(self):
-        path = self.root / 'trace'
-        return path.read_text().splitlines() if path.exists() else []
-
-    def test_first_creation_uses_canonical_defaults_and_ignores_caller_overrides(self):
-        result = self.run_script('c0_create_runtime fresh-runtime')
+    def test_first_creation_uses_deterministic_workspace_name(self):
+        result = self.discover({})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.trace(), [CANONICAL + '\tfalse'])
+        self.assertEqual(result.stdout, 'workspace-home-overlays\tfalse\n')
 
-    def test_stop_records_actual_volume_before_removal_then_fresh_creation_reuses_it(self):
-        self.write_record(CANONICAL + '\n')
-        result = self.run_script('c0_stop_instance && c0_create_runtime fresh-runtime')
+    def test_existing_canonical_volume_is_external(self):
+        result = self.discover({'workspace-home-overlays': {}})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.record.read_text(), GENERATION + '\n')
-        self.assertEqual(stat.S_IMODE(self.record.stat().st_mode), 0o600)
-        self.assertEqual(self.trace(), ['stop:existing', 'rm:existing', GENERATION + '\ttrue'])
-        self.assertEqual(list(self.record.parent.glob('.home-overlays.*')), [])
+        self.assertEqual(result.stdout, 'workspace-home-overlays\ttrue\n')
 
-    def test_canonical_record_is_external_after_stop_so_missing_data_is_not_recreated(self):
-        result = self.run_script('c0_stop_instance && c0_create_runtime fresh-runtime', actual=CANONICAL)
+    def test_existing_lineage_selects_unique_leaf_without_recency(self):
+        first = 'workspace-home-overlays-' + 'a' * 32
+        second = 'workspace-home-overlays-' + 'b' * 32
+        volumes = {'workspace-home-overlays': {},
+                   first: {'c0dev.instance': 'workspace', 'c0dev.overlay_generation': 'a' * 32,
+                           'c0dev.overlay_source': 'workspace-home-overlays'},
+                   second: {'c0dev.instance': 'workspace', 'c0dev.overlay_generation': 'b' * 32,
+                            'c0dev.overlay_source': first}}
+        result = self.discover(volumes)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.trace(), ['stop:existing', 'rm:existing', CANONICAL + '\ttrue'])
-        result = self.run_script('c0_create_runtime fresh-runtime', actual=CANONICAL, missing=True)
+        self.assertEqual(result.stdout, second + '\ttrue\n')
+
+    def test_ambiguous_branches_preserve_every_volume(self):
+        volumes = {'workspace-home-overlays': {}}
+        for suffix in ('a' * 32, 'b' * 32):
+            volumes['workspace-home-overlays-' + suffix] = {
+                'c0dev.instance': 'workspace', 'c0dev.overlay_generation': suffix,
+                'c0dev.overlay_source': 'workspace-home-overlays'}
+        result = self.discover(volumes)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('selected home-overlay volume is missing', result.stderr)
-        self.assertEqual(len(self.trace()), 3)
+        self.assertIn('ambiguous home storage', result.stderr)
+        self.assertEqual(result.stdout, '')
 
-    def test_selection_write_failure_does_not_stop_or_remove_the_container(self):
-        result = self.run_script('c0_write_overlay_selection() { return 17; }; c0_stop_instance')
+    def test_foreign_volume_is_not_adopted(self):
+        result = self.discover({'workspace-home-overlays-' + 'a' * 32: {
+            'c0dev.instance': 'another-workspace', 'c0dev.overlay_generation': 'a' * 32}})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('container was left unchanged', result.stderr)
-        self.assertEqual(self.trace(), [])
-        self.assertFalse((self.root / 'removed').exists())
+        self.assertIn('another checkout', result.stderr)
 
-    def test_existing_container_corrects_a_malformed_record_from_its_actual_mount(self):
-        self.write_record('obsolete-not-a-volume\n')
-        result = self.run_script('c0_stop_instance')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.record.read_text(), GENERATION + '\n')
 
-    def test_missing_foreign_or_malformed_record_cannot_create_an_empty_replacement(self):
-        cases = ((GENERATION + '\n', INSTANCE, True),
-                 (GENERATION + '\n', 'another-checkout', False),
-                 (GENERATION + '\n' + CANONICAL + '\n', INSTANCE, False),
-                 ('$(touch SHOULD_NOT_RUN)\n', INSTANCE, False))
-        for payload, owner, missing in cases:
-            with self.subTest(payload=payload, owner=owner, missing=missing):
-                self.write_record(payload)
-                result = self.run_script('c0_create_runtime fresh-runtime', owner=owner, missing=missing)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self.trace(), [])
-                self.assertEqual(self.record.read_text(), payload)
-        self.assertFalse((self.root / 'SHOULD_NOT_RUN').exists())
-
-    def test_symlink_selection_is_not_followed_or_overwritten(self):
-        self.record.parent.mkdir(parents=True)
-        target = self.root / 'unrelated-data'
-        target.write_text('keep-me')
-        self.record.symlink_to(target)
-        for operation in ('c0_read_overlay_selection', 'c0_stop_instance'):
-            with self.subTest(operation=operation):
-                result = self.run_script(operation)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self.trace(), [])
-                self.assertEqual(target.read_text(), 'keep-me')
-                self.assertTrue(self.record.is_symlink())
+@unittest.skipUnless(os.environ.get('C0_BUILD_DOCKER_TESTS') == '1', 'opt-in owned Docker volumes')
+class DockerStorage(unittest.TestCase):
+    def test_legacy_volume_data_is_derived_after_container_removal(self):
+        docker = shutil.which('docker')
+        self.assertTrue(docker)
+        def call(*args, **kwargs):
+            return subprocess.run([docker, *args], capture_output=True, text=True, timeout=30, **kwargs)
+        if call('image', 'inspect', 'alpine:latest').returncode:
+            self.skipTest('cached alpine required; refusing to pull')
+        token = uuid.uuid4().hex
+        workspace = 'c0-storage-proof-' + token
+        canonical = workspace + '-home-overlays'
+        generation = uuid.uuid4().hex
+        leaf = canonical + '-' + generation
+        volumes = [canonical, leaf]
+        containers = []
+        def check(result):
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+        try:
+            check(call('volume', 'create', '--label', 'c0dev.storage_test=' + token, canonical))
+            check(call('volume', 'create', '--label', 'c0dev.storage_test=' + token,
+                       '--label', 'c0dev.instance=' + workspace,
+                       '--label', 'c0dev.overlay_generation=' + generation,
+                       '--label', 'c0dev.overlay_source=' + canonical, leaf))
+            for volume, marker in ((canonical, 'backup'), (leaf, 'guest-stage-and-launcher')):
+                check(call('run', '--rm', '--pull=never', '--network', 'none',
+                           '-v', volume + ':/state', 'alpine:latest', 'sh', '-ec',
+                           'printf "%s" "$1" >/state/data', 'write-data', marker))
+            backup = check(call('create', '--pull=never', '--network', 'none',
+                                '--label', 'c0dev.storage_test=' + token,
+                                '-v', canonical + ':/state', 'alpine:latest', 'true'))
+            containers.append(backup)
+            backup_before = check(call('inspect', backup))
+            old = check(call('create', '--pull=never', '--network', 'none',
+                             '--label', 'c0dev.storage_test=' + token,
+                             '-v', leaf + ':/state', 'alpine:latest', 'true'))
+            containers.append(old)
+            script = '\n'.join(function(name) for name in
+                               ('c0_validate_overlay_volume', 'c0_discover_home_storage'))
+            script += '\nC0_WORKSPACE_ID="$TEST_WORKSPACE"\nC0_INSTANCE_ID=build-workspace\nc0_discover_home_storage\n'
+            env = dict(os.environ, TEST_WORKSPACE=workspace)
+            with tempfile.TemporaryDirectory(prefix='c0-derived-storage-proof-') as temporary:
+                for remove in (False, True):
+                    if remove:
+                        check(call('rm', old))
+                        containers.remove(old)
+                    selected = subprocess.run(['/bin/bash', '-c', script], env=env, cwd=temporary,
+                                              capture_output=True, text=True, timeout=30)
+                    self.assertEqual(selected.returncode, 0, selected.stderr)
+                    self.assertEqual(selected.stdout, leaf + '\ttrue\n')
+                    self.assertEqual(list(Path(temporary).iterdir()), [])
+                data = check(call('run', '--rm', '--pull=never', '--network', 'none',
+                                  '-v', leaf + ':/state:ro', 'alpine:latest', 'cat', '/state/data'))
+                self.assertEqual(data, 'guest-stage-and-launcher')
+                self.assertEqual(check(call('inspect', backup)), backup_before)
+                self.assertEqual(check(call('run', '--rm', '--pull=never', '--network', 'none',
+                     '-v', canonical + ':/state:ro', 'alpine:latest', 'cat', '/state/data')), 'backup')
+        finally:
+            for cid in containers:
+                ownership = call('inspect', '--format', '{{index .Config.Labels "c0dev.storage_test"}}', cid)
+                if ownership.returncode == 0 and ownership.stdout.strip() == token:
+                    call('rm', '-f', cid)
+            for volume in volumes:
+                ownership = call('volume', 'inspect', '--format', '{{index .Labels "c0dev.storage_test"}}', volume)
+                if ownership.returncode == 0 and ownership.stdout.strip() == token:
+                    call('volume', 'rm', volume)
 
 
 if __name__ == '__main__':

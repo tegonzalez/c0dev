@@ -4,64 +4,25 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 # c0dev Constraints
 
-## Purpose
-
-Record the forbidden architectures, repeated failure modes, detection signals, and replacement guidance required by authors implementing, extending, or reconsidering c0dev.
-
-## Audience
-
-This document is for authors changing the runtime, build pipeline, tool lifecycle, storage layout, host mounts, or security profile.
-
 ## Constraints
 
-### `C0-C001` Writable Canonical Store In Runtime
-
-Mounting complete tools read-write in the runtime lets a compromised `dev` or `c0 root` process replace shared executables and resources. Detect any runtime mount of a selected prefix without `ro`. Mount only `/tools/opt/<TOOLS_ID>` at `/tools/current:ro`; runtime changes belong in the OverlayFS upper.
-
-### `C0-C002` Networked Installer With Whole-Store Write Access
-
-Giving runtime updater code the tools volume read-write lets an upstream compromise alter complete snapshots, pins, or other workspaces. Detect any networked runtime or updater with shared-volume write access. Runtime code writes only the upper; a fixed networkless host publisher alone receives tools-volume write authority after explicit acceptance.
-
-### `C0-C003` In-Place Published Tool Mutation
-
-Updating a complete selected prefix in place produces mixed versions and exposes partial state. Detect writes beneath a path containing `.c0dev-complete`. Acceptance must copy the selected snapshot to a new 64-hex identity, replace overlaid paths in the unpublished copy, write completeness last, and update the checkout pin afterward.
-
-### `C0-C004` Tools Command As A Second Build System
-
-Making `c0 tools` rebuild Dockerfiles or invoke a second installer path conflates construction with writable-stage disposition. Detect build flags, selectors, or package-manager orchestration beneath `c0 tools`. Keep construction in `c0 build [-f]`; reserve `c0 tools` for display, acceptance, and restoration.
-
-### `C0-C005` Root Tool Installation
-
-Installing language and assistant tools as root during the image tools stage expands authority and hides ownership defects. Detect builder-created payload owned by UID 0. Run non-apt Dockerfile tool installers after `USER dev`; runtime `c0 root` remains constrained and can write only its stage.
-
-### `C0-C006` Installer Publication Authority
-
-Letting a runtime installer update pins or completeness metadata allows fetched code to self-approve. Detect guest access to tools metadata or the Docker socket. Only explicit host `c0 tools accept` may invoke the fixed networkless publisher.
-
-### `C0-C007` Unresolved Latest In Canonical Identity
-
-Building `latest` under a stable Dockerfile hash can produce different payloads for identical `TOOLS_BUILD_ID` inputs. Detect mutable build selectors when strict reproducibility is claimed. Accepted snapshots receive independent identities, but this does not make the original build reproducible.
-
-### `C0-C008` Hidden Stage Scope
-
-Classifying only packaged-path overrides hides upper-only files that acceptance or restoration will also affect. Detect counters without a complete path view. `c0 tools --detail` must enumerate every staged non-directory entry, deletion marker, opaque directory, and added directory that the operation can observe.
-
-### `C0-C009` Guest Mount Or Publication Capability
-
-Granting `SYS_ADMIN`, Docker socket access, namespace entry, or store publication to the long-running runtime defeats the established boundary. Detect those authorities on the runtime container or its processes. Overlay mount and snapshot operations may use only the documented short-lived, networkless host-launched helper; publication remains a separate networkless process without mount-namespace authority.
-
-### `C0-C010` Hidden Host Orchestrator Delta
-
-Special-casing `bin/` as a read-only bind or OverlayFS upper so guest writes never hit the host checkout hides `c0` mutation from the same git working tree that guards the rest of the tree. Detect `:ro` or an overlay on `/home/dev/bin` while sibling host folders remain read-write binds. Mount `bin/` read-write like `.claude`; a guest edit of tracked `bin/c0` is a host git delta.
-
-### `C0-C011` Aggressive Garbage Collection
-
-Deleting a hash referenced by a valid checkout pin or running-container label breaks selected commands. Detect GC reachability that ignores either protection source. Retain pinned and active snapshots; incomplete non-selected paths may be cleaned separately.
-
-### `C0-C012` Canonical Integrity Claimed From PATH Alone
-
-Placing a mutable user directory before canonical binaries silently changes the effective tool while the store remains intact. Detect undocumented PATH precedence or mutable shims presented as canonical integrity. Prefer canonical paths by default and make user-channel overrides explicit and diagnosable.
-
-### `C0-C013` Persistent Ad Hoc Runtime Package Drift
-
-Treating `c0 root` package changes as reproducible state makes destructive recreation surprising and may invalidate the built runtime ABI. Detect claims that live `apt` changes alter image or toolset identity. Treat them as runtime-layer administration; persistent OS changes belong in the runtime build inputs.
+- **writable-canonical-store**: A guest-writable selected tools snapshot lets ordinary or guest-root code replace shared executables; detect effective mount permissions for every guest identity. Mount only the selected snapshot read-only and place native tool changes in the writable stage.
+- **networked-store-writer**: Combining fetched code or network acquisition with whole-store write authority lets upstream code publish itself; detect any installer or updater with a writable tools-volume mount. Separate acquisition from fixed, networkless host publication.
+- **published-payload-mutation**: Writing a complete referenced payload in place exposes mixed content under an unchanged identity; detect writes or rotation while any container or published image references that identity. Publish a separate complete candidate and retain referenced and uncertain content.
+- **stage-command-installer**: Making stage inspection, acceptance, or restoration resolve releases or run installers creates another construction path; detect software acquisition, installer execution, or default-tool construction caused by these commands. Keep default-tool construction in the build command and retain acceptance's fixed networkless derived-runtime-image publication.
+- **root-tool-builder**: Running non-system tool installers as root enlarges their authority and obscures ownership defects; detect root-owned default user-tool payload or root installer execution. Install user tools under the unprivileged build identity and keep system-package setup separately scoped.
+- **self-authorized-publication**: Letting guest code select publisher source or write publication metadata converts runtime changes into host authority; detect guest-writable executing code, image-selection metadata, or daemon access. Require an explicit host action using protected launcher and publisher inputs.
+- **recipe-only-identity**: Reusing a recipe hash after resolved releases change silently selects old tools; detect a release-manifest change that leaves the completed build identity unchanged. Bind identity and reuse validation to both the recipe and exact resolved manifest.
+- **hidden-stage-scope**: Reporting only known packaged files hides additions, deletion markers, or opaque directories affected by whole-stage operations; compare the complete observable upper with the detailed stage report. Keep stage reporting complete and retain launcher state as a separately scoped overlay.
+- **runtime-mount-authority**: Giving the long-running guest a privileged container, daemon socket, host namespace, or mount-administration capability defeats containment; inspect actual process, mount, namespace, and capability state. Limit namespace operations to short-lived host helpers with the exact required mounts, capabilities, and lifetime.
+- **guest-writable-host-orchestrator**: A guest write to host launcher, publisher, entrypoint, security-policy, or Git-configuration inputs can become later host execution; detect writable aliases and effective destinations, not just a read-only bind flag. Keep the host launcher lower read-only and guest launcher edits in their own persistent overlay.
+- **incomplete-garbage-collection-protection**: Collecting a payload referenced by a stopped container or published image breaks retained consumers; detect reachability that omits either resource class or treats a failed inventory as empty. Protect all container and image references and delete only positively identified unreferenced rebuildable cache content, retaining accepted and unknown data.
+- **path-only-default-integrity**: An unchanged read-only store does not establish the effective command when mutable launchers shadow it; detect selected Node, Python, and package-manager commands that disagree with the mounted manifest. Preserve manifest-bound defaults and explicit per-session alternatives without deleting user state.
+- **runtime-administration-as-build-state**: Treating live system-package changes as image provenance makes destructive lifecycle replacement surprising; detect claims that guest administration updates the published image. Keep durable operating-system defaults in build inputs and state the disposable guest-layer boundary.
+- **excess-process-authority**: Reusing a helper's privileges for routine execution enlarges the feature's attack surface; compare each role's actual capabilities, UID, seccomp, descriptors, network, and mounts with its required operation. Keep routine work unprivileged and separately justify every helper permission with accepted and refused behavior.
+- **undeclared-host-exposure**: Broad host-home binds, remote daemon endpoints, inherited credentials, agent forwarding, or network publication can expose unrelated host authority; inspect resolved source, destination, access mode, endpoint, and recipient. Admit only the declared feature surfaces and preserve deliberate durable configuration and data mounts.
+- **secret-bearing-observability**: Credential values in argv, diagnostics, traces, reports, events, build output, or persistent artifacts create secondary disclosure; verify handling with synthetic secrets across success and failure. Keep sensitive values out of recorded surfaces and expose only bounded sanitized causes and nonsecret identifiers.
+- **secret-bearing-version-control**: Ignore rules do not prevent already tracked or force-added secrets from entering history; inspect the exact proposed tracked content and outgoing history without echoing secret values. Block credentials, private keys, private user files, and secret-bearing build contexts before commit or publication.
+- **unverified-acquisition**: A version label, HTTPS transport, or a successful installer does not verify every consumed software input; detect acquisitions and transitive downloads not bound to trusted expected content or supported native proof. Establish integrity before consumption and record unverified routes as release-blocking coverage gaps.
+- **vulnerable-release**: A severity filter, missing fix, successful build, or old clean scan cannot clear a known applicable vulnerability in a release. Apply the specification's release-security gate to the exact source and delivered artifacts, refusing known applicable findings and incomplete evidence.
+- **unsafe-host-command-effects**: Broad cleanup, unbound process signals, path traversal, symlink redirection, and untrusted shell interpretation can turn a host command into unrelated host mutation; test these effects with owned fixtures and literal inputs. Require resource ownership and identity before every destructive effect and retain uncertain state on failure.

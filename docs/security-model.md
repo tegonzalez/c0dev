@@ -6,81 +6,100 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 ## Purpose
 
-Define the trust boundaries, capabilities, storage authority, and residual risks of runtime tool staging and host-authorized acceptance.
+Explain the trust boundaries of the current host launcher, development guest, durable mounts, helper processes, software inputs, and tools publication. [Specification containment](spec.md#containment), [private-data requirements](spec.md#private-data), and [release security](spec.md#release-security) own the required hardened baseline. Configuration and source observations below are not deployed-state verification or release clearance.
+
+## Terminology
+
+| Term                 | Meaning                                                                                                                          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Guest administration | Explicit UID-0 execution inside the guest's existing restrictions.                                                               |
+| Host authority       | Owning-account and Docker-daemon ability to change host resources and launch helpers.                                            |
+| Tools publication    | Fixed host-controlled production of a new complete payload and derived runtime artifact.                                         |
+| Secret               | Credential, private key, token, or private user content requiring restricted disclosure.                                         |
+| Integrity proof      | Verification of exact input bytes against independently trusted expected content or supported native signature/repository proof. |
 
 ## Threat Model
 
-| Boundary     | Scope                                                                                                                       |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| In scope     | Compromised runtime process, fetched updater code, accidental snapshot corruption, privilege expansion, cross-snapshot read |
-| Out of scope | Operator controlling Docker or macOS, compromised OrbStack VM/kernel, trusted build-input compromise                        |
-| Assumption   | One human owns the checkout; Docker and OrbStack are trusted infrastructure                                                 |
+| Boundary     | Scope                                                                                                                                           |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| In scope     | Compromised guest/agent/updater, accidental host-resource damage, credential disclosure, vulnerable embedded software, and authority expansion. |
+| Out of scope | A malicious owning host account or Docker operator, or a compromised host/VM kernel.                                                            |
+| Premise      | Docker and the platform enforce their declared isolation; host execution uses independently protected source.                                   |
 
-The objective is to keep runtime and updater authority from becoming Docker or tools-volume publication authority. c0dev is not a multi-tenant sandbox and does not protect mounted user data from code intentionally run in the guest.
+This is a single-user development environment, not a multi-tenant sandbox. Deliberately writable host mounts are real host authority, and their contents are readable by guest code. A read-only mount removes a write route but does not protect confidentiality. Docker identifies daemon access and added capabilities as material security boundaries; see [Docker Engine security](https://docs.docker.com/engine/security/).
 
 ## Process Variants
 
-| Kind              | Lifetime   | UID      | Capabilities                                                                                         | Seccomp/NNP          | Network      | Writable authority                              |
-| ----------------  | ---------- | -------- | ---------------------------------------------------------------------------------------------------- | -------------------- | ------------ | ----------------------------------------------- |
-| Build             | Ephemeral  | root/dev | Docker build profile; non-apt tool installers run after `USER dev`                                   | Build profile        | Fetch        | Image layers and unpublished extraction path    |
-| Runtime           | Long-lived | 1000     | Effective/permitted zero; bounded runtime admin set                                                  | Project seccomp; NNP | Guest egress | Runtime layer, host RW mounts, overlay stage    |
-| Runtime root lane | Exec only  | 0        | `CHOWN`, `DAC_OVERRIDE`, `FOWNER`; no `SYS_ADMIN`, Docker socket, or publication authority           | Same as runtime      | Guest egress | Runtime layer, host RW mounts, overlay stage    |
-| Overlay helper    | Ephemeral  | 0        | `SYS_ADMIN`, `SYS_PTRACE`, `SYS_CHROOT`, DAC read/write, ownership caps; unconfined seccomp; NNP     | Unconfined; NNP      | None         | Runtime mount namespace and overlay upper/work  |
-| Snapshot helper   | Ephemeral  | 0        | Mount-namespace entry and read capabilities; unconfined seccomp; NNP                                 | Unconfined; NNP      | None         | Host-owned temporary archive stream             |
-| Publisher         | Ephemeral  | 0        | `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`; no `SYS_ADMIN`; read-only root filesystem; NNP | Default helper       | None         | Tools `opt`, `tmp`, and checkout pin metadata   |
+The following profiles are source-configured by [Compose](../docker/docker-compose.security-permissive.yaml) and [host helper construction](../bin/c0). Actual restrictions require separate native observations.
 
-The helper capability increase exists only in host-launched one-shot containers. PID 1 and user processes in the runtime never receive those capabilities. A rogue runtime must first cross a kernel or Docker boundary; it cannot obtain helper authority by compromising runtime PID 1 alone.
+| Kind                    | Identity and capabilities                                                              | Seccomp / privilege escalation        | Network              | Writable scope                                         |
+| ----------------------- | -------------------------------------------------------------------------------------- | ------------------------------------- | -------------------- | ------------------------------------------------------ |
+| Build                   | System setup root; user-tool installation dev                                          | Docker build profile                  | Declared acquisition | Build layers and unpublished payload                   |
+| Runtime dev             | UID 1000; ordinary effective/permitted capabilities expected zero                      | Project seccomp; no-new-privileges    | Guest egress         | Container layer, declared writable host mounts, uppers |
+| Explicit guest root     | UID 0; runtime bound includes CHOWN, DAC_OVERRIDE, FOWNER                              | Runtime profile; no-new-privileges    | Guest egress         | Same guest/host mount view; no publication             |
+| Overlay helper          | UID 0; SYS_ADMIN, SYS_PTRACE, SYS_CHROOT, DAC_OVERRIDE, DAC_READ_SEARCH, CHOWN, FOWNER | Unconfined seccomp; no-new-privileges | None                 | Exact runtime mount namespace and overlay storage      |
+| Snapshot helper         | UID 0; SYS_ADMIN, SYS_PTRACE, SYS_CHROOT, DAC_OVERRIDE, DAC_READ_SEARCH                | Unconfined seccomp; no-new-privileges | None                 | Owned host archive stream                              |
+| Tools publisher         | UID 0; CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER                                    | Read-only root; no-new-privileges     | None                 | Unpublished/new tools payload                          |
+| Restore/GC helper       | UID 0; DAC_OVERRIDE, FOWNER for classified removal                                     | Fixed host helper; no-new-privileges  | None                 | Proven owned clear/cache paths                         |
+| Derived-image publisher | Host-controlled Docker build                                                           | Parent image configuration retained   | None                 | New runtime image and Docker publication tags          |
+
+Namespace mount and snapshot helpers bind the original helper root and proc directory by held descriptors before namespace entry; executable and loader resolution stays in that helper root. The guest root is only a data/mount target, not the source of privileged shell programs. Build payload extraction uses a never-started, store-less source container; only a fixed base-image publisher receives writable candidate access, with no network and only CHOWN, DAC_OVERRIDE, and FOWNER added to the dropped capability set.
+
+The named `cap-drop-all` profile currently restores the same guest-admin capability bound as `permissive`; its name is not evidence of a stricter profile. Helper privileges and unconfined seccomp require operation-specific necessity evidence, not a claim that every process is capability-free. Guest-root administration remains supported without privileged containers or daemon access.
 
 ## Storage Boundaries
 
-| Surface                        | Runtime access                            | Helper/publisher access                                      | Purpose                                                            |
-| ------------------------------ | --------------                            | ---------------------------                                  | ------------------------------------------------------------------ |
-| Selected `/tools/opt/<id>`     | `/tools/current:ro` only                  | Snapshot helper reads; publisher copies                      | Prevent runtime mutation and cross-snapshot browsing               |
-| Other tools snapshots/metadata | Absent                                    | Host volume helpers only                                     | Prevent one runtime from reading accepted state from another       |
-| Overlay upper/work volume      | RW through merged home and internal mount | Overlay/snapshot helper                                      | Persist runtime writes without weakening selected snapshot         |
-| Host config/cache/XDG state    | Declared RW                               | Absent from publisher except when also written under overlay | Preserve ordinary user state directly on host                      |
-| Docker socket                  | Absent                                    | Host c0 invokes Docker                                       | Prevent guest-to-daemon privilege expansion                        |
-| SSH agent                      | Runtime relay when enabled                | Absent from helpers/publisher                                | Keep publication processes credentialless                          |
+| Surface                          | Guest authority                                                 | Interpretation                                                                                                |
+| -------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Selected tools                   | Selected subpath read-only at `/tools/current`                  | Guest cannot modify lower content or browse other store paths through this mount.                             |
+| Tools upper/work                 | Workspace volume exposed through configured overlays            | Native tool writes persist across ordinary replacement; tools restore deliberately discards its scoped upper. |
+| Host launcher lower              | Read-only `/run/c0/host-bin`                                    | Guest launcher writes go to separate persistent upper, not host scripts.                                      |
+| Host control files               | Git configuration, entrypoint, overlay policy/checker read-only | Their integrity still depends on no writable alias or alternate host execution source.                        |
+| Configuration, caches, projects  | Declared host read/write mounts                                 | Required durability intentionally exposes these data to guest code.                                           |
+| Selected auth directory          | Current host SSH bind is writable                               | Private/client-key separation and narrower access are not established by the bind.                            |
+| Tools metadata and Docker socket | Absent from guest                                               | Host commands alone coordinate publication and collection.                                                    |
 
-## Acceptance Boundary
+Host path validation, symlink/alias handling, Docker attribution, and exact resource references must be considered together. A label or path prefix alone is insufficient authority for host deletion, signaling, or namespace entry. Storage preservation and publication rules belong to the [tools contract](tool-store-contract.md).
 
-Runtime updaters execute with the runtime's network and data authority. They can corrupt the stage, consume resources, and write any host surface already exposed to the guest. They cannot mark their output accepted or write the tools volume.
+## Credentials And Observability
 
-`c0 tools accept` is the operator authorization event. The runtime is paused while the namespace helper reads the merged overlay, then resumed before the publisher runs. The publisher receives the captured archives read-only and the tools volume read-write, has no network, and executes fixed host-controlled code. Completeness is written last and the pin changes afterward.
+SSH key/config creation and Orca log access use descriptor-bound host I/O. Descendant symlinks, non-regular files, and multiply linked files refuse; config replacement and log reads/reset do not follow guest-selected host redirects. These checks preserve ordinary file contents and durability but are not secret-content classification or a change to which auth material the guest receives.
 
-Acceptance approves the whole stage, not a tool-specific subset. Consequently, direct writers may place credentials, logs, databases, bytecode, or configuration into an accepted snapshot. The runtime mounts only its selected subpath to prevent cross-checkout browsing, but the Docker operator can inspect every volume and remains out of scope.
+The launcher reads optional host auth values for attachments; shell/root exec currently transports values through Docker environment arguments, while SSH uses per-attachment environment forwarding. SSH daemon configuration currently admits broad environment forwarding. These are exposure surfaces requiring synthetic-value verification, not evidence that values are absent from process listings or diagnostic output.
 
-## Restore Boundary
+The OrbStack agent relay exposes signing capability to the guest when enabled; `C0_SSH_AGENT=0` disables it. Keeping a key file on the host does not prevent guest use of a forwarded agent. Scope recipients and lifetime to the feature and avoid unnecessary forwarding.
 
-`c0 tools restore` is an explicit destructive host operation. It removes the runtime before clearing upper/work state, retains the selected immutable snapshot, and recreates the runtime. It never modifies the selected snapshot or direct host paths outside the overlay volume.
+The repository ignores `auth/` and common user-state paths. Ignore rules do not untrack committed content or establish that outgoing history, logs, build contexts, snapshots, and bundles contain no secrets. A detailed tools report lists paths, not secret-free contents. Actual secrets must never be reproduced to demonstrate a failure; verification uses synthetic values.
 
-## Residual Risks
+## Software Inputs And Release Evidence
 
-| Risk                          | Exposure                                                                        | Control                                                                   |
-| ----------------------------- | ------------------------------------------------------------------------------  | ------------------------------------------------------------------------  |
-| Linux kernel or Docker escape | Helpers and runtimes share the OrbStack VM kernel                               | Short lifetimes, no helper network, NNP, narrow mounts, updated platform  |
-| Whole-stage secret acceptance | Native non-XDG state may enter the accepted snapshot                            | Full `--detail` display, explicit accept, selected-subpath runtime mount  |
-| Writable guest host mounts    | Agent can alter projects, configuration, credentials, and host helper scripts   | Deliberate single-user scope; minimize mounts and credentials             |
-| Publisher snapshot integrity  | Runtime controls staged content and filenames                                   | Paused capture, path validation, fixed extraction root, completeness-last |
-| Runtime apt drift             | Ad hoc libraries can diverge from the built ABI                                 | Treat as ephemeral; rebuild image for persistence                         |
-| Accepted binary provenance    | Accepted snapshot records parent and archive digest, not source reproducibility | Build toolsets remain separate; accept is explicit operator authority     |
+The current resolver captures selected toolchain releases and enforces version/security floors. Some Dockerfile paths still execute upstream installers, resolve unconstrained dependencies, or install runtime assistant globals from floating selectors. Recipe hashes, final-version checks, and manifest equality identify selected inputs but do not authenticate every fetched or compiled byte.
 
-## Operational Verification
+The required release gate covers complete final content and build/helper execution inputs. Vulnerability inventory must account for OS packages, language dependencies, bundled interpreters, static native dependencies, vendored assets, and external installers. [OSV's image-scanning documentation](https://google.github.io/osv-scanner/usage/scan-image) describes OS/build-artifact identification in images; its [supported-artifact inventory](https://google.github.io/osv-scanner/supported-languages-and-lockfiles/) also makes coverage a concrete tooling question. Neither one scanner nor a clean lockfile report establishes full candidate coverage.
 
-```bash
-c0 status
-c0 tools
-c0 tools --detail
-c0 ssh 'grep -E "^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):" /proc/1/status'
-c0 ssh 'findmnt -T /tools/current -n -o TARGET,FSTYPE,OPTIONS'
-```
+[CISA's Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) supplies exploitation evidence. It supplements vendor, distribution, and ecosystem advisories rather than defining the complete vulnerability set. Exact applicability, fixed/backported versions, and withdrawn findings require evidence; severity and convenience do not waive the specification's gate.
 
-Expected runtime evidence is a read-only `/tools/current`, no `/tools/opt` or tools metadata mount, zero effective/permitted capabilities for PID 1, NNP enabled, seccomp filtering enabled, and no Docker socket or mount capability.
+## Acceptance And Restore Boundaries
 
-## Failure Response
+Runtime updaters retain guest filesystem/network authority and can alter declared writable host data. Networkless publication limits the publisher's egress and separates it from the running guest; it does not prove the submitted stage benign or free of private content. Capturing a paused view prevents ordinary guest writes during capture but is not cryptographic source provenance.
 
-- Writable selected mount: stop the guest and reject startup.
-- Snapshot failure: resume runtime and retain stage and selection.
-- Publisher failure: retain prior selection and complete stage.
-- Incomplete selected ID: warn and fall back to the complete build toolset.
-- Uncertain pin or active-use protection: collect nothing.
+Acceptance publishes immutable tools and a derived runtime reference without replacing the running guest or clearing its stage. Restore stops and resumes the same guest and clears only tools state after selection/exclusivity proof. Launcher state and direct host data remain separate. Whole-stage capture can currently include non-XDG credentials, logs, or databases; that limitation does not authorize secret-bearing release artifacts.
+
+## Network Exposure
+
+SSH is loopback-published. The web service currently publishes a host port without a loopback-only address; `host.docker.internal` also reaches host services. Guest egress, service listeners, trusted X11 forwarding, and agent relay are separate access grants. The required narrow feature exposure is not established merely by the SSH binding or non-privileged UID.
+
+## Assurance Limits
+
+Current restore compares published selection only after a successful initial recipe-image inspection; absent/failed inspection skips that comparison in [the launcher](../bin/c0). It therefore does not demonstrate fail-closed publication inspection. This is a current implementation limit against the required hardened baseline, not permission to clear release assurance.
+
+| Required property                | Current source evidence and remaining limit                                                                                                                                   |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Minimum authority                | Runtime restrictions and separate fixed helper profiles exist; exhaustive feature-to-permission necessity and native per-role conformance are not established here.           |
+| Host containment                 | Protected launcher/control lowers and ownership-aware effects exist; declared writable data, host services, auth, agent access, and supported legacy layouts retain exposure. |
+| Input integrity                  | Canonical manifests and selected version/trust checks exist; executable installers, floating inputs, and transitive acquisitions lack complete origin-to-consumption proof.   |
+| Secret exclusion                 | Ignore patterns and scoped host workflows exist; no complete argv/log/history/context/snapshot/artifact exclusion result is supplied.                                         |
+| Vulnerability-free known content | No complete exact-artifact inventory, current advisory assessment, or enforced project release gate is supplied by this documentation change.                                 |
+| Narrow network surface           | Loopback SSH exists; web publication, guest-to-host services, egress, and forwarding require separate scope verification.                                                     |
+
+These are requirements and bounded source observations, not findings that a live secret disclosure, host compromise, or particular CVE has occurred. Changes to controls require functional accepted/refused cases and preservation of durable mounts and supported guest administration. A missing required release assurance blocks clearance even when ordinary commands work.

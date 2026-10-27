@@ -45,9 +45,10 @@ c0_publish_home_overlay_snapshot() {
     printf 'parent=%s\n' "$2" >>"$TRACE"
     return "$PUBLISH_STATUS"
 }
-compute_folder_id() { echo folder; }
-c0_read_tools_pin_strict() { echo "$SELECTED"; }
-write_pin_for_folder_id() { echo "pin=$2" >>"$TRACE"; }
+c0_accept_runtime_metadata() { echo parent-image-metadata; }
+c0_publish_accepted_runtime() { echo "artifact=$2" >>"$TRACE"; }
+c0_runtime_recipe_ref() { echo shared-runtime; }
+c0_resolve_shared_build() { TOOLS_BUILD_ID="$SELECTED"; }
 c0_overlay_volume_for_container() { echo stage-volume; }
 c0_clear_tools_stage() {
     printf 'clear=%s:%s\n' "$1" "$2" >>"$TRACE"
@@ -58,6 +59,7 @@ docker() {
     case "$1" in
         ps) echo container; if [ "$SHARED" = 1 ]; then echo retained-backup; fi ;;
         stop|start) printf '%s=%s\n' "$1" "$2" >>"$TRACE" ;;
+        image) [[ "$2" == inspect ]] ;;
         *) echo "unexpected Docker mutation: $*" >&2; return 99 ;;
     esac
 }
@@ -70,7 +72,7 @@ docker() {
         result, trace = self.exercise('cmd_tools_accept')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('parent=' + 'a' * 64, trace)
-        self.assertRegex(trace, r'pin=[a-f0-9]{64}')
+        self.assertRegex(trace, r'artifact=[a-f0-9]{64}')
         self.assertNotIn('stop=', trace)
         self.assertNotIn('clear=', trace)
         self.assertIn('fixed Docker mount cannot change in place', result.stderr)
@@ -78,7 +80,7 @@ docker() {
     def test_failed_publish_keeps_selection_and_guest_untouched(self):
         result, trace = self.exercise('cmd_tools_accept', publish_status=23)
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn('pin=', trace)
+        self.assertNotIn('artifact=', trace)
         self.assertNotIn('stop=', trace)
 
     def test_restore_stops_and_resumes_same_container(self):
@@ -103,7 +105,7 @@ docker() {
         result, trace = self.exercise('cmd_tools_restore', fail_clear=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('start=container\nready=container:true\n', trace)
-        self.assertNotIn('pin=', trace)
+        self.assertNotIn('artifact=', trace)
 
     def test_preexisting_generation_volume_requires_ownership_and_is_read_only_recognized(self):
         generation = 'c' * 32

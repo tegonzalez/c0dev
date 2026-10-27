@@ -1,169 +1,160 @@
 ---
 doc-graph: "When there is an intention to amend this document, first Adhere to [dc-doc-design]; otherwise, do not modify."
+dg-limit: words<=15000
 ---
 
-# c0dev Design
+# c0dev Architecture Design
 
 ## Purpose
 
-Define how c0dev combines an immutable selected tool snapshot with a persistent writable runtime stage while preserving a constrained long-running guest and a low-cognitive-load host interface.
+Explain how the host launcher, build pipeline, Docker guest, tools store, and workspace mounts realize the product model, while separating current mechanisms from security requirements without demonstrated enforcement.
 
 ## Orientation
 
-This document is for maintainers changing `bin/c0`, Compose mounts, overlay helpers, snapshot publication, or lifecycle behavior.
+This design serves maintainers of the current Bash launcher and Docker configuration. It preserves Docker-derived shared builds, workspace storage, protected host launcher inputs, and non-replacing tools operations. The [specification](spec.md) owns behavior and the release-security bar; implementation and a passing local test cannot weaken that bar. No optional-package subsystem or named-environment facade is part of this design.
 
 ## Terminology
 
-The [Specification](spec.md) defines runtime guest, selected snapshot, writable stage, and accepted snapshot. This design uses those terms without redefining them.
+| Term           | Meaning                                                                                 |
+| -------------- | --------------------------------------------------------------------------------------- |
+| Recipe         | Path-independent source identity of Dockerfiles and relevant copied inputs.             |
+| Manifest       | Canonical resolved release selections used by one build.                                |
+| Workspace      | Mode and real working folder sharing durable home storage.                              |
+| Instance       | Workspace and build identifying a runtime container.                                    |
+| Launcher upper | Persistent guest edits over the read-only host `bin/` lower, outside tools disposition. |
 
 ## Design Goals
 
-- Keep `c0 build` as the only construction command.
-- Make the complete writable upper visible through one stage interface.
-- Keep runtime tools-volume access selected and read-only.
-- Require explicit host authority for acceptance or restoration.
+Keep authority with the process that needs it, separate networked acquisition from publication, discover state from Docker, preserve deliberate durable data, and make immutable defaults distinguishable from native writable changes.
 
 ## Module Inventory
 
-| Component            | Source                                         | Responsibility                                                                  |
-| -------------------- | -------------------------------------------    | ------------------------------------------------------------------------------- |
-| Host router          | `bin/c0`                                       | Instance selection, lifecycle, snapshots, publication, pins, and diagnostics    |
-| Build definition     | `docker/Dockerfile.base`, `.tools`, `.runtime` | OS image and build-produced default tools                                       |
-| Runtime guest        | Compose service `c0dev`                        | Development processes under runtime seccomp/capability policy                   |
-| Overlay policy       | `docker/home-overlays.conf`                    | Maps guest-home-relative paths to selected-snapshot-relative lowers             |
-| Overlay checker      | `docker/c0-overlay-check`                      | Validates mounts and emits stage porcelain                                      |
-| Overlay helper       | Host-launched Alpine plus `nsenter`            | Mounts OverlayFS inside the runtime mount namespace                             |
-| Snapshot helper      | Same bounded helper class                      | Reads merged paths while runtime is paused                                      |
-| Publisher            | Fixed inline host-controlled script            | Creates a complete accepted snapshot and updates checkout selection             |
-| Shared tools volume  | `${SHARED_TOOLS_VOLUME}`                       | Immutable build/accepted snapshots, temporary publication paths, and pins       |
-| Overlay-state volume | `${C0_INSTANCE_ID}-home-overlays`              | Persistent per-instance upper and work directories                              |
+The product is one development-environment tool. These are engineering modules, not separately managed components.
+
+| ID   | Module / realized surface                                                | Responsibility, inputs, and outputs                                                                    | Owned/reused seam                               | Decisions and gaps                                                      |
+| ---- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------- | ----------------------------------------------------------------------- |
+| M-01 | Host router: `bin/c0`, `bin/c0-host-io`                                  | Host arguments, source root, mode, Docker facts → bounded build/lifecycle/attachment/tools actions     | SM-01 workspace ownership; SM-02 tools store    | D-04, D-09, D-10; complete secret-safe transport is unproved            |
+| M-02 | Build and toolchain: Dockerfiles, `bin/c0-toolchain`, `bin/docker-hash`  | Recipe and upstream metadata → canonical manifest and validated shared images/payloads                 | SM-02 tools store                               | D-09; complete acquisition provenance and release scanning are unproved |
+| M-03 | Guest and activation: Compose, entrypoint, `bin/activate`                | Selected image/mounts/manifest → dev execution and toolchain defaults                                  | SM-01 workspace ownership; SM-03 overlay policy | D-05, D-08, D-10; effective least privilege requires per-role evidence  |
+| M-04 | Overlay handling: `docker/c0-overlay-check`, host helper functions       | Policy and exact namespace/volume → mounted lowers/uppers and complete stage report                    | SM-03 overlay policy                            | D-02, D-06, D-07; privileged helper minimization requires evidence      |
+| M-05 | Tools store/publication: host tools functions, `docker/c0-publish-tools` | Verified build or captured stage → complete payload and published runtime reference; scoped restore/GC | SM-02 tools store                               | D-01, D-03, D-04; whole-stage secret exclusion is unproved              |
+
+| ID    | Seam                            | Owner / direction     | Contract and test boundary                                                                                           |
+| ----- | ------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| SM-01 | Docker workspace ownership      | M-01 → M-03/M-04      | Specification lifecycle/mount semantics; existing mount, storage, and sharing tests                                  |
+| SM-02 | Immutable tools and publication | M-05 → M-01/M-02/M-03 | [Tools-store contract](tool-store-contract.md); tools-state, publication, cache, and retention tests                 |
+| SM-03 | Home overlay policy             | M-04 → M-03/M-05      | Current `docker/home-overlays.conf` path-pair format; a separately governed formal overlay-policy contract is absent |
+
+## Existing Surface Reuse Map
+
+| ID    | Surface                                         | Required use / extension                                                | Preservation and limitation                                                      |
+| ----- | ----------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| RU-01 | Existing Bash launcher                          | Sequence host Docker actions through current ownership/mount validation | No alternate selector files or second lifecycle controller                       |
+| RU-02 | Toolchain resolver and embedded manifests       | Resolve once for construction and select mounted defaults on activation | Do not resolve/download during login or status; not publisher-authenticity proof |
+| RU-03 | Existing tools upper and launcher upper         | Preserve ordinary tool writes and separate guest launcher edits         | Tools restore cannot erase launcher or unrelated host data                       |
+| RU-04 | Existing test fixtures and opt-in native suites | Observe stable command, mount, storage, and Docker boundaries           | Inert peers prove control flow; native tests prove only exercised integration    |
 
 ## Architecture
 
 ### Build Path
 
-`c0 build [-f]` is the only construction path. `dockerfile-concat` creates build inputs from base plus tools/runtime fragments. The tools builder installs non-apt tools after `USER dev`. The host extracts `.cargo/bin`, `.rustup`, and the complete `.local` tree through `/tools/tmp/<TOOLS_BUILD_ID>.partial`, writes `.c0dev-complete` last, and pins the complete build ID after overall build success.
+`bin/c0` constructs an owned temporary build context and concatenates base/tools or base/runtime fragments. `bin/c0-toolchain` resolves the supported releases once and emits canonical JSON plus build arguments. The tools identity binds the base/tools recipe and manifest; the runtime identity additionally binds runtime inputs. Equivalent mode/recipe/releases share completed artifacts across working folders.
 
-`-f` changes Docker cache and extraction disposition only. It does not change the `c0 tools` interface.
+The current tools builder installs non-system tools as `dev`, including managed Python/pip, Node/npm/pnpm through fnm, Semgrep, Rust/Cargo tools, and assistant installers. It retains explicit version and certificate-trust checks. Payload extraction includes `.cargo/bin`, `.rustup`, and complete `.local`. Cache acceptance compares completeness and embedded provenance; validated runtime images are published only after successful construction. Acquisition paths with executable upstream installers remain assurance limits, not verified routes merely because their final versions match.
+
+Tools extraction creates a never-started container from the constructed image without store access or network, then copies its home data into private host staging. A fixed networkless publisher running the base image copies only the admitted tool roots into the unpublished candidate, preserves nested links without following them, records provenance, and writes completeness last. Constructed-image programs and startup hooks never execute with the tools volume writable. Source-container retirement requires the exact operation label and created state; fixed legacy container names supply no cleanup authority.
 
 ### Runtime Mount Path
 
-Compose mounts only the selected volume subpath `opt/${TOOLS_ID}` at `/tools/current:ro`. This is narrower than mounting the complete shared volume and prevents a runtime from browsing other accepted snapshots or metadata.
+Docker labels, actual container/image state, and mount inventories bind workspace and instance identity. Start reuses the matching instance or creates the published build against the workspace's positively identified durable storage. A different build cannot concurrently use the same writable home overlays. Ordinary stop removes workspace runtimes while retaining declared persistent data; restart composes stop and start.
 
-At start or restart, the host validates the overlay policy and launches a short-lived networkless helper. The helper joins the runtime mount namespace and mounts:
+Tools lower mounts expose only the selected payload. Tool upper/work storage lives in a Linux Docker volume; current macOS bind-backed upper semantics do not support the needed writes. A networkless host helper opens its own root and proc-directory descriptors before entering the exact runtime mount namespace, restores those held root/cwd bindings before executing programs, mounts configured paths, and exits. Programs and their loader stay in the protected helper filesystem; guest data is reached through the held proc directory. Overlay checks recognize the corresponding kernel option spelling and existing supported lower bindings. The runtime entrypoint waits for overlays before services.
 
-- lower: `/tools/current/<tools-relative-path>`
-- upper: `/run/c0/overlay-state/upper/<overlay-name>`
-- work: `/run/c0/overlay-state/work/<TOOLS_ID>/<overlay-name>`
-- target: `/home/dev/<guest-relative-path>`
+The host `bin/` lower is read-only at `/run/c0/host-bin`; a separate guest launcher overlay exposes `/home/dev/bin`. Guest edits persist without writing host orchestration source. Git configuration, entrypoint, and overlay-control inputs are read-only. Declared configuration, caches, projects, and selected auth remain explicit host data surfaces, with confidentiality exposure distinct from write permission.
 
-The helper exits after verification. Runtime PID 1 waits for every configured target to become OverlayFS before starting sshd and reporting readiness.
+### Host Config And Log I/O
+
+M-01 routes SSH preparation/configuration and Orca log reset, output, and startup watching through the fixed host I/O helper. It holds the selected checkout directory, opens descendant parents without following links, and validates held file identities, regular type, ownership, and single-link count before effects. Config updates replace a private staged file atomically; log reset truncates only a validated descriptor and log reads/watches retain that descriptor. Missing SSH key pairs are generated in private temporary host storage and installed without overwriting existing keys. Existing keys and declared durable directories remain intact; redirected, hardlinked, or non-regular control files refuse rather than becoming host read/write targets.
 
 ### Stage Inspection
 
-The checker reads upper entries directly and emits a porcelain status:
-
-- `A`: no corresponding lower entry
-- `M`: non-directory upper entry shadows a lower path
-- `D`: whiteout hides a lower path
-- `O`: opaque upper directory hides lower directory content
-
-`c0 tools` summarizes counts and expands non-additive changes. `c0 tools --detail` prints every emitted path. Normal shell activation does not run the checker; start, guest-entry guards, status, and tools commands own validation.
+The existing checker compares upper entries with the selected lower and exposes the complete configured tools stage. Tools display summarizes it without classifying payload versus state. Successful shell and SSH activation stays quiet. Launcher state is separate from tools inspection/disposition.
 
 ### Acceptance
 
-Acceptance uses the runtime upper as the writable stage; it does not run installers or rebuild Dockerfiles.
+M-01 validates the actual running container, mounts, payload, and runtime metadata. M-04 briefly pauses that container and streams merged tool archives through a networkless namespace helper into private host storage, then resumes it. The capture helper uses the same held helper-root/proc bindings as mounting, so the archive program and its loader come from the protected helper image rather than the mutable guest filesystem. M-05 validates archive paths, copies the complete parent into an unpublished candidate, applies the archives, records identity/provenance, writes completeness last, and publishes a derived shared runtime image.
 
-1. Validate that the runtime and overlays are ready and that the stage is non-empty.
-1. Pause the runtime to prevent a changing merged view.
-1. For each policy row, launch a networkless namespace helper and stream a tar archive of the merged guest path to a mode-0700 host temporary directory.
-1. Reject archive members outside the configured guest-relative root.
-1. Resume the runtime before publication.
-1. Hash the ordered archive digests and derive a new ID from the selected parent plus stage digest.
-1. Launch the networkless publisher with snapshots RO and the shared tools volume RW.
-1. Copy the selected parent into a temporary candidate and replace configured paths from the archives.
-1. Record parent and stage digest, normalize ownership, and write completeness last.
-1. Move the candidate to its immutable ID and update the checkout pin.
-1. Preserve ports and security mode, remove the runtime, clear upper/work, and recreate against the accepted ID.
-
-The publisher does not modify the selected parent. A complete identical target is reused; an incomplete existing target blocks publication.
+The existing guest continues on its fixed tools mount and writable stage. Publication changes the Docker reference used by later creation; it does not replace the guest filesystem or clear the upper. Namespace capture and networkless publication have separate authority and do not execute staged payload as publisher code.
 
 ### Restoration
 
-Restore is intentionally smaller: retain the selected pin, preserve ports and security mode, remove the runtime, clear the complete upper/work volume, and recreate against the same selected ID. No build or volume publication occurs.
+M-01 initializes restore selection from the actual guest mount and compares the Docker-published selection only when initial recipe-image inspection succeeds; an absent image or failed initial inspection skips that comparison. It separately verifies that no other container references the guest's home storage. It stops the exact guest, rechecks exclusivity, and invokes a fixed helper clearing only configured tools upper/work paths. It restarts and validates that same guest even when clearing failed, preserving container-layer and launcher data. A resolved selection mismatch or shared stage refuses rather than migrating the guest. The skipped publication comparison is a current realization gap against the specification's hardened fail-closed requirement.
 
-### Selection
+### Selection And Collection
 
-The per-checkout pin is both selection and GC protection. Command startup resolves a valid complete pinned ID and otherwise falls back to `TOOLS_BUILD_ID`. Compose receives the resolved `TOOLS_ID`; the container label records it for active-use protection.
-
-Accepted snapshots are complete copies, so their parent need not remain mounted or GC-protected after acceptance. `.c0dev-accepted-from` retains provenance for inspection.
+New creation resolves a validated Docker-published runtime reference; existing actions use actual inspected mounts and metadata. No checkout pin or saved volume mapping is created. Collection protects tools referenced by every running/stopped/recovery container and published runtime image, then limits deletion to positively identified unreferenced rebuildable caches. Accepted and unknown legacy data remain retained. Required discovery failure blocks deletion.
 
 ## Design Decisions
 
-| ID        | Decision                                                                 | Rationale                                                                                   |
-| --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `C0-D001` | `c0 tools` manages stage state and never builds                          | Keeps one build command and a simple clean/staged user model                                |
-| `C0-D002` | The complete upper is the stage                                          | Generic path inference cannot distinguish arbitrary tool payload from native support state  |
-| `C0-D003` | Accept creates a new immutable snapshot                                  | Runtime never needs tools-volume RW and complete parents are never mutated in place         |
-| `C0-D004` | Accept and restore recreate the runtime                                  | Generic live replacement of an active OverlayFS lower is not reliable                       |
-| `C0-D005` | Runtime mounts only its selected tools subpath                           | Whole shared-volume RO access would expose other checkout snapshots                         |
-| `C0-D006` | Upper/work remain in a Linux Docker volume                               | OrbStack host bind mounts can mount as an OverlayFS upper but merged writes fail read-only  |
-| `C0-D007` | XDG data/state uses host `.local-rw`                                     | Keeps common mutable state host-visible while preserving native merged `~/.local`           |
-| `C0-D008` | Successful shell activation is silent                                    | Stage state is actionable only through status/tools commands, not every interactive attach  |
-
-## Rejected Alternatives
-
-- Copying built `.local` into a writable host directory: destroys the selected read-only execution baseline.
-- Manual per-tool writable-path policy: cannot remain correct for arbitrary future native installers.
-- Treating every upper override as an integrity failure: writable copy-up is the feature being provided.
-- Making `c0 tools` another build/update coordinator: duplicates `c0 build` and increases cognitive load.
-- Live lower remount after acceptance: unsafe for arbitrary open files, working directories, and OverlayFS upper reuse.
-- Host-backed upper/work on current OrbStack/macOS binds: isolated validation produced `Read-only file system` on merged writes.
+| ID   | Decision                                                   | Rationale                                                         | Alternatives                                                                                       | Affected surfaces | Status  |
+| ---- | ---------------------------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------- | ------- |
+| D-01 | Tools commands manage stage disposition                    | Keeps construction separate and reviewable                        | Running installers during stage management duplicates construction                                 | M-01/M-05         | current |
+| D-02 | Complete configured tools upper defines the stage          | Arbitrary native state cannot be classified reliably by path      | Per-tool allowlists hide new support/state files                                                   | M-04/M-05         | current |
+| D-03 | Acceptance creates immutable child content                 | Retains stable parent content without guest store authority       | In-place mutation mixes published states                                                           | M-05/SM-02        | current |
+| D-04 | Preserve fixed guest mounts during tools operations        | Protects guest filesystem and process identity                    | Replacement during tools disposition discards unrelated guest state; live lower swapping is unsafe | M-01/M-05         | current |
+| D-05 | Mount only the selected tools subpath                      | Limits cross-payload browsing and metadata exposure               | Whole-volume read access exposes other workspace state                                             | M-03/SM-02        | current |
+| D-06 | Keep overlay upper/work in Linux workspace storage         | Supplies required OverlayFS semantics and durability              | Current macOS host-backed upper fails merged writes                                                | M-04              | current |
+| D-07 | Redirect XDG data/state to declared host storage           | Makes common mutable data durable and visible                     | Whole-stage persistence alone hides ordinary host-managed state                                    | M-03              | current |
+| D-08 | Keep successful attachment quiet                           | Avoids reporting a stage on every shell entry                     | Repeated overlay summaries obscure native shell output                                             | M-01/M-03         | current |
+| D-09 | Publish recipe/manifest-bound shared builds through Docker | Joins release identity, discovery, sharing, and native references | Recipe-only identity reuses stale releases; saved checkout selectors drift from Docker             | M-01/M-02/M-05    | current |
+| D-10 | Separate host launchers from guest launcher writes         | Keeps future host execution outside guest write authority         | Direct writable host `bin/` creates delayed host execution                                         | M-01/M-03/M-04    | current |
 
 ## Component Responsibilities
 
-The host router sequences every Docker-authority operation. Guest helpers validate or inspect only their mounted/runtime namespace. The runtime owns user execution and stage writes but never selection or publication. The publisher owns completeness and immutable placement but never runtime mounts.
+The host router owns sequencing and resource attribution. Build code owns acquisition and candidate construction. Guest execution owns deliberate native work within declared mounts. Overlay helpers own only the exact namespace/mount operation. Tools publication owns unpublished immutable content and Docker reference publication; it does not interpret arbitrary guest instructions as host code. No package installer or separate local-service container is introduced.
 
 ## API Shape
 
-The public stage API is exactly `c0 tools`, `c0 tools --detail`, `c0 tools accept`, and `c0 tools restore`. Internal porcelain is tab-separated status plus path and is not a public stability promise beyond those commands.
+[Specification public surfaces](spec.md#public-surface) own exposed behavior; the tools contract owns storage and transaction shape. `docker/home-overlays.conf` supplies the current internal path-pair policy. Internal function names and fixture implementations are not additional public APIs.
 
 ## Workflow And Data Flow
 
-Runtime writes flow to the upper. Display reads upper versus selected lower. Acceptance reads the merged view, creates a new complete snapshot, updates the pin, clears upper/work, and recreates runtime. Restoration skips snapshot creation and publication.
+Build arguments and one resolved manifest flow through M-02 to complete tools/runtime artifacts and Docker publication. Start flows from inspected Docker state through M-01 ownership and M-04 mounts to M-03 services. Guest writes flow to declared host data or workspace uppers. Explicit acceptance flows through paused capture and isolated publication to a new shared reference while leaving the guest intact. Restore flows through exclusive storage proof, bounded clear, and same-container restart. Cleanup consumes complete resource references before any candidate deletion.
 
 ## Policy And Authority Boundaries
 
-The [Specification](spec.md) owns commands and observable behavior. The [Tool-store contract](tool-store-contract.md) owns snapshot and stage transitions. The [Security model](security-model.md) owns capability and threat interpretation. This document owns implementation mechanisms and rationale.
+Goals fix outcomes, specification fixes behavior, contract fixes the tools seam, and this design fixes mechanisms. The security reference explains current controls and missing assurance. A successful source check or image build establishes neither least privilege nor release-security clearance.
 
 ## Upstreamable Surface
 
-Overlay policy parsing, porcelain status, immutable snapshot layout, and selected-subpath Compose mounts are general mechanisms. OrbStack relay paths and macOS bind limitations are platform-specific integration.
+Recipe/manifest-bound artifact identity, Docker-derived resource discovery, immutable publication, complete stage reporting, and reference-aware cleanup are general mechanisms. OrbStack agent relay and macOS bind limitations are platform-specific integration.
 
 ## Private Implementation Surface
 
-Temporary archive names, inline publisher shell, helper image choice, colorized messages, and internal function names may change while preserving the specification and contract.
+Temporary context names, helper image selection, archive transport, fixed shell bodies, and function decomposition may change while preserving behavior, provenance, authority, and failure contracts. New helper authority requires evidence of necessity; a convenience refactor does not supply it.
 
 ## Constraints References
 
-Changes must preserve [Constraints](constraints.md), especially read-only selected snapshots, no guest publication authority, no in-place complete-snapshot mutation, complete stage visibility, and checkout-visible `bin/` writes.
+[Constraints](constraints.md#constraints) carry forbidden authority, host-exposure, release, secret, and cleanup patterns. They apply to all modules; a local helper must not become a weaker second owner.
 
 ## Preservation Requirements
 
-- Preserve unrelated host state and untracked workspace files.
-- Preserve the selected parent until acceptance completes.
-- Preserve runtime ports and security mode across accept and restore recreation.
-- Preserve stage data on every failure before successful publication and pin update.
+- Preserve declared host configuration/data, guest launcher state, unrelated files, and supported storage lineage.
+- Preserve the running guest during tools acceptance and the same guest filesystem during restoration, including failed clears.
+- Preserve immutable referenced payloads and conservatively retain unknown storage.
+- Preserve recipe/manifest-sensitive identity, current version/security floors, and mounted-default selection.
+- Preserve actual capability/seccomp/NNP controls and explicit guest administration while reducing unnecessary authority through evidenced changes.
 
 ## Failure Modes
 
-Snapshot capture always attempts to resume a paused runtime. Temporary archives are removed after success, failure, or interrupt. Publication failure leaves the stage intact. The pin changes only after completeness. Stage clearing occurs only after publication. If recreation fails, the immutable selected snapshot and persistent stage volume remain available to host diagnostics.
+Required Docker ownership, mount, lineage, and reference validations refuse dependent mutation when their evidence is unavailable or conflicting. Restore's initial recipe-image probe currently skips publication comparison on inspection failure, so it does not realize the hardened fail-closed requirement for that observation. Build failure retains published artifacts. Snapshot failure attempts same-container resume and removes owned host temporaries. Publication may leave an unselected complete candidate but does not clear the live stage. Failed restore attempts same-container restart and remains failed. Neither failure nor a clean stage supplies permission to remove host mounts or unknown resources.
+
+Current gaps in complete input verification, secret exclusion, vulnerability coverage, and helper minimization remain requirements at the [specification](spec.md#release-security); this design selects no unimplemented scanner, broker, syscall sandbox, or replacement installer.
 
 ## Acceptance Criteria
 
-- Runtime Compose configuration mounts only `opt/${TOOLS_ID}` at `/tools/current:ro`.
-- `c0 tools` is read-only and does not invoke Docker build or package installation.
-- Isolated publisher and clearing fixtures pass without altering non-target snapshots.
-- Snapshot capture while paused observes the merged namespace-mounted overlay.
-- Shell and SSH attachment emit no overlay summary on success.
-- README, specification, contract, security reference, and command help describe the same command surface.
+- Existing command and mount tests preserve protected host lowers, literal inputs, owned-resource validation, and refused unsafe mappings.
+- Tools-state and native publication tests preserve guest identity and filesystem through acceptance/restore and their failure paths.
+- Build/cache and sharing tests distinguish changed manifests, source recipes, modes, working folders, and referenced artifacts.
+- Cleanup tests retain stopped/image references, accepted data, and unknown lineage.
+- Security acceptance additionally requires the specification's intended containment, secret, input-verification, and release evidence; source configuration alone does not establish those effects.

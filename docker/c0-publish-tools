@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+# Fixed, networkless publisher; /payload is copied data, never executed.
+set -eu
+identity=$1
+case "$identity" in *[!0-9a-f]*|'') exit 1 ;; esac
+[ "${#identity}" -eq 64 ] || exit 1
+candidate="/tools/tmp/$identity.partial"
+for path in /tools/tmp "$candidate"; do
+    [ -d "$path" ] && [ ! -L "$path" ] || {
+        echo 'error: unsafe tools candidate directory' >&2; exit 1;
+    }
+done
+for path in /payload/.cargo /payload/.cargo/bin /payload/.rustup /payload/.local; do
+    [ ! -L "$path" ] || { echo 'error: redirected tools payload root' >&2; exit 1; }
+done
+copied=false
+for path in .cargo/bin .rustup .local; do
+    if [ -e "/payload/$path" ]; then
+        [ -d "/payload/$path" ] || { echo 'error: tools payload root is not a directory' >&2; exit 1; }
+        case "$path" in
+            .cargo/bin) mkdir -p "$candidate/.cargo"; cp -a /payload/.cargo/bin "$candidate/.cargo/" ;;
+            *) cp -a "/payload/$path" "$candidate/" ;;
+        esac
+        copied=true
+    fi
+done
+[ "$copied" = true ] || { echo 'error: no tools payload to publish' >&2; exit 1; }
+for path in /payload/.local/share /payload/.local/share/c0; do
+    [ -d "$path" ] && [ ! -L "$path" ] || {
+        echo 'error: redirected tools provenance directory' >&2; exit 1;
+    }
+done
+manifest=/payload/.local/share/c0/toolchain.json
+[ -f "$manifest" ] && [ ! -L "$manifest" ] || {
+    echo 'error: missing or redirected tools provenance file' >&2; exit 1;
+}
+cp "$manifest" "$candidate/.c0dev-toolchain.json"
+# Copy and ownership normalization preserve nested links, never their referents.
+chown -Rh 1000:1000 "$candidate"
+chmod 0755 "$candidate"
+touch "$candidate/.c0dev-complete"
+chown 1000:1000 "$candidate/.c0dev-complete"

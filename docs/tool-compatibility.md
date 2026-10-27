@@ -6,59 +6,62 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 ## Purpose
 
-Describe how tools using native home-directory layouts interact with the build payload, runtime OverlayFS stage, host XDG paths, and explicit acceptance.
+Explain current default tools, native home-directory writes, immutable payloads, writable overlays, and host-persisted state. [Specification](spec.md) owns behavior; [tools contract](tool-store-contract.md) owns publication and restoration.
+
+## Terminology
+
+| Term            | Meaning                                                                        |
+| --------------- | ------------------------------------------------------------------------------ |
+| Default tool    | Tool supplied by the built runtime image or immutable tools payload.           |
+| Native override | User-selected tool or writable path that differs from a built default.         |
+| Tools stage     | Configured tool-home upper; distinct from launcher upper and direct host data. |
 
 ## General Contract
 
-Non-apt tools installed by `Dockerfile.tools` run as `dev` in `/home/dev`. c0 packs the complete builder-created `.local`, plus `.cargo/bin` and `.rustup`; future supporting files under `.local/share` therefore require no additional extraction allowlist.
+The current tools builder installs user tools as `dev` and packs `.cargo/bin`, `.rustup`, and complete `.local`. Runtime image content separately includes Bun and global assistant tools. Native writes beneath configured `.local` enter the tools upper. Declared host config/cache/XDG paths preserve ordinary state outside that stage.
 
-At runtime, the selected `.local` is the read-only lower and the per-instance stage is the upper. A tool may create, replace, or delete any native path beneath merged `~/.local`. This behavior does not alter the selected snapshot.
-
-`c0 tools` does not decide whether a change is payload or state. An explicit acceptance approves the complete merged overlaid path; restoration discards the complete upper. Tools requiring finer semantic separation must honor the configured XDG host paths themselves.
+The mounted manifest selects default Node/Python, package managers, uv/fnm, Semgrep, and mapped assistant commands through private cache shims. Stale generic launchers or fnm defaults in the persistent upper do not silently replace those defaults. Explicit interpreter paths, custom tools, and per-session version selection remain available. Other native `.local` commands continue through the merged upper/lower lookup; read-only lower content alone does not prove effective command identity.
 
 ## Environment
 
-| Variable          | Runtime value               | Authority                                  |
-| ----------------- | --------------------------- | ------------------------------------------ |
-| `TOOLS_PREFIX`    | `/tools/current`            | Selected immutable snapshot                |
-| `XDG_CONFIG_HOME` | `/home/dev/.config`         | Host bind                                  |
-| `XDG_CACHE_HOME`  | `/home/dev/.cache`          | Host bind                                  |
-| `XDG_DATA_HOME`   | `/home/dev/.local-rw/share` | Host `.local/share`                        |
-| `XDG_STATE_HOME`  | `/home/dev/.local-rw/state` | Host `.local/state`                        |
-| `CARGO_HOME`      | `/home/dev/.cache/cargo`    | Host cache                                 |
-| `UV_CACHE_DIR`    | `/home/dev/.cache/uv`       | Host cache                                 |
-| `RUSTUP_HOME`     | `/tools/current/.rustup`    | Selected immutable snapshot; updates off   |
+| Variable / surface | Current meaning                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| `TOOLS_PREFIX`     | Selected immutable payload at `/tools/current`.                                    |
+| `XDG_CONFIG_HOME`  | Guest `.config`, backed by the declared host configuration directory.              |
+| `XDG_CACHE_HOME`   | Guest `.cache`, backed by the declared host cache directory.                       |
+| XDG data/state     | `.local-rw/share` and `.local-rw/state`, backed by host `.local`.                  |
+| `CARGO_HOME`       | Guest `.cache/cargo`, backed by host cache.                                        |
+| `RUSTUP_HOME`      | Selected `/tools/current/.rustup`; ordinary rustup updates disabled by activation. |
+| `UV_CACHE_DIR`     | Guest `.cache/uv`, backed by host cache.                                           |
+| Guest launchers    | `/home/dev/bin` uses its own upper over read-only host `/run/c0/host-bin`.         |
 
-Tools honoring XDG write common state directly to visible host folders. Tools hardcoding `~/.local` write the stage and appear in `c0 tools`.
-
-Executable lookup uses merged `/home/dev/.local/bin`, not the lower path beneath `TOOLS_PREFIX`; an upper replacement therefore becomes effective while an unchanged path still resolves from the selected lower.
+Host-backed XDG paths are data/state storage, not the default executable prefix. The current [activation](../bin/activate) and [runtime entrypoint](../docker/docker-entrypoint.sh) define exact emitted environment values.
 
 ## Current Tool Matrix
 
-| Tool class                     | Build location                      | Expected runtime writes                                      | Update disposition                                                                |
-| -----------------------------  | ----------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------                               |
-| uv/uvx                         | `.local/bin`, `.local/share/uv`     | Host uv cache; Python bytecode may enter stage               | Native changes remain staged until accept/restore                                 |
-| Cursor Agent and Factory Droid | `.local/bin`, `.local/share`        | Config/cache when honored; native updater files may stage    | Inspect with `c0 tools`                                                           |
-| Devin CLI                      | `.local/bin`, `.local/share/devin`  | Logs and installation state may enter stage                  | Whole-stage semantics apply                                                       |
-| Semgrep                        | `.local/bin`, uv-managed resources  | Cache and generated Python bytecode                          | Whole-stage semantics apply                                                       |
-| Rustup and Cargo-built tools   | `.rustup`, `.cargo/bin`             | Cargo/registry cache redirected to host                      | Defaults change through `c0 build`; `.local` stage does not cover these paths yet |
-| Bun globals                    | Runtime image global install        | Tool-specific host config/cache                              | Persistent default changes require `c0 build`                                     |
-| apt packages                   | Runtime image or runtime layer      | System state                                                 | `c0 root` changes are not tool snapshots                                          |
+| Tool class              | Built location and acquisition                                                                 | Runtime state and update boundary                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Bun / bunx              | Resolved base/runtime image release                                                            | Built defaults change through build; runtime files remain separate from tools-stage publication.                          |
+| uv / uvx                | `.local/bin` and supporting resources; resolved uv installer                                   | Host uv cache; manifest-bound defaults; input verification remains separately required.                                   |
+| Managed Python / pip    | `.local/share/uv/python` and selected launchers                                                | Built Python 3.15 and resolved pip defaults; explicit project interpreters remain separate.                               |
+| fnm / Node / npm / pnpm | `.local/share/fnm` and managed Node 22 tree                                                    | Core build supplies Node and package managers; per-session selections remain available without rewriting custom aliases.  |
+| Cursor / Droid / Devin  | User-tool resources acquired by current upstream installers                                    | Config/cache and direct native writes may persist or stage; installer success is not full input proof.                    |
+| Semgrep                 | uv-managed environment in `.local/share/uv/tools`                                              | Built version and certificate-trust requirements; generated state may stage; no complete dependency hash lock is claimed. |
+| Rustup / Cargo tools    | `.rustup` and `.cargo/bin`; current build uses Cargo for fd, ripgrep, ast-grep, zellij, and Nu | Host registry cache; immutable default payload; compiled security-library checks remain part of the build.                |
+| Bun assistant globals   | Runtime Dockerfile global installs                                                             | Some selectors still float; tools acceptance does not rebuild runtime globals.                                            |
+| Orca                    | Runtime image through `docker/install-orca.sh`                                                 | Guest service controlled by `c0 orca`; no marked-package publication route exists.                                        |
+| System packages         | Base/runtime image and disposable guest layer                                                  | Explicit guest-root administration remains within runtime controls; durable defaults require build inputs.                |
+
+The [tools Dockerfile](../docker/Dockerfile.tools), [runtime Dockerfile](../docker/Dockerfile.runtime), and [toolchain resolver](../bin/c0-toolchain) support this inventory. Resolved version floors and certificate checks must remain effective through documentation reconciliation; no release-binary migration or alternate package subsystem is implied.
 
 ## Display Semantics
 
-`A`, `M`, `D`, and `O` describe filesystem relationships only. In particular, `A` can mean a new executable, dependency, log, credential, database, or bytecode file. No status implies safety or canonical eligibility.
-
-The default display collapses added paths because native runtimes can generate thousands of files. `--detail` is the authority for the exact observable path set before accept or restore.
+Stage statuses describe filesystem relationships, not safety or canonical eligibility. New paths can be executables, dependencies, logs, credentials, or databases. Default display may summarize additions; detailed display supplies the full observable path set. Neither one inspects all file contents for secrets.
 
 ## Acceptance Consequences
 
-- Accepted content becomes part of a new read-only selected snapshot.
-- A fresh empty upper is mounted after recreation, so later native writes copy up again.
-- The parent build or accepted snapshot remains immutable.
-- Accepted snapshots record parent and archive digest but do not claim reproducible source provenance.
-- Direct non-XDG credentials or logs can be accepted; users must inspect `--detail` before authorizing when this matters.
+Acceptance creates a complete immutable tools payload and derived runtime artifact. The existing guest continues using its mounted lower and stage until a later lifecycle replacement. Restoration clears configured tools upper/work and resumes the same guest, retaining launcher state and direct host data. Accepted archives bind captured content and metadata but do not establish source reproducibility, publisher authenticity, or release-security clearance.
 
 ## Adding A Tool
 
-A new default non-apt tool belongs in `Dockerfile.tools` and must install as `dev`. If it writes anywhere under `.local`, no extraction-list edit is required. Its documentation should identify whether it honors XDG or writes direct native state so operators understand what will appear in the stage.
+A new default tool enters the appropriate build inputs and resolved identity. User-tool installers run unprivileged, with all consumed inputs subject to the [security requirements](spec.md#containment). Document native payload/support state, XDG behavior, direct writes, update behavior, and built/transitive dependency coverage. Native optional installation uses existing guest facilities; this branch provides no `c0 pkg` command or named-environment shell facade.

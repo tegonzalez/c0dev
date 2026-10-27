@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 """Run the actual c0 CLI against a stateful Docker double and an isolated checkout."""
+import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -88,10 +90,9 @@ if op == 'inspect':
     if '.State.Status' in fmt: finish(output=c['state'])
     if fmt == '{{.Name}}': finish(output='/'+c['name'])
     if '.Config.User' in fmt: finish(output='dev')
-    if 'c0dev.home_overlays_volume' in fmt: finish(output=c.get('labels', {}).get('c0dev.home_overlays_volume', ''))
-    if 'c0dev.instance' in fmt: finish(output=c['instance'])
-    if 'c0dev.security_mode' in fmt: finish(output=c.get('security', 'seccomp'))
-    if 'c0dev.tools_hash' in fmt: finish(output=c['tools'])
+    if fmt == '{{json .Config.Labels}}': finish(output=json.dumps(labels(c)))
+    label_match = re.search(r'index \.Config\.Labels "([^"]+)"', fmt)
+    if label_match: finish(output=labels(c).get(label_match.group(1), ''))
     if '3000/tcp' in fmt: finish(output='3001')
     if '2222/tcp' in fmt: finish(output='2223')
     if '.NetworkSettings.Networks' in fmt: finish(output='192.0.2.10')
@@ -104,22 +105,37 @@ if op == 'inspect':
             if not mount: finish()
             finish(output=mount.get('name', '') if '.Name' in fmt else str(mount['rw']).lower())
     finish(98, 'unhandled inspect template: '+fmt)
+if op == 'image' and args[1] == 'ls':
+    images = list(state.get('images', {}).values())
+    for expr in flags(('-f', '--filter')):
+        if expr.startswith('label='):
+            key, separator, value = expr[6:].partition('=')
+            images = [image for image in images if
+                      (image.get('Config', {}).get('Labels', {}).get(key) == value
+                       if separator else key in image.get('Config', {}).get('Labels', {}))]
+    finish(output='\n'.join(dict.fromkeys(image['id'] for image in images)))
 if op == 'image' and args[1] == 'inspect':
     tag = next((arg for arg in args[2:] if arg in state.get('images', {})), args[-1])
     image = state.get('images', {}).get(tag)
     if not image:
         image = next((value for value in state.get('images', {}).values() if value['id'] == tag), None)
-    if not image:
-        # Runtime availability is independent of the optional toolchain build.
-        image = dict(id='sha256:'+'1'*64, Config=dict(Labels={}))
-        state.setdefault('images', {})[tag] = image
-    if '--format' in args or '-f' in args:
-        finish(output=image['id'] if image else 'sha256:'+'1'*64)
-    result = dict(Id=image['id'] if image else 'sha256:'+'1'*64,
-                  Config=image.get('Config', dict(Labels={})) if image else dict(Labels={}))
-    if image:
-        for key in ('RootFS', 'Os', 'Architecture', 'Variant'):
-            if key in image: result[key] = image[key]
+    if not image: finish(1)
+    formats = flags(('--format', '-f'))
+    if formats:
+        fmt = formats[0]
+        if fmt == '{{.Id}}': finish(output=image['id'])
+        if fmt == '{{json .Config.Labels}}': finish(output=json.dumps(image.get('Config', {}).get('Labels', {})))
+        if fmt.startswith('{{printf'):
+            keys = re.findall(r'index \.Config\.Labels "([^"]+)"', fmt)
+            values = [image['id']] if '.Id' in fmt else []
+            values += [image.get('Config', {}).get('Labels', {}).get(key, '') for key in keys]
+            finish(output='\t'.join(values))
+        label_match = re.search(r'index \.Config\.Labels "([^"]+)"', fmt)
+        if label_match: finish(output=image.get('Config', {}).get('Labels', {}).get(label_match.group(1), ''))
+        finish(98, 'unhandled image inspection: '+fmt)
+    result = dict(Id=image['id'], Config=image.get('Config', dict(Labels={})))
+    for key in ('RootFS', 'Os', 'Architecture', 'Variant'):
+        if key in image: result[key] = image[key]
     finish(output=json.dumps([result]))
 if op == 'image' and args[1] == 'tag':
     source = state.get('images', {}).get(args[-2])
@@ -149,11 +165,17 @@ if op == 'compose':
         if state.get('compose_run_status'): finish(state['compose_run_status'])
         if state.get('compose_up_empty'): finish()
         c = copy.deepcopy(state['new_container'])
+        c['instance'] = os.environ.get('C0_INSTANCE_ID', c['instance'])
         state['creations'] = state.get('creations', 0) + 1
         if state['creations'] > 1 or any(container['id'] == c['id'] for container in state['containers']):
             c['id'] = hashlib.sha256((c['id'] + str(state['creations'])).encode()).hexdigest()
         if '--name' in args: c['name'] = flags(('--name',))[0]
         c['labels'] = dict(c.get('labels', {}))
+        for key, variable in (('c0dev.workspace', 'C0_WORKSPACE_ID'),
+                              ('c0dev.build', 'C0_BUILD_ID'),
+                              ('c0dev.recipe', 'C0_RECIPE_ID'),
+                              ('c0dev.mode', 'C0_MODE_KEY')):
+            if os.environ.get(variable): c['labels'][key] = os.environ[variable]
         for label in flags(('--label',)):
             key, value = label.split('=', 1)
             c['labels'][key] = value
@@ -171,6 +193,7 @@ if op == 'compose':
                     mount['name'] = overlay
                     mount['source'] = '/var/lib/docker/volumes/' + overlay + '/_data'
         if os.environ.get('TOOLS_ID'): c['tools'] = os.environ['TOOLS_ID']
+        if os.environ.get('C0_RUNTIME_IMAGE'): c['image'] = os.environ['C0_RUNTIME_IMAGE']
         c['state'] = state.get('started_state', 'running')
         c['security'] = os.environ.get('C0_SECURITY', 'permissive')
         state['containers'].append(c)
@@ -179,6 +202,20 @@ if op == 'compose':
         if 'ps' in args: finish(output='\n'.join(c['id'] for c in selected()))
         finish()
     finish(99, 'unexpected compose operation: '+repr(args))
+if op == 'volume' and args[1] == 'ls':
+    volumes = dict(state.get('volumes', {}))
+    for c in state['containers']:
+        for mount in c['mounts']:
+            if mount['type'] == 'volume': volumes.setdefault(mount['name'], dict(Labels={}, data={}))
+    for expr in flags(('-f', '--filter')):
+        if expr.startswith('label='):
+            key, separator, value = expr[6:].partition('=')
+            volumes = {name: volume for name, volume in volumes.items() if
+                       (volume.get('Labels', {}).get(key) == value
+                        if separator else key in volume.get('Labels', {}))}
+        elif expr.startswith('name='):
+            volumes = {name: volume for name, volume in volumes.items() if re.search(expr[5:], name)}
+    finish(output='\n'.join(volumes))
 if op == 'volume' and args[1] == 'inspect':
     name = args[-1]
     volume = state.get('volumes', {}).get(name)
@@ -188,9 +225,11 @@ if op == 'volume' and args[1] == 'inspect':
         volume = dict(Labels={}, data={})
     formats = flags(('-f', '--format'))
     if formats:
-        for key in ('c0dev.instance', 'c0dev.overlay_generation'):
+        for key in ('c0dev.instance', 'c0dev.workspace', 'c0dev.overlay_generation', 'c0dev.overlay_source'):
             if key in formats[0]: finish(output=volume.get('Labels', {}).get(key, ''))
-        finish(98, 'unhandled volume inspection')
+        if formats[0] == '{{json .Labels}}': finish(output=json.dumps(volume.get('Labels', {})))
+        if formats[0] == '{{.Name}}': finish(output=name)
+        finish(98, 'unhandled volume inspection: '+formats[0])
     finish(output=json.dumps([dict(Name=name, **volume)]))
 if op == 'volume' and args[1] == 'create':
     name = args[-1]
@@ -198,6 +237,8 @@ if op == 'volume' and args[1] == 'create':
     state.setdefault('volumes', {})[name] = dict(Labels=values, data={})
     finish(output=name)
 if op == 'run':
+    if any('test -d' in arg and '/tools/tmp/' in arg and '.next' in arg for arg in args):
+        finish(0 if state.get('staged_tools', False) else 1)
     mounts = flags(('--mount',))
     if 'rm -rf /state/upper /state/work' in ' '.join(args):
         state_volume = next((value.split('src=', 1)[1].split(',', 1)[0] for value in mounts
@@ -238,7 +279,7 @@ class Fixture:
         shutil.copytree(REPO/'docker', self.checkout/'docker', ignore=shutil.ignore_patterns('.terminfo', '.Dockerfile*', '.compose.*'))
         for name in ('c0', 'docker-hash', 'dockerfile-concat', 'activate', 'list-listening-ports'):
             shutil.copy2(REPO/'bin'/name, self.checkout/'bin'/name)
-        for name in ('c0-terminfo', 'c0-toolchain'):
+        for name in ('c0-terminfo', 'c0-toolchain', 'c0-host-io'):
             if (REPO/'bin'/name).exists():
                 shutil.copy2(REPO/'bin'/name, self.checkout/'bin'/name)
         self.home = self.root/'home'
@@ -249,8 +290,19 @@ class Fixture:
         (self.checkout/'.claude.json').write_text('{}')
         for name in ('authorized_keys', 'id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key'):
             (self.checkout/'auth/ssh'/name).write_text('fixture\n')
-        self.tools = subprocess.check_output([str(self.checkout/'bin/docker-hash'), str(self.checkout/'docker/Dockerfile.base'), str(self.checkout/'docker/Dockerfile.tools')], text=True).strip()
-        self.instance = 'c0dev-'+__import__('hashlib').sha256(str(self.checkout).encode()).hexdigest()[:8]
+        self.tools = subprocess.check_output(
+            [str(self.checkout/'bin/docker-hash'), 'docker/Dockerfile.base',
+             'docker/Dockerfile.tools'], cwd=self.checkout, text=True).strip()
+        self.instance = 'c0dev-'+hashlib.sha256(str(self.checkout).encode()).hexdigest()[:8]
+        self.workspace = self.instance
+        source = (self.checkout/'bin/c0').read_text()
+        recipe_function = re.search(r'^c0_recipe_hash\(\) \{\n.*?^\}', source,
+                                    re.M | re.S).group()
+        self.recipe = subprocess.check_output(
+            ['/bin/bash', '-c', 'C0ROOT="$TEST_CHECKOUT"\n' + recipe_function + '\nc0_recipe_hash'],
+            env=dict(os.environ, TEST_CHECKOUT=str(self.checkout)), text=True).strip()
+        self.build = hashlib.sha256(('fixture-build-v1\n'+self.recipe+'\n').encode()).hexdigest()
+        self.runtime_ref = 'c0dev-runtime-prod:recipe-' + self.recipe
         mock_bin = self.root/'mock-bin'
         mock_bin.mkdir()
         (mock_bin/'docker').write_text('#!'+sys.executable+'\n'+DOCKER)
@@ -268,12 +320,34 @@ class Fixture:
                         C0_SECCOMP_NOTIFY='0', C0DEV_WEB_PORT='3001', C0DEV_SSH_PORT='2223', TERM='xterm')
         self.env.pop('C0_SECURITY', None)
         self.env.pop('C0_SECURITY_RESOLVED', None)
+        for name in ('C0_BUILD_ID', 'C0_WORKSPACE_ID', 'C0_INSTANCE_ID', 'C0_RUNTIME_IMAGE',
+                     'C0_BASE_IMAGE', 'C0_MODE_KEY', 'C0_RECIPE_ID',
+                     'C0_HOME_OVERLAYS_VOLUME', 'C0_HOME_OVERLAYS_EXTERNAL'):
+            self.env.pop(name, None)
         container = self.container()
-        self.write(dict(containers=[container], new_container=self.container('new-runtime', oneoff=False), calls=[]))
+        self.write(dict(containers=[container], new_container=self.container('new-runtime', oneoff=False),
+                        volumes={self.workspace+'-home-overlays': dict(Labels={}, data={}),
+                                 'c0dev-tools-shared': dict(Labels={}, data={})}, calls=[]))
+        self.publish_runtime()
 
     def close(self): self.temp.cleanup()
     def read(self): return json.loads(self.state_path.read_text())
     def write(self, state): self.state_path.write_text(json.dumps(state))
+
+    def publish_runtime(self, image_id=None, build=None, tools=None):
+        """Represent an already-published immutable Docker artifact and its alias."""
+        image_id = image_id or 'sha256:' + '1' * 64
+        build = build or self.build
+        tools = tools or self.tools
+        state = self.read()
+        image = dict(id=image_id, Config=dict(Labels={
+            'c0dev.build': build, 'c0dev.recipe': self.recipe, 'c0dev.mode': 'prod',
+            'c0dev.tools_hash': tools, 'c0dev.tools_volume': 'c0dev-tools-shared',
+            'c0dev.base_image': 'c0dev-base-prod:' + build}))
+        state.setdefault('images', {})[self.runtime_ref] = image
+        state['images']['c0dev-runtime-prod:' + build] = image
+        state['new_container']['image'] = image_id
+        self.write(state)
 
     def container(self, cid='oneoff-runtime', oneoff=True, state='running'):
         mounts = []

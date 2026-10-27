@@ -24,7 +24,7 @@ Run `bash ./env.sh c0 help` for available commands and options; implementations 
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | Reproducible guest   | Build a Linux development container with assistant CLIs and toolchains.                     |
 | Persistent workspace | Keep configured credentials, caches, projects, and user state on host mounts.               |
-| Per-checkout runtime | Manage an isolated container instance with published web and loopback SSH ports.            |
+| Workspace runtime    | Isolate containers by build and working folder while sharing build artifacts.               |
 | Staged tool updates  | Inspect tool changes, accept them as immutable snapshots, or restore the selected snapshot. |
 | Runtime restrictions | Apply capability limits, no-new-privileges, and the vendored Moby seccomp profile.          |
 
@@ -116,13 +116,13 @@ c0 clean       |----------------- GC ----------------------+
 - User: UID 0.
 - Security: `SYS_ADMIN`, `SYS_PTRACE`, `SYS_CHROOT`, DAC/ownership capabilities, NNP, and unconfined seccomp.
 - Network: None.
-- Storage: Reads the selected tools lower and writes the per-instance overlay-stage volume while entering the runtime mount namespace.
+- Storage: Reads the selected tools lower and writes the workspace overlay-stage volume while entering the runtime mount namespace.
 - Use: Mounts writable `.local` into `runtime`; the helper exits immediately after the mount succeeds.
 
 #### `runtime`
 
 - Type: Long-running development guest instance.
-- Lifetime: Created when absent by `c0 start`; stop removes the runtime and retains persistent mounts and volumes. Restart runs stop followed by start.
+- Lifetime: Shared by repeated commands for one mode/build/working-folder tuple. Stop removes the workspace runtime and retains persistent mounts and volumes; restart runs stop followed by start.
 - User: `dev`; `c0 root` enters UID 0 inside the same instance.
 - Security: `cap_drop: ALL`, then `CHOWN`, `DAC_OVERRIDE`, `FOWNER`; NNP; vendored Moby seccomp.
 - Network: Normal guest egress with published web and loopback-published SSH ports.
@@ -137,7 +137,7 @@ c0 clean       |----------------- GC ----------------------+
 - Security: Only the selected `/tools/opt/<TOOLS_ID>` subpath is mounted read-only in `runtime`.
 - Network: Not applicable.
 - Storage: Written during build or explicit stage acceptance and eligible cleanup; inspected read-only by status.
-- Use: Stores immutable build toolsets, accepted snapshots, pins, and temporary publication paths.
+- Use: Stores immutable build toolsets, accepted snapshots, and temporary extraction/publication paths. Docker artifact and container references protect live payloads.
 
 #### `host-mount`
 
@@ -153,16 +153,19 @@ Not shown as nodes: `c0 root` is an exec lane inside `runtime`; `c0 tools accept
 
 ## Terms
 
-| Term              | Meaning                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| checkout          | Your clone of this repository on the host                                                                                                |
-| guest             | The running c0dev container                                                                                                              |
-| dev user          | Default shell user inside the guest (`uid` 1000); use `c0 sh`                                                                            |
-| `TOOLS_BUILD_ID`  | Content hash of `Dockerfile.base` and `Dockerfile.tools`; identifies the build-produced toolset                                          |
-| `TOOLS_ID`        | Complete build toolset or accepted-stage snapshot selected for one checkout                                                              |
-| tools volume      | Docker volume `c0dev-tools-shared` (override: `SHARED_TOOLS_VOLUME`); holds immutable `/tools/opt/<TOOLS_ID>/` snapshots                 |
-| writable stage    | Per-instance OverlayFS upper containing every runtime write beneath the overlaid tool-home paths                                         |
-| instance          | Per-checkout container identity (`c0dev.instance` label); ports and hostname are allocated per instance                                  |
+| Term                      | Meaning                                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| checkout / working folder | The real host path of this c0dev source tree; symlink spellings do not create another workspace |
+| guest                     | A running c0dev container                                                                       |
+| dev user                  | Default guest user, UID 1000; use `c0 sh`                                                       |
+| recipe identity           | Path-independent hash of the Dockerfiles and stable copied build inputs                         |
+| build identity            | Recipe identity plus the canonical resolved release manifest; shared within one `C0_MODE`       |
+| `TOOLS_BUILD_ID`          | Content identity of the base/tools recipe and resolved toolchain manifest                       |
+| `TOOLS_ID`                | Immutable tools payload identified by a published Docker image or an actual container mount     |
+| tools volume              | Mode-scoped Docker volume containing immutable `/tools/opt/<TOOLS_ID>/` snapshots               |
+| writable stage            | Workspace OverlayFS upper containing runtime writes beneath configured tool-home paths          |
+| workspace                 | Mode plus real working folder; owns persistent host mappings and home-overlay storage           |
+| instance                  | Mode/build/working-folder container identity, carried by Docker labels                          |
 
 ## Host requirements
 
@@ -179,7 +182,7 @@ Not shown as nodes: `c0 root` is an exec lane inside `runtime`; `c0 tools accept
 
 | Property    | Value                                                 |
 | ----------- | ----------------------------------------------------- |
-| Base distro | Debian (downstream of `oven/bun:latest`)              |
+| Base distro | Debian from the resolved `oven/bun` release           |
 | Image size  | ~4 GB total                                           |
 | Build time  | ~20 minutes for a full build including Rust toolchain |
 
@@ -225,20 +228,20 @@ A successful final command opens the guest shell as `dev` (UID 1000); `c0 sh` au
 
 ## Commands
 
-| Command | Purpose |
-| --- | --- |
-| `c0 build [-f]` | Build and validate tools and the runtime image, then publish the checkout selection. |
-| `c0 start [--cap-drop-all]` | Resume the existing container; create it only when absent. |
-| `c0 stop` | Stop and remove the runtime; retain bind mounts and named volumes. |
-| `c0 restart [--cap-drop-all]` | Run stop, then start with the supplied start arguments. |
-| `c0 sh` / `c0 root` / `c0 ssh [-Y] [command...]` | Attach as dev, root, or dev over SSH. `ssh --keygen` regenerates SSH keys. |
-| `c0 status` / `c0 logs [svc]` | Inspect this instance or view service logs. |
-| `c0 tools [--detail\|accept\|restore]` | Inspect, publish, or discard the writable tools stage; see the tools behavior below. |
-| `c0 orca [start\|stop\|status]` | Check or manage the guest Orca service. |
-| `c0 seccomp-upgrade [--dry-run]` | Check for or apply a newer Moby seccomp profile. |
-| `c0 clean [-a]` | Collect unused tools; refuse while any container references the store. |
-| `c0 cp-term` | Copy caller terminfo into the guest system terminfo store. |
-| `c0 help` | Show command help. |
+| Command                                          | Purpose                                                                                     |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `c0 build [-f]`                                  | Build or reuse validated shared tools, base, and runtime artifacts; publish through Docker. |
+| `c0 start [--cap-drop-all]`                      | Reuse the matching build/workspace container, or create it from the published shared image. |
+| `c0 stop`                                        | Stop and remove this workspace's runtimes; retain bind mounts and named volumes.            |
+| `c0 restart [--cap-drop-all]`                    | Run stop, then start with the supplied start arguments.                                     |
+| `c0 sh` / `c0 root` / `c0 ssh [-Y] [command...]` | Attach as dev, root, or dev over SSH. `ssh --keygen` regenerates SSH keys.                  |
+| `c0 status` / `c0 logs [svc]`                    | Inspect this instance or view service logs.                                                 |
+| `c0 tools [--detail\|accept\|restore]`           | Inspect, publish, or discard the writable tools stage; see the tools behavior below.        |
+| `c0 orca [start\|stop\|status]`                  | Check or manage the guest Orca service.                                                     |
+| `c0 seccomp-upgrade [--dry-run]`                 | Check for or apply a newer Moby seccomp profile.                                            |
+| `c0 clean [-a]`                                  | Collect unused tools; refuse while any container references the store.                      |
+| `c0 cp-term`                                     | Copy caller terminfo into the guest system terminfo store.                                  |
+| `c0 help`                                        | Show command help.                                                                          |
 
 Run this command table in the host helper Bash started by `bash ./env.sh`. From the parent shell, invoke one command with `bash ./env.sh c0 help`, replacing `help` with the desired command and arguments.
 
@@ -307,25 +310,25 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 
 Persistent host ↔ guest paths for credentials, tooling, and projects: see `./docker/volumes-folders.yaml`, eg:
 
-| Host path       | Guest path               | Role                                                                       |
-| --------------- | ------------------------ | -------------------------------------------------------------------------- |
-| `.claude/`      | `/home/dev/.claude`      | Assistant state                                                            |
-| `.cache/`       | `/home/dev/.cache`       | Mutable tool caches (cargo registry, uv); `c0` never purges                |
-| `.config/`      | `/home/dev/.config`      | Application config                                                         |
-| `.codex/`       | `/home/dev/.codex`       | Assistant state                                                            |
-| `.local/`       | `/home/dev/.local-rw`    | Host-visible XDG data and state                                            |
-| `rules/`        | `/home/dev/rules`        | Project rules                                                              |
-| `projects/`     | `/home/dev/projects`     | Sources and build outputs                                                  |
+| Host path       | Guest path                | Role                                                                              |
+| --------------- | ------------------------- | --------------------------------------------------------------------------------- |
+| `.claude/`      | `/home/dev/.claude`       | Assistant state                                                                   |
+| `.cache/`       | `/home/dev/.cache`        | Mutable tool caches (cargo registry, uv); `c0` never purges                       |
+| `.config/`      | `/home/dev/.config`       | Application config                                                                |
+| `.codex/`       | `/home/dev/.codex`        | Assistant state                                                                   |
+| `.local/`       | `/home/dev/.local-rw`     | Host-visible XDG data and state                                                   |
+| `rules/`        | `/home/dev/rules`         | Project rules                                                                     |
+| `projects/`     | `/home/dev/projects`      | Sources and build outputs                                                         |
 | `bin/`          | `/run/c0/host-bin:ro`     | Host launcher/helper lower; writable guest view at `/home/dev/bin` uses OverlayFS |
-| `auth/ssh/`     | `/home/dev/.ssh`         | SSH keys and `sshd` config (gitignored)                                    |
-| `.claude.json`  | `/home/dev/.claude.json` | Assistant credentials file                                                 |
-| `~/.gitconfig`  | `/home/dev/.gitconfig:ro` | Host Git identity and settings; guest cannot change the host file          |
-| `tools-shared`  | `/tools/current:ro`      | Only this checkout's selected immutable tool snapshot                      |
-| `home-overlays` | `/run/c0/overlay-state`  | Per-instance writable tool stage, launcher upper, and OverlayFS work data                   |
+| `auth/ssh/`     | `/home/dev/.ssh`          | SSH keys and `sshd` config (gitignored)                                           |
+| `.claude.json`  | `/home/dev/.claude.json`  | Assistant credentials file                                                        |
+| `~/.gitconfig`  | `/home/dev/.gitconfig:ro` | Host Git identity and settings; guest cannot change the host file                 |
+| `tools-shared`  | `/tools/current:ro`       | Shared immutable payload selected from Docker artifact metadata                   |
+| `home-overlays` | `/run/c0/overlay-state`   | Workspace writable tool stage, launcher upper, and OverlayFS work data            |
 
 The guest `/home/dev/bin` overlays the read-only host `bin/` lower. Guest edits persist in a separate launcher upper across restarts and do not change host scripts. The launcher upper is excluded from `c0 tools accept` and `c0 tools restore`; host updates remain visible for paths the guest has not overridden.
 
-Canonical executables and resources come from the selected read-only tools snapshot. Native writes beneath an overlaid tool-home path enter the per-instance writable stage. XDG data/state is redirected to the host `.local/`; direct writers that ignore XDG remain part of the stage and are therefore included by `c0 tools accept` or removed by `c0 tools restore`.
+Canonical executables and resources come from the selected read-only tools snapshot. Native writes beneath an overlaid tool-home path enter the workspace writable stage. XDG data/state is redirected to the host `.local/`; direct writers that ignore XDG remain part of the stage and are therefore included by `c0 tools accept` or removed by `c0 tools restore`.
 
 `PATH` resolves other `.local` tools through merged `/home/dev/.local/bin`, so their staged native upgrades are effective immediately. Core toolchain defaults follow the mounted snapshot manifest. Explicit interpreter paths and per-session `fnm use` remain available.
 
@@ -345,43 +348,57 @@ Canonical executables and resources come from the selected read-only tools snaps
 
 On `c0 build`:
 
-1. Ensures host mount directories exist (prevents Docker from creating them as root-owned paths).
-1. Resolves current stable toolchain releases once from official upstream metadata, keeping Node on 22 and Python on 3.15; records a canonical manifest before checking the tools cache.
-1. Builds or reuses the UID-1000 tools-builder snapshot from the supported base path.
-1. Packs `.cargo/bin`, `.rustup`, and the complete builder-created `.local` tree, then extracts through a temporary path and writes the completeness marker last.
-1. Prepares terminfo for proper terminal emulation.
-1. Builds the runtime image from `docker/Dockerfile.base` + `docker/Dockerfile.runtime`, downloading the pinned Orca 1.4.239 arm64 package, verifying its SHA-256, and installing its headless Electron/Xvfb dependencies.
-1. Pins the completed toolset for this checkout only after both tool and runtime builds succeed.
+1. Validates the declared host mount paths.
+1. Resolves current stable releases from official upstream metadata, keeping Node on 22 and Python on 3.15, and produces a canonical release manifest.
+1. Derives path-independent recipe, build, and tools identities. Working-folder paths do not enter shared artifact identities.
+1. Builds or reuses the mode/build base image and mode-scoped tools payload. Tools extraction writes a completeness marker only after the payload is complete.
+1. Prepares the portable `xterm-256color` image definition. Caller terminal definitions are synchronized when attaching.
+1. Builds or reuses the mode/build runtime image. New images pass a networkless UID-1000 launch check before publication.
+1. Publishes the completed runtime image under its shared build tag and recipe alias. Docker image labels identify its build, mode, recipe, tools payload, and base image.
 
-Every `c0 build` resolves the latest stable Bun, uv, fnm, Node 22 patch, Python 3.15 patch, pip, and Semgrep. npm and pnpm select the newest stable versions compatible with the selected Node 22 release. Prereleases, releases below the security floors, malformed metadata, and upstream lookup failures stop the build; failed builds leave the successful checkout selection intact.
+Every `c0 build` resolves the latest stable Bun, uv, fnm, Node 22 patch, Python 3.15 patch, pip, and Semgrep. npm and pnpm select the newest stable versions compatible with the selected Node 22 release. Prereleases, releases below the security floors, malformed metadata, and upstream lookup failures stop the build; failed builds leave the previously published shared runtime image intact.
 
-The canonical manifest and Dockerfile recipe together determine the tools snapshot identity. A new resolved release invalidates the old snapshot even when the Dockerfiles are unchanged. Unchanged manifests can reuse complete snapshots. A build publishes the image and tools selection for container creation. The running container keeps its fixed image and tools mount until stopped. After `c0 stop`, `c0 start` creates from the published image and selected tools. The exact versions are passed to both image builds and verified during installation; the manifest is retained in `/tools/current/.c0dev-toolchain.json` and `/tools/current/.local/share/c0/toolchain.json` for inspection.
+The canonical manifest and Dockerfile recipe determine shared artifact identities. A new resolved release changes the build and tools identities even when the Dockerfiles are unchanged. Identical mode/recipe/release inputs in different working folders reuse the same completed tools, base, and runtime artifacts. Containers add the working-folder identity. A running container keeps its fixed image and tools mount until stopped; the next start uses the current published shared image. The exact versions are passed to both image builds and verified during installation; the manifest is retained in `/tools/current/.c0dev-toolchain.json` and `/tools/current/.local/share/c0/toolchain.json` for inspection.
 
-`c0 build -f` also pulls the selected base and bypasses Docker layer caching. Ordinary image builds use `--pull`. This release resolver is not a CVE scanner: same-version distro package changes, independently vendored application runtimes, Rust transitive changes, and existing project environments still need their own security review or a forced rebuild.
+`c0 build -f` bypasses completed-artifact reuse, pulls the selected base, and bypasses Docker layer caching. Image builds that are needed use `--pull`. This release resolver is not a CVE scanner: same-version distro package changes, independently vendored application runtimes, Rust transitive changes, and existing project environments still need their own security review or a forced rebuild.
 
-Normal `c0 sh` and `c0 ssh` select the mounted snapshot's Node/Python, package-manager and uv defaults, even when a persistent home overlay contains older generic launchers or fnm defaults. Selection uses private cache shims without deleting staged files or rewriting custom fnm aliases. Node/Python versions remain available for explicit per-session selection. Login, status, start, and SSH do not resolve toolchain releases or install tools; only `c0 build` contacts release services.
+Normal `c0 sh` and `c0 ssh` select the mounted snapshot's Node/Python, package-manager and uv defaults, even when a persistent home overlay contains older generic launchers or fnm defaults. Selection uses private cache shims without deleting staged files or rewriting custom fnm aliases. Node/Python versions remain available for explicit per-session selection. Login, status, start, and SSH do not resolve toolchain releases or install tools; `c0 build` resolves toolchain releases.
 
 Debian's `/usr/bin/python3` remains available for system-package shebangs and dependencies; replacing or removing it would break those consumers. Existing project virtual environments keep their own interpreter and packages. Pip is resolved independently of Python, so a pip security release can refresh the tools snapshot without a CPython release. CPython's embedded `ensurepip` wheel remains the vendor-supplied wheel and is checked against the certificate-security floor rather than rewritten.
 
-The base upgrades inherited Debian packages, requires the eMudhra fixed CA package, and checks that the affected root and cross-sign trust paths are absent. Bun, Node, uv and Electron use their corresponding patched releases. Zellij and Nushell resolve updated compatible Rust dependencies, and build checks inspect their actual compiled certificate-verifier/root-store versions. Guest activation supplies system trust defaults for Python/OpenSSL, Requests and uv, including SSH sessions. Explicit application trust overrides and old virtual environments still need their own review.
+The base upgrades inherited Debian packages, requires the eMudhra fixed CA package, and checks that the affected root and cross-sign trust paths are absent. Bun, Node, uv and Electron use their corresponding patched releases; the reviewed Orca package is 1.4.239 with Electron 43.8.1. Zellij and Nushell resolve updated compatible Rust dependencies, and build checks inspect their actual compiled certificate-verifier/root-store versions. Guest activation supplies system trust defaults for Python/OpenSSL, Requests and uv, including SSH sessions. Explicit application trust overrides and old virtual environments still need their own review.
 
 Existing writable tool overlays survive a rebuild. Review `c0 tools --detail` to inspect native changes; there is no need to discard the complete stage to pick up newly built default toolchains.
 
 The `c0 tools` implementation in `bin/c0` defines snapshot identity, publication, restore, and collection behavior.
 
-## Existing containers
+## Sharing and lifecycle
 
-`c0 start` resumes the same container. It recognizes both the prior writable host-bin/Git-config mounts and the current read-only host-bin/Git-config layout, while validating the checkout's other mount sources. It does not convert mounts, replace the filesystem, or change the tools selection of an existing container. Existing writable host mounts retain their original permissions; the read-only protections apply when creating a container with the current configuration.
+| Resource                  | Sharing scope                                                                            |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| TOOLS, BASE, IMAGE        | `C0_MODE` plus build identity; reused across working folders                             |
+| CONTAINER                 | Mode/build identity plus real working folder; reused by repeated commands for that tuple |
+| Persistent workspace data | Mode plus real working folder; retained across runtime removal                           |
 
-`c0 stop` stops and removes the runtime container without deleting bind mounts or named volumes. The next `c0 start` creates a fresh runtime from the current built image and selected tools. `c0 restart` is exactly stop followed by start. A build leaves a running container alone until this cycle.
+c0 derives selection from Docker images, tags, labels, containers, mounts, and named volumes. It creates no persistent c0 selector files, checkout pins, saved volume references, or replacement selector objects. Temporary build contexts and embedded immutable release manifests are build inputs and artifact contents.
 
-The writable container layer is disposable, as in the original design. Keep durable data in the declared host mounts and writable tools/launcher overlays; files stored elsewhere in the container are removed by stop.
+`c0 start` reuses the matching build/workspace container, or creates one from the completed shared image. Existing supported writable-bin/Git-config and read-only launcher/Git-config layouts remain operable without conversion. Read-only host protections apply to newly created containers. Different builds cannot concurrently mount the same workspace's writable home overlays; stop the workspace before starting its replacement build.
 
-Artifacts left by the removed lifecycle implementation are retained. Existing labeled overlay volumes can still be used by their original containers. Backup containers are excluded from primary discovery and do not block fresh creation. c0 does not restore, convert, rename, or delete those artifacts. Stop records the actual validated home-overlay volume name in per-instance checkout state under `.local/c0/` before removing the runtime. The next start reuses that same existing volume directly, including volumes left by earlier c0 implementations. This storage selection is independent of tools pins and survives builds and tools cleanup. Recorded volumes are required to exist; c0 does not silently create an empty replacement.
+`c0 stop` validates ownership, stops and removes this workspace's runtimes, and retains host binds and named volumes. `c0 restart` is exactly stop followed by start. To apply a newly built artifact to a running workspace:
 
-Builds use a private image tag and run an image check before publishing the normal runtime tag and tools selection. A missing Docker content/cache blob identified in a captured build or validation log triggers one uncached retry; ordinary package or network failures remain failures. Failed image validation retains the previously published image and checkout selection. Tools caches must contain their completeness marker and the exact resolved toolchain metadata. A tools path referenced by a running or stopped container is never overwritten. After removal, start can validate and promote a staged forced rebuild offline before creation. If a retained container still references that snapshot, start warns and retains the existing tools instead of overwriting shared data.
+```bash
+c0 build
+c0 stop
+c0 start
+```
 
-Terminal handling is portable: builds collect `xterm-256color` and the build caller's `TERM`. Interactive `c0 sh` and `c0 ssh` transfer the caller's definition using host `infocmp` and guest `tic` as UID 1000 into `~/.terminfo`; shell exec also forwards the caller's `TERM`. `c0 cp-term` remains available for an explicit system-wide copy.
+The writable container layer is disposable. Keep durable files in declared host mounts or writable tools/launcher overlays; files elsewhere in the container are removed by stop.
+
+Home-overlay storage is discovered from Docker. Existing canonical workspace storage and unambiguous labeled legacy volume lineage are reused directly. Ambiguous or conflicting Docker storage is left untouched for review. Retained backup containers are excluded from runtime selection. There is no data conversion, root-filesystem capture, or upgrade path.
+
+Completed artifacts are validated before reuse or publication. Missing Docker content identified in captured diagnostics can trigger one uncached retry; package or network failures remain failures. Referenced tools payloads are never overwritten. A forced tools rebuild can remain staged while a retained container still references the existing payload; start reports that condition rather than changing shared data.
+
+Terminal handling is portable: the image contains `xterm-256color`, and interactive `c0 sh` and `c0 ssh` transfer the caller's definition using host `infocmp` and guest `tic` as UID 1000 into `~/.terminfo`. Shell exec forwards the caller's `TERM`. `c0 cp-term` remains available for an explicit system-wide copy.
 
 
 ## Networking
@@ -417,15 +434,15 @@ Runtime containers are **not privileged**. On `c0 start`, compose applies the se
 
 `sshd` listens on guest port `2222` and runs as the `dev` user (no setuid). The host publishes **`127.0.0.1:<port>` only**.
 
-Native upgrades run inside the existing restricted runtime and can write only its OverlayFS upper, not the shared tools volume. `c0 tools accept` pauses the runtime for a consistent snapshot, uses the existing networkless namespace helper to read the merged view, and invokes a separate networkless publisher. The publisher creates a new immutable snapshot and selects it for this checkout; it never modifies the selected snapshot in place.
+Native upgrades run inside the existing restricted runtime and can write only its OverlayFS upper, not the shared tools volume. `c0 tools accept` pauses the runtime for a consistent snapshot, uses the existing networkless namespace helper to read the merged view, and invokes a separate networkless publisher. The publisher creates a new immutable tools payload and publishes its derived shared runtime image; it never modifies a mounted payload in place.
 
 ### Hardening in place
 
 | Control                   | Mechanism                                                                                                                                 |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------   |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Immutable accepted tools  | Runtime mounts only `/tools/opt/<TOOLS_ID>` at `/tools/current:ro`; other shared snapshots are not visible                                |
 | Explicit publication      | Runtime writes remain in its upper until the host operator runs `c0 tools accept`; runtime processes never receive volume-write authority |
-| Restore boundary          | `c0 tools restore` discards configured tool uppers and resumes the same container; launcher state is retained                              |
+| Restore boundary          | `c0 tools restore` discards configured tool uppers and resumes the same container; launcher state is retained                             |
 | Loopback SSH              | Pubkey-only inbound login; keys in gitignored `auth/ssh/`                                                                                 |
 | SSH agent relay           | OrbStack relay bound at `/run/host-services/ssh-auth.sock`; SSH sessions receive the same guest `SSH_AUTH_SOCK` path                      |
 | Seccomp integrity         | Tampered or missing vendored profiles block `c0 start` / `c0 build`; run `c0 seccomp-upgrade` to adopt newer Moby profiles deliberately   |
@@ -485,64 +502,34 @@ c0dev intentionally shares selected host data with guest tools and applies a con
 - Inspect tool changes with `c0 tools`; use `--detail` when the added-path summary needs expansion.
 - If staged changes are wanted, run `c0 tools accept`; otherwise run `c0 tools restore`. Neither command replaces the guest filesystem. Restore refuses a pending selection change or a stage shared with another container.
 - A failed accept leaves the previously selected snapshot complete and does not clear the writable stage.
-- Container label `c0dev.instance` identifies the checkout instance.
+- Docker labels identify the mode, build, recipe, workspace, instance, and tools payload; `c0 status` reports discovered containers.
 
-## Tools garbage collection
+## Tools publication and garbage collection
 
-Build-produced and accepted tool snapshots are immutable. The current checkout pin and running-container labels protect selected snapshots from garbage collection.
+Build-produced and accepted tools payloads are immutable. Docker images and running or stopped containers identify their referenced payloads. Garbage collection protects those references and conservatively retains accepted snapshots and unknown legacy data.
 
-### Concepts
+### Stage acceptance and restore
 
-| Concept            | Definition                                                                 |
-| ------------------ | -------------------------------------------------------------------------- |
-| Build toolset      | Immutable payload identified by `TOOLS_BUILD_ID`                           |
-| Accepted snapshot  | Immutable merged tool-home snapshot derived from the selected `TOOLS_ID`   |
-| Writable stage     | Complete OverlayFS upper reported by `c0 tools`                            |
-| Pin                | Per-checkout selection and garbage-collection claim                        |
-| Active label       | Running-container claim protecting its selected snapshot                   |
-| Garbage collection | Removes complete snapshots protected by neither a valid pin nor active use |
+`c0 tools accept` publishes the complete stage reported by `c0 tools --detail` as a new immutable tools payload and an ordinary shared runtime artifact. Its Docker labels publish the derived build and tools identity. The running container keeps its mounted tools and writable stage until stop/start; acceptance does not replace its filesystem or clear its files. Launcher state is excluded from tools acceptance and restore.
 
-### Stage acceptance
+`c0 tools restore` stops the container, clears only the configured tool uppers and work directories, and starts that same container. It refuses before mutation when the Docker-published tools differ from the mounted snapshot or another container shares the stage. It retains launcher state. Direct writers that put logs, credentials, bytecode, or configuration beneath a configured tools overlay are part of its stage.
 
-`c0 tools accept` operates on the complete stage shown by `c0 tools --detail`; there are no hidden path exclusions. It pauses the runtime, snapshots each configured merged home overlay, copies the selected immutable snapshot to a new 64-hex path, replaces its overlaid paths with the merged snapshot, records the parent and stage digest, writes `.c0dev-complete` last, and updates the checkout pin. The running container keeps its mounted snapshot and stage, and the command warns about that fixed mount. Publication does not replace the guest or clear its files; the next stop/start selects the published snapshot.
+### Inspection and cleanup
 
-`c0 tools restore` stops the container, clears only the configured tool uppers and their work directories, and starts the same container. It refuses before mutation if the checkout pin differs from the mounted snapshot or another container shares the stage. It retains launcher state and does not change the selected snapshot. Because the entire upper is the stage, direct writers that place logs, credentials, generated bytecode, or configuration beneath the overlay are included in either operation.
+Inspect the current writable stage with `c0 tools` or `c0 tools --detail`. `c0 status` reads Docker-owned workspace/container information without consulting a saved selector.
 
-### Inspecting state
-
-Current stage:
-
-```bash
-c0 tools
-c0 tools --detail
-```
-
-Pinned `TOOLS_ID` values:
-
-```bash
-docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/pins
-read -rp 'Folder ID from the list above: ' folder_id
-docker run --rm -v c0dev-tools-shared:/tools alpine cat "/tools/pins/${folder_id}.pin"
-```
-
-Toolset directories:
-
-```bash
-docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/opt
-docker run --rm -v c0dev-tools-shared:/tools alpine ls -la /tools/tmp
-```
+`c0 clean` refuses while containers reference the store and otherwise collects unused, verifiably rebuildable cache payloads. `c0 clean -a` also refuses published-image references and unknown retained data before removing an unused tools volume. Neither command removes guest containers, host caches, projects, or persistent home-overlay volumes.
 
 ### Safety guarantees
 
-- Never gives the runtime guest tools-volume write access
-- Never replaces a complete selected snapshot in place
-- Never modifies pins from inside the guest
-- Never accepts or restores without an explicit host command
-- Never triggers GC on build failure
-- Never updates pins on build failure
-- Writes the accepted snapshot completeness marker last, then updates the checkout pin
+- Runtime guests receive read-only tools-volume mounts.
+- Published images and container references protect their tools payloads.
+- Complete referenced snapshots are not replaced in place.
+- Acceptance and restore require an explicit host command.
+- Failed builds do not trigger garbage collection or replace the published runtime image.
+- Completeness markers and release manifests validate immutable artifact contents; they are not runtime-selection registries.
 
-The `tools` command behavior and state transitions are implemented in `bin/c0`.
+The tools commands are implemented in `bin/c0`.
 
 ## License
 

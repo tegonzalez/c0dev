@@ -17,11 +17,11 @@ from c0_fixture import Fixture, REPO
 
 SOURCE = (REPO/'bin/c0').read_text()
 FUNCTIONS = '\n'.join(re.search(r'^'+name+r'\(\) \{\n.*?^\}', SOURCE, re.M|re.S).group()
-    for name in ('c0_list_instance_containers', 'get_c0_container_id_any', 'get_c0_container_id',
+    for name in ('c0_list_instance_containers', 'c0_list_workspace_containers', 'get_c0_container_id_any', 'get_c0_container_id',
                  'get_c0_container_state', 'get_tools_hash_label', 'resolve_volume_host_path',
                  'is_docker_volume', 'to_display_path', 'parse_folder_mappings', 'parse_file_mappings',
                  'c0_validate_overlay_volume', 'c0_overlay_volume_for_container',
-                 'c0_overlay_selection_path', 'c0_write_overlay_selection', 'c0_validate_container_mounts', 'c0_require_docker', 'c0_stop_instance',
+                 'c0_discover_home_storage', 'c0_validate_container_mounts', 'c0_require_docker', 'c0_stop_instance',
                  'c0_validate_overlay_row', 'c0_mount_home_overlay'))
 
 

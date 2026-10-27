@@ -71,9 +71,13 @@ tools_volume_build_matches test-id
             resolver.write_text('#!'+sys.executable+'\n'+RESOLVER)
             resolver.chmod(0o755)
             script = '\n'.join(function(name) for name in (
+                'short_hash', 'c0_instance_id_for', 'c0_set_build_identity',
                 'set_tools_id', 'c0_resolve_toolchain', 'build_tools_volume')) + '''
 set -e
 C0ROOT="$TEST_ROOT"
+C0_MODE=""
+C0_MODE_KEY=prod
+C0_RECIPE_ID="$TEST_RECIPE"
 C0_BUILD_CONTEXT="$TEST_CONTEXT"
 TOOLS_RECIPE_ID="$TEST_RECIPE"
 TOOLS_BUILD_ID="$TEST_RECIPE"
@@ -125,6 +129,7 @@ build_tools_volume false ''
             script = function('c0_build_cleanup') + '''
 C0_BUILD_CONTEXT="$TEST_CONTEXT"
 TOOLS_BUILD_ID="$TEST_RECIPE"
+C0_MODE_KEY=prod
 SHARED_TOOLS_VOLUME=test-tools
 tools_volume_exists() { return 0; }
 docker() { printf 'DOCKER=%s\n' "$@" >>"$TEST_LOG"; }
@@ -142,7 +147,7 @@ c0_build_cleanup
                     result = subprocess.run(['/bin/bash', '-c', script], env=env,
                                             text=True, capture_output=True, timeout=5, cwd=context)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn('DOCKER=c0dev-tools-builder:'+expected, log.read_text())
+                    self.assertIn('DOCKER=c0dev-tools-builder-prod:'+expected, log.read_text())
                     self.assertIn('CLEANUP=/tools/tmp/'+expected+'.partial', log.read_text())
                     self.assertFalse((context/'should-not-execute').exists())
                     self.assertEqual(result.stdout, '')

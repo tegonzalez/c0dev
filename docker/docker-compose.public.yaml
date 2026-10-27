@@ -11,6 +11,7 @@ x-environment-base: &env-base
 services:
   c0dev:
     init: true
+    image: ${C0_RUNTIME_IMAGE:-c0dev-unbuilt}
     build:
       # c0 build supplies an isolated temporary context and combined Dockerfile.
       context: ${C0_BUILD_CONTEXT:-.}
@@ -33,4 +34,8 @@ services:
       c0dev.tools_hash: ${TOOLS_ID}
       c0dev.tools_volume: ${SHARED_TOOLS_VOLUME}
       c0dev.instance: ${C0_INSTANCE_ID}
+      c0dev.workspace: ${C0_WORKSPACE_ID}
+      c0dev.build: ${C0_BUILD_ID:-legacy}
+      c0dev.recipe: ${C0_RECIPE_ID}
+      c0dev.mode: ${C0_MODE_KEY}
       c0dev.security_mode: ${C0_SECURITY:-permissive}

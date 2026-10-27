@@ -36,11 +36,11 @@ class SnapshotRetention(unittest.TestCase):
 SHARED_TOOLS_VOLUME=test-shared
 IN_CONTAINER=false
 tools_volume_exists() { return 0; }
-cleanup_orphan_pins() { :; }
-get_pinned_hashes() { :; }
+get_published_tools_hashes() { printf '%s\\n' "$TEST_PUBLISHED"; }
+tools_volume_cache_matches() { return 0; }
 tools_volume_sh() {
     case "$*" in
-        'ls -1 /tools/opt'*) printf '%s\\n' "$TEST_STOPPED" "$TEST_RUNNING" "$TEST_UNUSED" ;;
+        'ls -1 /tools/opt'*) printf '%s\\n' "$TEST_STOPPED" "$TEST_RUNNING" "$TEST_UNUSED" "$TEST_PUBLISHED" ;;
         'test -f '*) return 0 ;;
         *) return 99 ;;
     esac
@@ -50,7 +50,7 @@ gc_tools_hashes
 ''')
             removals = root/'removals'
             env = dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'], TEST_FAIL=fail,
-                       TEST_REMOVALS=str(removals), TEST_STOPPED='a'*64, TEST_RUNNING='b'*64, TEST_UNUSED='c'*64)
+                       TEST_REMOVALS=str(removals), TEST_STOPPED='a'*64, TEST_RUNNING='b'*64, TEST_UNUSED='c'*64, TEST_PUBLISHED='d'*64)
             result = subprocess.run(['/bin/bash', str(script)], env=env, capture_output=True, text=True, timeout=5)
             return result, removals.read_text() if removals.exists() else ''
 
@@ -60,6 +60,7 @@ gc_tools_hashes
         self.assertNotIn('a'*64, removed)
         self.assertNotIn('b'*64, removed)
         self.assertIn('c'*64, removed)
+        self.assertNotIn('d'*64, removed)
 
     def test_failed_container_listing_prevents_deletion(self):
         result, removed = self.run_gc(fail='ps')

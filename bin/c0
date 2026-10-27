@@ -41,7 +41,9 @@ REQUIRED_FILES=(
     "$C0ROOT/docker/install-orca.sh"
     "$C0ROOT/docker/home-overlays.conf"
     "$C0ROOT/docker/c0-overlay-check"
+    "$C0ROOT/docker/c0-publish-tools"
     "$C0ROOT/bin/docker-hash"
+    "$C0ROOT/bin/c0-host-io"
     "$C0ROOT/bin/dockerfile-concat"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.json"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.sha256"
@@ -93,35 +95,95 @@ short_hash() {
 
 # Docker instance id for a c0dev tree (realpath) and mode.
 c0_instance_id_for() {
-    local c0root="$1" mode="${2:-}" root_real
+    local c0root="$1" mode="${2:-}" build="${3:-}" root_real prefix=c0dev
     root_real="$(realpath "$c0root" 2>/dev/null)" || root_real="$c0root"
-    if [[ "$mode" == "dev" ]]; then
-        echo "c0dev-dev-$(short_hash "${root_real}:dev")"
+    [[ "$mode" != dev ]] || prefix=c0dev-dev
+    if [[ -n "$build" ]]; then
+        printf '%s-%s\n' "$prefix" "$(short_hash "$mode:$build:$root_real")"
+    elif [[ "$mode" == dev ]]; then
+        printf '%s-%s\n' "$prefix" "$(short_hash "$root_real:dev")"
     else
-        echo "c0dev-$(short_hash "$root_real")"
+        printf '%s-%s\n' "$prefix" "$(short_hash "$root_real")"
     fi
 }
 
 if [[ "$C0_MODE" == "dev" ]]; then
-    C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT" dev)"
     SHARED_TOOLS_VOLUME="c0dev-tools-shared-dev"
 else
-    C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT")"
     SHARED_TOOLS_VOLUME="c0dev-tools-shared"
 fi
+C0_MODE_KEY="${C0_MODE:-prod}"
+C0_WORKSPACE_ID="$(c0_instance_id_for "$C0ROOT" "$C0_MODE")"
+C0_INSTANCE_ID="$C0_WORKSPACE_ID"
 
-# Internal Compose inputs. Runtime creation replaces these from saved storage;
+# Internal Compose inputs. Runtime creation derives these from Docker volumes;
 # inherited environment values must not select storage or affect image builds.
 export C0_HOME_OVERLAYS_VOLUME="${C0_INSTANCE_ID}-home-overlays"
 export C0_HOME_OVERLAYS_EXTERNAL=false
 
-# Offline recipe identity. A build combines it with a freshly resolved release
-# manifest before checking the tools cache. Other commands use the successful
-# per-checkout pin and never contact upstream release services.
-TOOLS_RECIPE_ID="$("$C0ROOT/bin/docker-hash" "$C0ROOT/docker/Dockerfile.base" "$C0ROOT/docker/Dockerfile.tools")"
+# Hash logical input names and contents, never the checkout's absolute path.
+c0_recipe_hash() {
+    local input digest values
+    digest="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" \
+        docker/Dockerfile.base docker/Dockerfile.tools docker/Dockerfile.runtime)" || return 1
+    values="c0-recipe-v1"$'\n'"$digest"
+    for input in 1password.asc cloud.google.gpg install-orca.sh docker-entrypoint.sh \
+        home-overlays.conf c0-overlay-check; do
+        digest="$(shasum -a 256 <"$C0ROOT/docker/$input")" || return 1
+        values+=$'\n'"docker/$input:${digest:0:64}"
+    done
+    printf '%s\n' "$values" | shasum -a 256 | awk '{print $1}'
+}
+
+TOOLS_RECIPE_ID="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" \
+    docker/Dockerfile.base docker/Dockerfile.tools)"
+C0_RECIPE_ID="$(c0_recipe_hash)"
 TOOLS_BUILD_ID="$TOOLS_RECIPE_ID"
 TOOLS_ID="$TOOLS_BUILD_ID"
 TOOLS_PREFIX="/tools/current"
+
+c0_runtime_recipe_ref() {
+    printf 'c0dev-runtime-%s:recipe-%s\n' "$C0_MODE_KEY" "$C0_RECIPE_ID"
+}
+
+c0_set_build_identity() {
+    local build="$1"
+    [[ "$build" =~ ^[0-9a-f]{64}$ ]] || {
+        echo 'error: invalid shared build identity' >&2; return 1;
+    }
+    C0_BUILD_ID="$build"
+    C0_RUNTIME_IMAGE="c0dev-runtime-${C0_MODE_KEY}:$build"
+    C0_BASE_IMAGE="c0dev-base-${C0_MODE_KEY}:$build"
+    C0_TOOLS_BUILDER_IMAGE="c0dev-tools-builder-${C0_MODE_KEY}:$TOOLS_BUILD_ID"
+    C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT" "$C0_MODE" "$build")" || return 1
+    export C0_BUILD_ID C0_RUNTIME_IMAGE C0_BASE_IMAGE C0_INSTANCE_ID C0_WORKSPACE_ID
+}
+
+# The shared recipe tag is Docker's publication of the current completed build.
+# Its labels supply the exact payload; no checkout-side selector is consulted.
+c0_resolve_shared_build() {
+    local reference metadata image build mode recipe tools volume base
+    reference="$(c0_runtime_recipe_ref)" || return 1
+    metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s" .Id (index .Config.Labels "c0dev.build") (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.tools_hash") (index .Config.Labels "c0dev.tools_volume") (index .Config.Labels "c0dev.base_image")}}' "$reference")" || {
+        echo "error: no completed shared image for this mode and recipe; run 'c0 build'" >&2
+        return 1
+    }
+    IFS=$'\t' read -r image build mode recipe tools volume base <<<"$metadata"
+    if [[ ! "$image" =~ ^sha256:[0-9a-f]{64}$ || ! "$build" =~ ^[0-9a-f]{64}$ ||
+          ! "$tools" =~ ^[0-9a-f]{64}$ || "$mode" != "$C0_MODE_KEY" ||
+          "$recipe" != "$C0_RECIPE_ID" || "$volume" != "$SHARED_TOOLS_VOLUME" ||
+          "$base" != "c0dev-base-${C0_MODE_KEY}:$build" ]]; then
+        echo 'error: shared image metadata does not match this mode and recipe' >&2
+        return 1
+    fi
+    c0_set_build_identity "$build" || return 1
+    set_tools_id "$tools" || return 1
+    TOOLS_BUILD_ID="$tools"
+    # Creation uses the inspected immutable image, even if a build retags the
+    # shared recipe while this invocation is preparing its mounts.
+    C0_RUNTIME_IMAGE="$image"
+    export C0_RUNTIME_IMAGE
+}
 
 DOCKERFILE_BASE="$C0ROOT/docker/Dockerfile.base"
 DOCKERFILE_TOOLS="$C0ROOT/docker/Dockerfile.tools"
@@ -149,7 +211,7 @@ c0_prepare_runtime_dockerfile() {
 }
 
 c0_prepare_terminfo() {
-    "$C0ROOT/bin/c0-terminfo" prepare "$C0_BUILD_CONTEXT/.terminfo"
+    TERM=xterm-256color "$C0ROOT/bin/c0-terminfo" prepare "$C0_BUILD_CONTEXT/.terminfo"
 }
 
 c0_resolve_toolchain() {
@@ -166,6 +228,10 @@ c0_resolve_toolchain() {
     TOOLS_BUILD_ID="$(printf 'c0-toolchain-build-v1\n%s\n%s\n' \
         "${TOOLS_RECIPE_ID:-$TOOLS_BUILD_ID}" "$manifest_sha" | shasum -a 256 | awk '{print $1}')" || return 1
     set_tools_id "$TOOLS_BUILD_ID" || return 1
+    local build
+    build="$(printf 'c0-runtime-build-v1\n%s\n%s\n' \
+        "$C0_RECIPE_ID" "$manifest_sha" | shasum -a 256 | awk '{print $1}')" || return 1
+    c0_set_build_identity "$build" || return 1
     # The supervisor lives in another process. Publish the worker's actual ID
     # before it can create build artifacts so cancellation cleans the right one.
     printf '%s\n' "$TOOLS_BUILD_ID" >"$C0_BUILD_CONTEXT/.c0-build-id.next" || return 1
@@ -179,7 +245,6 @@ c0_resolve_toolchain() {
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
 COMPOSE_SECURITY_PERMISSIVE="$C0ROOT/docker/docker-compose.security-permissive.yaml"
 COMPOSE_SECURITY_CAP_DROP_ALL="$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
-COMPOSE_SSH_AUTH_FILE="$C0ROOT/docker/.compose.ssh-auth.yaml"
 # OrbStack / Docker Desktop agent relay path inside the Linux VM (not a macOS socket).
 C0_SSH_AUTH_SOCK_PATH="/run/host-services/ssh-auth.sock"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
@@ -197,11 +262,6 @@ SECCOMP_PROFILE_JSON="$SECCOMP_DIR/moby-default-seccomp.json"
 SECCOMP_PROFILE_SHA="$SECCOMP_DIR/moby-default-seccomp.sha256"
 SECCOMP_LOCAL_TAG_FILE="$SECCOMP_DIR/moby-seccomp.tag"
 MOBY_PROFILES_GIT_URL="${MOBY_PROFILES_GIT_URL:-https://github.com/moby/profiles.git}"
-# Cache remote "latest" probe (git ls-remote + raw profile sha256); TTL limits network (seconds)
-C0_SECCOMP_REMOTE_CACHE_TTL="${C0_SECCOMP_REMOTE_CACHE_TTL:-21600}"
-C0_SECCOMP_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/c0dev"
-C0_SECCOMP_REMOTE_CACHE="$C0_SECCOMP_CACHE_DIR/moby-seccomp-remote.cache"
-
 # Ephemeral docker run helpers (tools volume I/O, unpack): align with least-privilege posture.
 # Runtime service hardening: docker-compose.security-*.yaml (selected via C0_SECURITY).
 c0_docker_run() {
@@ -228,7 +288,7 @@ verify_moby_seccomp_profile() {
     return 0
 }
 
-# --- Moby seccomp: query upstream, optional cache, user-driven upgrade (see cmd_seccomp_upgrade) ---
+# --- Moby seccomp: query upstream; explicit vendored-profile updates ---
 
 read_local_seccomp_tag() {
     if [[ ! -f "$SECCOMP_LOCAL_TAG_FILE" ]]; then
@@ -320,38 +380,6 @@ moby_seccomp_profile_sha256_for_tag() {
         "$url" 2>/dev/null | shasum -a 256 | awk '{print $1}'
 }
 
-moby_seccomp_remote_cache_read_field() {
-    local key="$1"
-    [[ ! -f "$C0_SECCOMP_REMOTE_CACHE" ]] && return 0
-    grep "^${key}=" "$C0_SECCOMP_REMOTE_CACHE" 2>/dev/null | head -1 | cut -d= -f2-
-}
-
-moby_seccomp_remote_cache_write() {
-    local latest_tag="$1"
-    local commit_sha="$2"
-    local profile_sha="$3"
-    mkdir -p "$C0_SECCOMP_CACHE_DIR"
-    local now
-    now="$(date +%s)"
-    cat >"$C0_SECCOMP_REMOTE_CACHE" <<EOF
-checked_epoch=$now
-latest_tag=$latest_tag
-commit_sha=$commit_sha
-profile_sha256=$profile_sha
-EOF
-}
-
-moby_seccomp_remote_cache_valid() {
-    [[ ! -f "$C0_SECCOMP_REMOTE_CACHE" ]] && return 1
-    local checked
-    checked="$(moby_seccomp_remote_cache_read_field checked_epoch)"
-    [[ -z "$checked" ]] && return 1
-    local now age
-    now="$(date +%s)"
-    age=$((now - checked))
-    [[ "$age" -lt "$C0_SECCOMP_REMOTE_CACHE_TTL" ]]
-}
-
 # After verify_moby: optionally notify if upstream has a newer seccomp tag than vendored.
 # Set C0_SECCOMP_NOTIFY=0 to skip. Uses git ls-remote + curl (no JSON parser); failures are silent.
 maybe_notify_seccomp_update_available() {
@@ -369,28 +397,13 @@ maybe_notify_seccomp_update_available() {
         return 0
     fi
 
-    local remote_tag remote_commit remote_profile use_cache=false
-    if moby_seccomp_remote_cache_valid; then
-        remote_tag="$(moby_seccomp_remote_cache_read_field latest_tag)"
-        remote_commit="$(moby_seccomp_remote_cache_read_field commit_sha)"
-        remote_profile="$(moby_seccomp_remote_cache_read_field profile_sha256)"
-        if [[ -n "$remote_tag" && -n "$remote_profile" ]]; then
-            use_cache=true
-        fi
-    fi
-
-    if [[ "$use_cache" != true ]]; then
-        local pair
-        if ! pair="$(moby_seccomp_resolve_upstream_latest)"; then
-            return 0
-        fi
-        remote_tag="$(echo "$pair" | cut -f1)"
-        remote_commit="$(echo "$pair" | cut -f2)"
-        [[ -z "$remote_tag" ]] && return 0
-        remote_profile="$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
-        [[ -z "$remote_profile" ]] && return 0
-        moby_seccomp_remote_cache_write "$remote_tag" "$remote_commit" "$remote_profile"
-    fi
+    local remote_tag remote_commit remote_profile pair
+    pair="$(moby_seccomp_resolve_upstream_latest)" || return 0
+    remote_tag="$(echo "$pair" | cut -f1)"
+    remote_commit="$(echo "$pair" | cut -f2)"
+    [[ -n "$remote_tag" ]] || return 0
+    remote_profile="$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
+    [[ -n "$remote_profile" ]] || return 0
 
     if ! moby_seccomp_tag_a_gt_b "$remote_tag" "$local_tag"; then
         return 0
@@ -442,7 +455,6 @@ cmd_seccomp_upgrade() {
 
     if [[ "$remote_tag" == "$local_tag" ]]; then
         echo -e "${GREEN}seccomp:${NC} already on latest Moby tag ${CYAN}$remote_tag${NC}"
-        moby_seccomp_remote_cache_write "$remote_tag" "$remote_commit" "$(moby_seccomp_profile_sha256_for_tag "$remote_tag")"
         exit 0
     fi
 
@@ -495,7 +507,6 @@ cmd_seccomp_upgrade() {
         mv moby-default-seccomp.sha256.tmp moby-default-seccomp.sha256
     )
     printf '%s\n' "$remote_tag" >"$SECCOMP_LOCAL_TAG_FILE"
-    rm -f "$C0_SECCOMP_REMOTE_CACHE" 2>/dev/null || true
 
     if ! verify_moby_seccomp_profile; then
         echo "error: upgraded files failed verification (restore from git)" >&2
@@ -562,9 +573,32 @@ c0_list_instance_containers() {
     done <<<"$rows"
 }
 
+# Workspace discovery comes from Docker ownership, including pre-build-key
+# runtimes. Backup artifacts are never primary runtimes.
+c0_list_workspace_containers() {
+    local rows cid name seen=$'\n' scope arg all=false
+    for arg in "$@"; do case "$arg" in -a|-aq|-qa) all=true ;; -q) ;; *) return 1 ;; esac; done
+    local -a options=()
+    [[ "$all" != true ]] || options=(-a)
+    for scope in "c0dev.workspace=${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}" "c0dev.instance=${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}"; do
+        rows="$(docker ps --no-trunc "${options[@]}" --filter "label=$scope" \
+            --format '{{printf "%s\t%s" .ID .Names}}')" || return 1
+        while IFS=$'\t' read -r cid name; do
+            [[ -n "$cid" ]] || continue
+            [[ "$name" != c0-recovery-*-"$cid" ]] || continue
+            [[ "$seen" != *$'\n'"$cid"$'\n'* ]] || continue
+            seen+="$cid"$'\n'
+            printf '%s\n' "$cid"
+        done <<<"$rows"
+    done
+}
+
 get_c0_container_id_any() {
     local ids cid selected=""
     ids="$(c0_list_instance_containers -aq)" || return 1
+    if [[ -z "$ids" && "${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}" != "$C0_INSTANCE_ID" ]]; then
+        ids="$(C0_INSTANCE_ID="$C0_WORKSPACE_ID" c0_list_instance_containers -aq)" || return 1
+    fi
     while IFS= read -r cid; do
         [[ -n "$cid" ]] || continue
         if [[ -n "$selected" ]]; then
@@ -581,6 +615,23 @@ get_c0_container_state() {
     local cid="$1"
     [[ -z "$cid" ]] && return 0
     docker inspect -f '{{.State.Status}}' "$cid"
+}
+
+# Existing pre-keyed guests remain operable using their Docker identity. A
+# missing published artifact never authorizes an empty replacement or a file
+# based selection. New creation still requires a completed shared image.
+c0_resolve_runtime_context() {
+    local cid
+    if c0_resolve_shared_build 2>/dev/null; then return 0; fi
+    C0_INSTANCE_ID="$C0_WORKSPACE_ID"
+    cid="$(get_c0_container_id_any)" || return 1
+    if [[ -n "$cid" ]]; then
+        C0_RUNTIME_IMAGE="$(docker inspect -f '{{.Image}}' "$cid")" || return 1
+        set_tools_id "$(get_tools_hash_label "$cid")" || return 1
+        export C0_INSTANCE_ID C0_RUNTIME_IMAGE
+        return 0
+    fi
+    c0_resolve_shared_build
 }
 
 get_c0_container_id() {
@@ -676,12 +727,7 @@ c0_ssh_agent_enabled() {
 }
 
 ensure_ssh_auth_compose_fragment() {
-    if ! c0_ssh_agent_enabled; then
-        rm -f "$COMPOSE_SSH_AUTH_FILE"
-        return 0
-    fi
-
-    cat >"$COMPOSE_SSH_AUTH_FILE" <<EOF
+    cat <<EOF
 services:
   c0dev:
     environment:
@@ -709,6 +755,7 @@ dc() {
     export TOOLS_ID
     export TOOLS_PREFIX
     export C0_INSTANCE_ID
+    export C0_WORKSPACE_ID C0_BUILD_ID C0_RECIPE_ID C0_MODE_KEY C0_RUNTIME_IMAGE
     export C0DEV_SSH_PORT
 
     local -a compose_files=(
@@ -726,13 +773,18 @@ dc() {
             security_file="$(c0_security_compose_file)" || return 1
             export C0_SECURITY
             compose_files+=(-f "$security_file")
-            ensure_ssh_auth_compose_fragment
-            if [[ -f "$COMPOSE_SSH_AUTH_FILE" ]]; then
-                compose_files+=(-f "$COMPOSE_SSH_AUTH_FILE")
-            fi
             ;;
     esac
 
+    case "${1:-}" in
+        up|create|run|config)
+            if c0_ssh_agent_enabled; then
+                docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" \
+                    -f <(ensure_ssh_auth_compose_fragment) "$@"
+                return $?
+            fi
+            ;;
+    esac
     docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" "$@"
 }
 
@@ -741,12 +793,59 @@ dc() {
 dc_build() {
     export SHARED_TOOLS_VOLUME TOOLS_ID TOOLS_PREFIX C0_INSTANCE_ID
     export C0_BUILD_CONTEXT DOCKERFILE_RUNTIME_BUILD
-    docker compose -p "$C0_INSTANCE_ID" \
+    # Compose adds its project to image labels, so this project must have the
+    # shared build identity rather than the working-folder runtime identity.
+    docker compose -p "c0dev-build-${C0_MODE_KEY}-${C0_BUILD_ID}" \
         -f "$VOLUMES_FOLDERS_FILE" \
         -f "$VOLUMES_FILES_FILE" \
         -f "$COMPOSE_PUBLIC_FILE" \
         -f "$C0_BUILD_CONTEXT/runtime-image.yaml" \
         build "$@"
+}
+
+c0_base_image_matches() {
+    local metadata
+    metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s" (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.build")}}' "$C0_BASE_IMAGE" 2>/dev/null)" || return 1
+    [[ "$metadata" == "$C0_MODE_KEY"$'\t'"$C0_RECIPE_ID"$'\t'"$C0_BUILD_ID" ]]
+}
+
+c0_validate_base_image() {
+    docker run --rm --pull=never --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --user 1000:1000 --entrypoint /bin/bash \
+        "$1" -c 'set -e; test "$(id -un)" = dev; bun --version >/dev/null; test -s "$SSL_CERT_FILE"'
+}
+
+c0_build_base_image() {
+    local nocache="${1:-}"
+    local staging="c0dev-base-${C0_MODE_KEY}-build:$(basename "$(dirname "$C0_BUILD_CONTEXT")")"
+    if [[ -z "$nocache" ]] && c0_base_image_matches && c0_validate_base_image "$C0_BASE_IMAGE"; then
+        echo '📦 Base: valid'
+        return 0
+    fi
+    echo '🏗️  Building shared base image...'
+    if ! docker build --pull $nocache "${C0_TOOLCHAIN_BUILD_ARGS[@]}" \
+        --target base --label "c0dev.mode=$C0_MODE_KEY" \
+        --label "c0dev.recipe=$C0_RECIPE_ID" --label "c0dev.build=$C0_BUILD_ID" \
+        -f "$DOCKERFILE_BASE" -t "$staging" "$C0_BUILD_CONTEXT"; then
+        docker image rm "$staging" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! c0_validate_base_image "$staging"; then
+        docker image rm "$staging" >/dev/null 2>&1 || true
+        return 1
+    fi
+    docker image tag "$staging" "$C0_BASE_IMAGE" || return 1
+    docker image rm "$staging" >/dev/null 2>&1 || true
+}
+
+c0_publish_runtime_image() {
+    local image="$1" reference
+    reference="$(c0_runtime_recipe_ref)" || return 1
+    docker image inspect "$C0_BASE_IMAGE" >/dev/null || return 1
+    docker image tag "$image" "$C0_RUNTIME_IMAGE" || return 1
+    # Updating the shared recipe tag publishes the completed image to every
+    # working folder; Docker supplies the previous image until this succeeds.
+    docker image tag "$image" "$reference"
 }
 
 # Docker can retain a tag whose backing content has disappeared. Build privately
@@ -756,8 +855,8 @@ c0_docker_content_failure() {
 }
 
 c0_validate_runtime_image() {
-    local image
-    image="$(docker image inspect --format '{{.Id}}' "$C0_RUNTIME_BUILD_TAG")" || return 1
+    local image reference="${1:-$C0_RUNTIME_BUILD_TAG}"
+    image="$(docker image inspect --format '{{.Id}}' "$reference")" || return 1
     [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || {
         echo 'error: Docker returned an invalid built image identity' >&2; return 1;
     }
@@ -777,12 +876,36 @@ c0_validate_runtime_image() {
     printf '%s\n' "$image" >"$C0_BUILD_CONTEXT/.runtime-image-id"
 }
 
+c0_runtime_image_matches() {
+    local metadata expected
+    metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s\t%s\t%s\t%s" (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.build") (index .Config.Labels "c0dev.tools_hash") (index .Config.Labels "c0dev.tools_volume") (index .Config.Labels "c0dev.base_image")}}' "$C0_RUNTIME_IMAGE" 2>/dev/null)" || return 1
+    expected="$C0_MODE_KEY"$'\t'"$C0_RECIPE_ID"$'\t'"$C0_BUILD_ID"$'\t'"$TOOLS_ID"$'\t'"$SHARED_TOOLS_VOLUME"$'\t'"$C0_BASE_IMAGE"
+    [[ "$metadata" == "$expected" ]]
+}
+
 c0_build_runtime_image() {
     local nocache="${1:-}" attempt=0 status image log
-    local C0_RUNTIME_BUILD_TAG="${C0_INSTANCE_ID}-build:$(basename "$(dirname "$C0_BUILD_CONTEXT")")"
+    local C0_RUNTIME_BUILD_TAG="c0dev-runtime-${C0_MODE_KEY}-build:$(basename "$(dirname "$C0_BUILD_CONTEXT")")"
     log="$C0_BUILD_CONTEXT/runtime-build.log"
-    printf 'services:\n  %s:\n    image: %s\n' "$MAIN_SERVICE" "$C0_RUNTIME_BUILD_TAG" \
-        >"$C0_BUILD_CONTEXT/runtime-image.yaml" || return 1
+    if [[ -z "$nocache" ]] && c0_runtime_image_matches && c0_validate_runtime_image "$C0_RUNTIME_IMAGE" >"$log" 2>&1; then
+        image="$(cat "$C0_BUILD_CONTEXT/.runtime-image-id")" || return 1
+        c0_publish_runtime_image "$image" || return 1
+        echo '📦 Image: valid'
+        return 0
+    fi
+    cat >"$C0_BUILD_CONTEXT/runtime-image.yaml" <<EOF
+services:
+  $MAIN_SERVICE:
+    image: $C0_RUNTIME_BUILD_TAG
+    build:
+      labels:
+        c0dev.mode: "$C0_MODE_KEY"
+        c0dev.recipe: "$C0_RECIPE_ID"
+        c0dev.build: "$C0_BUILD_ID"
+        c0dev.tools_hash: "$TOOLS_ID"
+        c0dev.tools_volume: "$SHARED_TOOLS_VOLUME"
+        c0dev.base_image: "$C0_BASE_IMAGE"
+EOF
     while :; do
         # Keep Docker attached to the caller's terminal for its normal progress
         # renderer. A pipe makes Compose select verbose plain output instead.
@@ -811,28 +934,16 @@ c0_build_runtime_image() {
             continue
         fi
         docker image rm "$C0_RUNTIME_BUILD_TAG" >/dev/null 2>&1 || true
-        echo 'error: image build or validation failed; previous published image and tools selection retained' >&2
+        echo 'error: image build or validation failed; previous shared image retained' >&2
         return 1
     done
     image="$(cat "$C0_BUILD_CONTEXT/.runtime-image-id")" || return 1
-    docker image inspect --format '{{.Id}}' "${C0_INSTANCE_ID}-${MAIN_SERVICE}:latest" \
-        >"$C0_BUILD_CONTEXT/.previous-runtime-image-id" 2>/dev/null || true
-    docker image tag "$image" "${C0_INSTANCE_ID}-${MAIN_SERVICE}:latest" || return 1
-    docker image rm "$C0_RUNTIME_BUILD_TAG" >/dev/null 2>&1 || true
-}
-
-c0_restore_build_image() {
-    local published="${C0_INSTANCE_ID}-${MAIN_SERVICE}:latest" current previous built
-    built="$(cat "$C0_BUILD_CONTEXT/.runtime-image-id")" || return 1
-    current="$(docker image inspect --format '{{.Id}}' "$published")" || return 1
-    # Another completed build may have published while this one was failing.
-    [[ "$current" == "$built" ]] || return 0
-    previous="$(cat "$C0_BUILD_CONTEXT/.previous-runtime-image-id")" || return 1
-    if [[ "$previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        docker image tag "$previous" "$published"
-    else
-        docker image rm "$published" >/dev/null
+    if ! c0_publish_runtime_image "$image"; then
+        docker image rm "$C0_RUNTIME_BUILD_TAG" >/dev/null 2>&1 || true
+        echo 'error: shared image publication failed; build did not complete' >&2
+        return 1
     fi
+    docker image rm "$C0_RUNTIME_BUILD_TAG" >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -1081,11 +1192,15 @@ print_orca_endpoint() {
     fi
 }
 
+c0_host_io() {
+    /usr/bin/python3 -I "${C0_HOST_IO:-$C0ROOT/bin/c0-host-io}" "$C0ROOT" "$@"
+}
+
 c0_ssh_write_sshd_config() {
     local ssh_dir="$C0_SSH_DIR"
     # AcceptEnv * : allowlist only. Values arrive per-attach via client SendEnv.
     # Written on keygen/start (bind-mounted auth/ssh/); not rewritten on c0 ssh attach.
-    cat >"$ssh_dir/sshd_config" <<EOF
+    c0_host_io write-config "$ssh_dir/sshd_config" <<EOF
 Port 2222
 ListenAddress 0.0.0.0
 PermitTTY yes
@@ -1102,27 +1217,10 @@ AcceptEnv *
 SetEnv SSH_AUTH_SOCK=${C0_SSH_AUTH_SOCK_PATH}
 X11Forwarding yes
 EOF
-    chmod 644 "$ssh_dir/sshd_config"
 }
 
 c0_ssh_keygen() {
-    local ssh_dir="$C0_SSH_DIR"
-
-    chmod 700 "$ssh_dir"
-
-    if [[ ! -f "$ssh_dir/id_ed25519" ]]; then
-        ssh-keygen -t ed25519 -a 100 -f "$ssh_dir/id_ed25519" -N "" -C "c0dev@${C0_INSTANCE_ID}"
-    fi
-
-    if [[ ! -f "$ssh_dir/ssh_host_ed25519_key" ]]; then
-        ssh-keygen -t ed25519 -a 100 -f "$ssh_dir/ssh_host_ed25519_key" -N "" -C "c0dev-sshd@${C0_INSTANCE_ID}"
-    fi
-
-    if [[ ! -s "$ssh_dir/authorized_keys" ]]; then
-        cat "$ssh_dir/id_ed25519.pub" >"$ssh_dir/authorized_keys"
-        chmod 600 "$ssh_dir/authorized_keys"
-    fi
-
+    c0_host_io prepare-ssh "$C0_SSH_DIR" "$C0_INSTANCE_ID" || return 1
     c0_ssh_write_sshd_config
 }
 
@@ -1147,6 +1245,7 @@ c0_container_log_tail() {
 c0_require_container_running() {
     local state
     c0_require_docker || return 1
+    c0_resolve_runtime_context || return 1
     C0_RUNTIME_CID="$(get_c0_container_id_any)" || return 1
     if [[ -z "$C0_RUNTIME_CID" ]]; then
         echo "error: container not running — run 'c0 start' first" >&2
@@ -1172,25 +1271,37 @@ c0_wait_container_running() {
 }
 
 c0_stop_instance() {
-    local cid volume remaining
+    local ids cid instance instances=$'\n' remaining storage volume
+    local -a containers=()
     c0_require_docker || return 1
-    cid="$(get_c0_container_id_any)" || return 1
-    [[ -n "$cid" ]] || return 0
-    c0_validate_container_mounts "$cid" false true || return 1
-    volume="$(c0_overlay_volume_for_container "$cid")" || return 1
-    # Save only the existing volume name before removing its container. This
-    # also replaces stale selection metadata with the actual validated mount.
-    if ! c0_write_overlay_selection "$volume"; then
-        echo 'error: could not retain home-overlay selection; container was left unchanged' >&2
-        return 1
-    fi
-    # Match the original compose down lifecycle without deleting any volumes or
-    # adopting retained backup containers. The runtime layer is disposable.
-    docker stop "$cid" >/dev/null || return 1
-    docker rm "$cid" >/dev/null || return 1
-    remaining="$(get_c0_container_id_any)" || return 1
+    ids="$(c0_list_workspace_containers -aq)" || return 1
+    while IFS= read -r cid; do
+        [[ -n "$cid" ]] || continue
+        c0_validate_container_mounts "$cid" false true || return 1
+        instance="$(docker inspect -f '{{ index .Config.Labels "c0dev.instance" }}' "$cid")" || return 1
+        if [[ "$instances" == *$'\n'"$instance"$'\n'* ]]; then
+            echo 'error: duplicate runtimes claim the same build/workspace; containers were left unchanged' >&2
+            return 1
+        fi
+        instances+="$instance"$'\n'
+        containers+=("$cid")
+    done <<<"$ids"
+    [[ ${#containers[@]} -gt 0 ]] || return 0
+    # Volumes remain Docker objects. No registry is written before teardown.
+    storage="$(c0_discover_home_storage)" || return 1
+    storage="${storage%%$'\t'*}"
+    for cid in "${containers[@]}"; do
+        volume="$(c0_overlay_volume_for_container "$cid")" || return 1
+        if [[ "$volume" != "$storage" ]]; then
+            echo 'error: active and retained Docker storage conflict; containers and data were left unchanged for review' >&2
+            return 1
+        fi
+    done
+    docker stop "${containers[@]}" >/dev/null || return 1
+    docker rm "${containers[@]}" >/dev/null || return 1
+    remaining="$(c0_list_workspace_containers -aq)" || return 1
     if [[ -n "$remaining" ]]; then
-        echo "error: instance $C0_INSTANCE_ID still has a container: $remaining" >&2
+        echo "error: workspace still has runtimes: $remaining" >&2
         return 1
     fi
 }
@@ -1281,74 +1392,85 @@ c0_mount_home_overlay() {
         --cap-add FOWNER \
         --security-opt seccomp=unconfined \
         --security-opt no-new-privileges:true \
-        alpine \
-        nsenter -t 1 -m -r -w -- /bin/sh -eu -c '
+        alpine /bin/sh -eu -c 'exec 3</; exec 4</proc; exec 5>/dev/null; exec "$@"' c0-helper-root \
+        nsenter -t 1 -m --root=/proc/self/fd/3 --wd=/proc/self/fd/4 -- /bin/sh -eu -c '            exec 3<&-
+            exec 4<&-
             guest_rel=$1
             tools_rel=$2
             tools_prefix=$3
             tools_id=$4
+            # Executables and their dynamic loader remain in the read-only helper root.
+            # Only data and mount targets are addressed through the target'"'"'s held proc root.
+            guest_root=1/root
             name=${guest_rel#.}
-            name=$(printf "%s" "$name" | tr "/" "-")
-            target="/home/dev/$guest_rel"
-            lower="$tools_prefix/$tools_rel"
-            state_root=/run/c0/overlay-state
-            upper="$state_root/upper/$name"
-            work="$state_root/work/$tools_id/$name"
+            name=$(printf '"'"'%s'"'"' "$name" | tr '"'"'/'"'"' '"'"'-'"'"')
+            target_guest="/home/dev/$guest_rel"
+            lower_guest="$tools_prefix/$tools_rel"
+            state_guest=/run/c0/overlay-state
+            upper_guest="$state_guest/upper/$name"
+            work_guest="$state_guest/work/$tools_id/$name"
             if [ "$guest_rel" = bin ]; then
-                lower=/run/c0/host-bin
-                upper="$state_root/launcher/upper"
-                work="$state_root/launcher/work"
-                case ",$(findmnt -T "$lower" -n -o OPTIONS)," in
-                    *,ro,*) ;;
-                    *) echo "error: launcher lower must be read-only: $lower" >&2; exit 1 ;;
-                esac
+                lower_guest=/run/c0/host-bin
+                upper_guest="$state_guest/launcher/upper"
+                work_guest="$state_guest/launcher/work"
             fi
-
-            [ -d "$lower" ] || {
-                echo "error: overlay lower missing: $lower" >&2
-                exit 1
+            target="$guest_root$target_guest"
+            lower="$guest_root$lower_guest"
+            upper="$guest_root$upper_guest"
+            work="$guest_root$work_guest"
+            # Read kernel mount facts with helper-owned tools, never guest findmnt/PATH.
+            mount_fact() {
+                awk -v path="$1" -v field="$2" '"'"'
+                    $5 == path || (substr(path,1,length($5)+1) == $5 "/") {
+                        if (length($5) >= longest) {
+                            longest=length($5); options=$6; type=""
+                            for (i=7;i<=NF;i++) if ($i == "-") { type=$(i+1); break }
+                        }
+                    }
+                    END { if (field == "type") print type; else print options }
+                '"'"' 1/mountinfo
             }
-            [ -d "$state_root" ] || {
-                echo "error: overlay state volume missing: $state_root" >&2
-                exit 1
+            case ",$(mount_fact "$lower_guest" options)," in
+                *,ro,*) ;;
+                *) echo '"'"'error: overlay lower must be read-only'"'"' >&2; exit 1 ;;
+            esac
+            [ -d "$lower" ] && [ ! -L "$lower" ] || {
+                echo '"'"'error: unsafe or missing overlay lower'"'"' >&2; exit 1;
             }
-
+            [ -d "$guest_root$state_guest" ] && [ ! -L "$guest_root$state_guest" ] || {
+                echo '"'"'error: unsafe or missing overlay state'"'"' >&2; exit 1;
+            }
+            # Refuse redirected control ancestors before privileged mkdir/chown/mount.
+            for path in "$state_guest/upper" "$state_guest/work" "$state_guest/work/$tools_id"             "$state_guest/launcher" "$upper_guest" "$work_guest"; do
+                [ ! -L "$guest_root$path" ] || {
+                    echo '"'"'error: redirected overlay state path'"'"' >&2; exit 1;
+                }
+            done
             mkdir -p "$upper" "$work"
             chown 1000:1000 "$upper"
             chmod 0700 "$upper"
             [ "$(stat -c %d "$upper")" = "$(stat -c %d "$work")" ] || {
-                echo "error: overlay upper and work are on different filesystems" >&2
-                exit 1
+                echo '"'"'error: overlay upper and work are on different filesystems'"'"' >&2; exit 1;
             }
-
             if [ -L "$target" ]; then
                 old_target=$(readlink "$target")
                 case "$old_target" in
                     "$tools_prefix"/*) rm "$target" ;;
-                    *)
-                        echo "error: refusing to replace unexpected symlink: $target -> $old_target" >&2
-                        exit 1
-                        ;;
+                    *) echo '"'"'error: refusing unexpected overlay target symlink'"'"' >&2; exit 1 ;;
                 esac
             fi
-            if mountpoint -q "$target" 2>/dev/null; then
-                findmnt -T "$target" -n -o FSTYPE | grep -qx overlay || {
-                    echo "error: non-overlay mount already exists at $target" >&2
-                    exit 1
+            if mountpoint -q "$target" 2>&5; then
+                [ "$(mount_fact "$target_guest" type)" = overlay ] || {
+                    echo '"'"'error: non-overlay mount already covers target'"'"' >&2; exit 1;
                 }
                 exit 0
             fi
             if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-                echo "error: refusing to cover non-empty directory: $target" >&2
-                exit 1
+                echo '"'"'error: refusing to cover non-empty overlay target'"'"' >&2; exit 1
             fi
             mkdir -p "$target"
             chown 1000:1000 "$target"
-
-            mount -t overlay overlay \
-                -o "rw,lowerdir=$lower,upperdir=$upper,workdir=$work,userxattr,index=off,metacopy=off,redirect_dir=nofollow" \
-                "$target"
-        ' c0-overlay-mount "$guest_rel" "$tools_rel" "$TOOLS_PREFIX" "$TOOLS_ID"
+            mount -t overlay overlay     -o "rw,lowerdir=$lower,upperdir=$upper,workdir=$work,userxattr,index=off,metacopy=off,redirect_dir=nofollow"     "$target"' c0-overlay-mount "$guest_rel" "$tools_rel" "$TOOLS_PREFIX" "$TOOLS_ID"
 }
 
 c0_setup_home_overlays() {
@@ -1427,9 +1549,12 @@ c0_snapshot_home_overlays() {
             --cap-add DAC_READ_SEARCH \
             --security-opt seccomp=unconfined \
             --security-opt no-new-privileges:true \
-            --entrypoint /usr/bin/nsenter "$C0_TOOLS_HELPER_IMAGE" -t 1 -m -- \
+            --entrypoint /bin/sh "$C0_TOOLS_HELPER_IMAGE" -eu -c \
+            'exec 3</; exec 4</proc; exec "$@"' c0-snapshot-helper \
+            /usr/bin/nsenter -t 1 -m --root=/proc/self/fd/3 --wd=/proc/self/fd/4 -- \
+            /bin/sh -eu -c 'exec 3<&-; exec 4<&-; exec "$@"' c0-snapshot-tar \
             /bin/tar --xattrs --xattrs-include='*' --acls --numeric-owner \
-                -C /proc/1/root/home/dev -cf - "$guest_rel" \
+                -C 1/root/home/dev -cf - "$guest_rel" \
             >"$archive"; then
             echo "error: failed to snapshot $guest_rel" >&2
             failed=1
@@ -1538,7 +1663,7 @@ c0_tools_helper_image() {
 
 # Storage identity is independent of toolchain selection and container lifetime.
 c0_validate_overlay_volume() {
-    local volume="$1" generation owner canonical="${C0_INSTANCE_ID}-home-overlays"
+    local volume="$1" generation owner canonical="${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}-home-overlays"
     if [[ "$volume" == "$canonical" ]]; then return 0; fi
     generation="${volume#"${canonical}-"}"
     if [[ "$generation" == "$volume" || ! "$generation" =~ ^[0-9a-f]{32}$ ]]; then
@@ -1546,7 +1671,7 @@ c0_validate_overlay_volume() {
         return 1
     fi
     owner="$(docker volume inspect -f '{{ index .Labels "c0dev.instance" }}' "$volume")" || return 1
-    [[ "$owner" == "$C0_INSTANCE_ID" ]] || {
+    [[ "$owner" == "${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}" ]] || {
         echo "error: home-overlay volume belongs to another checkout" >&2; return 1;
     }
     owner="$(docker volume inspect -f '{{ index .Labels "c0dev.overlay_generation" }}' "$volume")" || return 1
@@ -1562,47 +1687,37 @@ c0_overlay_volume_for_container() {
     printf '%s\n' "$volume"
 }
 
-c0_overlay_selection_path() {
-    printf '%s/.local/c0/%s.home-overlays-volume\n' "$C0ROOT" "$C0_INSTANCE_ID"
-}
-
-c0_write_overlay_selection() {
-    (
-        local volume="$1" path directory temporary
-        c0_validate_overlay_volume "$volume" || exit 1
-        path="$(c0_overlay_selection_path)" || exit 1
-        directory="${path%/*}"
-        if [[ -L "$directory" || -L "$path" ||
-              ( -e "$directory" && ! -d "$directory" ) ||
-              ( -e "$path" && ! -f "$path" ) ]]; then
-            echo 'error: invalid home-overlay selection file; container was left unchanged' >&2
-            exit 1
+# A legacy volume's existing lineage labels are Docker state, not a mutable
+# selector. Only an unambiguous leaf can be reused; timestamps are irrelevant.
+c0_discover_home_storage() {
+    local workspace="${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}"
+    local canonical="$workspace-home-overlays" names volume source candidates=$'\n' parents=$'\n' selected=""
+    names="$(docker volume ls --filter "name=$canonical" --format '{{.Name}}')" || return 1
+    while IFS= read -r volume; do
+        [[ -n "$volume" ]] || continue
+        if [[ "$volume" != "$canonical" && ! "$volume" =~ ^${canonical}-[0-9a-f]{32}$ ]]; then continue; fi
+        c0_validate_overlay_volume "$volume" || return 1
+        candidates+="$volume"$'\n'
+        if [[ "$volume" != "$canonical" ]]; then
+            source="$(docker volume inspect -f '{{ index .Labels "c0dev.overlay_source" }}' "$volume")" || return 1
+            case "$source" in ''|'<no value>') ;; *) parents+="$source"$'\n' ;; esac
         fi
-        umask 077
-        mkdir -p "$directory" || exit 1
-        temporary="$(mktemp "$directory/.home-overlays.XXXXXX")" || exit 1
-        trap 'rm -f "$temporary"' EXIT
-        printf '%s\n' "$volume" >"$temporary" && mv -f "$temporary" "$path"
-    )
-}
-
-c0_read_overlay_selection() {
-    local path volume
-    path="$(c0_overlay_selection_path)" || return 1
-    if [[ ! -e "$path" && ! -L "$path" ]]; then
-        printf '%s-home-overlays\tfalse\n' "$C0_INSTANCE_ID"
-        return 0
+    done <<<"$names"
+    while IFS= read -r volume; do
+        [[ -n "$volume" ]] || continue
+        [[ "$parents" != *$'\n'"$volume"$'\n'* ]] || continue
+        if [[ -n "$selected" ]]; then
+            echo 'error: Docker contains ambiguous home storage; no volume was changed or selected by recency' >&2
+            return 1
+        fi
+        selected="$volume"
+    done <<<"$candidates"
+    if [[ -z "$selected" ]]; then
+        [[ "$candidates" == $'\n' ]] || { echo 'error: invalid home-volume lineage in Docker' >&2; return 1; }
+        printf '%s\tfalse\n' "$canonical"
+    else
+        printf '%s\ttrue\n' "$selected"
     fi
-    [[ -f "$path" && ! -L "$path" ]] || {
-        echo 'error: invalid home-overlay selection file' >&2; return 1;
-    }
-    volume="$(cat "$path")" || return 1
-    c0_validate_overlay_volume "$volume" || return 1
-    docker volume inspect "$volume" >/dev/null || {
-        echo "error: selected home-overlay volume is missing: $volume; existing selection retained" >&2
-        return 1
-    }
-    printf '%s\ttrue\n' "$volume"
 }
 
 cmd_ssh() {
@@ -1747,32 +1862,14 @@ c0_orca_guest_listening() {
 }
 
 c0_orca_print_serve_output() {
-    if [[ -f "$C0_ORCA_LOG_HOST" ]]; then
-        cat "$C0_ORCA_LOG_HOST"
-    fi
+    c0_host_io read-log "$C0_ORCA_LOG_HOST"
 }
 
 c0_orca_wait_for_urls() {
-    local n=0 printed=0 lines
-    while true; do
-        if [[ -f "$C0_ORCA_LOG_HOST" ]]; then
-            lines="$(wc -l < "$C0_ORCA_LOG_HOST" | tr -d ' ')"
-            lines="${lines:-0}"
-            if [[ "$lines" -gt "$printed" ]]; then
-                tail -n +"$((printed + 1))" "$C0_ORCA_LOG_HOST"
-                printed="$lines"
-            fi
-            if grep -q '^Pairing URL:' "$C0_ORCA_LOG_HOST" 2>/dev/null; then
-                return 0
-            fi
-        fi
-        n=$((n + 1))
-        if [[ "$n" -gt 80 ]]; then
-            echo "error: orca serve did not print a Pairing URL on $(orca_remote_display)" >&2
-            return 1
-        fi
-        sleep 0.25
-    done
+    if ! c0_host_io wait-log "$C0_ORCA_LOG_HOST"; then
+        echo "error: orca serve did not provide safe Pairing URL output on $(orca_remote_display)" >&2
+        return 1
+    fi
 }
 
 cmd_orca_status() {
@@ -1815,8 +1912,7 @@ cmd_orca_start() {
         return 0
     fi
 
-    mkdir -p "$(dirname "$C0_ORCA_LOG_HOST")"
-    : >"$C0_ORCA_LOG_HOST"
+    c0_host_io reset-log "$C0_ORCA_LOG_HOST" || return 1
 
     remote_script="$(cat <<EOF
 set -euo pipefail
@@ -2166,7 +2262,7 @@ c0_validate_container_mounts() {
                 echo "error: guest bin overlay is missing; run c0 start to initialize mounts" >&2; exit 1
             }
             case ",$(findmnt -T /home/dev/bin -n -o OPTIONS)," in
-                *,lowerdir=/run/c0/host-bin,*) ;;
+                *,lowerdir=/run/c0/host-bin,*|*,lowerdir=/proc/1/root/run/c0/host-bin,*|*,lowerdir=1/root/run/c0/host-bin,*) ;;
                 *) echo "error: guest bin overlay has unexpected lowerdir" >&2; exit 1 ;;
             esac
         fi
@@ -2473,51 +2569,8 @@ get_active_hashes() {
 }
 
 # =============================================================================
-# Pin management helpers (Phase 2)
+# Tools selection and collection derive from Docker artifacts, never registries.
 # =============================================================================
-
-# Compute folder identity (sha256 of realpath C0ROOT:C0_MODE)
-compute_folder_id() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 1
-    fi
-    echo -n "${C0ROOT}:${C0_MODE}" | shasum -a 256 | cut -c1-64
-}
-
-# Get pin path for a folder ID
-pin_path_for_folder_id() {
-    local folder_id="$1"
-    echo "/tools/pins/${folder_id}.pin"
-}
-
-# Extract tools_id from pin file content (tools_id= preferred; hash= for legacy pins)
-pin_tools_id_from_content() {
-    local content="$1"
-    local id
-    id="$(echo "$content" | grep '^tools_id=' | cut -d= -f2-)"
-    if [[ -n "$id" ]]; then
-        echo "$id"
-        return 0
-    fi
-    echo "$content" | grep '^hash=' | cut -d= -f2-
-}
-
-# Read pin for current folder (returns tools_id or empty; GC metadata only)
-read_pin_for_folder_id() {
-    local folder_id="$1"
-    local pin_path
-    pin_path="$(pin_path_for_folder_id "$folder_id")"
-
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
-    local content
-    content="$(tools_volume_sh "cat '$pin_path' 2>/dev/null || true")"
-    if [[ -n "$content" ]]; then
-        pin_tools_id_from_content "$content"
-    fi
-}
 
 set_tools_id() {
     local tools_id="$1"
@@ -2530,247 +2583,62 @@ set_tools_id() {
     export TOOLS_ID TOOLS_PREFIX
 }
 
-# A successful build pins TOOLS_BUILD_ID. An explicit `c0 tools accept` pins a
-# derived immutable snapshot. The pin is therefore both the GC claim and this
-# checkout's selected tools ref.
 resolve_tools_selection() {
-    local folder_id selected
-
-    set_tools_id "$TOOLS_BUILD_ID" || return 1
-    tools_volume_exists || return 0
-
-    folder_id="$(compute_folder_id)"
-    selected="$(read_pin_for_folder_id "$folder_id")"
-    [[ -z "$selected" ]] && return 0
-
-    if [[ ! "$selected" =~ ^[0-9a-f]{64}$ ]]; then
-        echo "warning: ignoring malformed tools selection for this checkout" >&2
-        return 0
-    fi
-    if ! tools_volume_hash_complete "$selected"; then
-        echo "warning: selected tools snapshot is incomplete; using build tools" >&2
-        return 0
-    fi
-    set_tools_id "$selected"
+    c0_resolve_shared_build || return 1
+    set_tools_id "$TOOLS_BUILD_ID"
 }
 
-# Write pin for current folder
-write_pin_for_folder_id() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 0
-    fi
-
-    local folder_id="$1"
-    local hash="$2"
-    local c0root="$3"
-    local mode="$4"
-    local pin_path
-    [[ "$folder_id" =~ ^[0-9a-f]{64}$ && "$hash" =~ ^[0-9a-f]{64}$ ]] || {
-        echo "error: invalid tools pin identity" >&2; return 1;
-    }
-    pin_path="$(pin_path_for_folder_id "$folder_id")"
-    c0root="$(realpath "$c0root" 2>/dev/null || echo "$c0root")"
-    [[ "$c0root$mode" != *$'\n'* && "$c0root$mode" != *$'\r'* ]] || {
-        echo "error: tools pin metadata cannot contain line breaks" >&2; return 1;
-    }
-
-    local updated_at
-    updated_at="$(date +%s)"
-
-    tools_volume_sh "
-        set -e
-        umask 022
-        mkdir -p /tools/pins
-        pin_temporary=\$(mktemp /tools/pins/.pin.XXXXXX)
-        trap 'rm -f \"\$pin_temporary\"' EXIT
-        cat >\"\$pin_temporary\" <<'C0_PIN_CONTENT'
-tools_id=$hash
-hash=$hash
-c0root=$c0root
-mode=$mode
-updated_at=$updated_at
-C0_PIN_CONTENT
-        mv \"\$pin_temporary\" '$pin_path'
-    " >/dev/null
-}
-
-# Destructive tools operations must distinguish an absent pin from an API/read error.
-c0_read_tools_pin_strict() {
-    local folder="$1" path content selection
-    [[ "$folder" =~ ^[0-9a-f]{64}$ ]] || return 1
-    docker volume inspect "$SHARED_TOOLS_VOLUME" >/dev/null || return 1
-    path="$(pin_path_for_folder_id "$folder")" || return 1
-    content="$(tools_volume_sh "
-        if [ -L '$path' ] || { [ -e '$path' ] && [ ! -f '$path' ]; }; then exit 2; fi
-        if [ -f '$path' ]; then printf 'present\\n'; cat '$path'; else printf 'absent\\n'; fi
-    ")" || return 1
-    if [[ "$content" == absent ]]; then return 0; fi
-    [[ "$content" == present$'\n'* ]] || return 1
-    selection="$(pin_tools_id_from_content "${content#*$'\n'}")" || return 1
-    [[ "$selection" =~ ^[0-9a-f]{64}$ ]] || {
-        echo "error: existing tools selection is malformed; refusing to replace it" >&2; return 1;
-    }
-    printf '%s\n' "$selection"
-}
-
-# Delete pin for current folder
-delete_pin_for_folder_id() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 0
-    fi
-
-    local folder_id="$1"
-    local pin_path
-    pin_path="$(pin_path_for_folder_id "$folder_id")"
-
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
-    tools_volume_sh "rm -f '$pin_path'" >/dev/null 2>&1 || true
-}
-
-# List all pins (outputs: folder_id hash c0root on each line)
-list_all_pins() {
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
-    local pins_list
-    pins_list="$(tools_volume_sh "ls /tools/pins/*.pin 2>/dev/null || true")"
-    [[ -z "$pins_list" ]] && return 0
-
-    local pin_file
-    while IFS= read -r pin_file; do
-        [[ -z "$pin_file" ]] && continue
-        local folder_id
-        folder_id="$(basename "$pin_file" .pin)"
-        local content
-        content="$(tools_volume_sh "cat '$pin_file' 2>/dev/null || true")"
-        if [[ -n "$content" ]]; then
-            local hash c0root
-            hash="$(pin_tools_id_from_content "$content")"
-            c0root="$(echo "$content" | grep '^c0root=' | cut -d= -f2-)"
-            if [[ -n "$hash" && -n "$c0root" ]]; then
-                echo "$folder_id $hash $c0root"
-            fi
-        fi
-    done <<<"$pins_list"
-}
-
-# =============================================================================
-# Garbage collection helpers (Phase 5)
-# =============================================================================
-
-# Clean up orphan pins (pins for folders deleted from disk)
-cleanup_orphan_pins() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 0
-    fi
-
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
-    local pin_info folder_id hash c0root
-    while read -r folder_id hash c0root; do
-        [[ -z "$folder_id" ]] && continue
-        if [[ ! -d "$c0root" ]]; then
-            # Folder deleted, remove orphan pin
-            delete_pin_for_folder_id "$folder_id"
-        fi
-    done < <(list_all_pins)
-}
-
-# Get all pinned hashes (from valid pins only)
-get_pinned_hashes() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 0
-    fi
-
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
+# Every published runtime image names its immutable tools content. Multiple
+# workspaces and stopped containers may legitimately retain older content.
+get_published_tools_hashes() {
+    local images image hash
     local -a hashes=()
-    local pin_info folder_id hash c0root
-    while read -r folder_id hash c0root; do
-        [[ -z "$folder_id" ]] && continue
-        if [[ -d "$c0root" ]]; then
-            hashes+=("$hash")
-        fi
-    done < <(list_all_pins)
-
-    # Return unique hashes (sorted)
-    if [[ ${#hashes[@]} -gt 0 ]]; then
-        printf '%s\n' "${hashes[@]}" | sort -u
-    fi
+    images="$(docker image ls -aq --filter "label=c0dev.tools_volume=$SHARED_TOOLS_VOLUME")" || return 1
+    while IFS= read -r image; do
+        [[ -n "$image" ]] || continue
+        hash="$(docker image inspect --format '{{ index .Config.Labels "c0dev.tools_hash" }}' "$image")" || return 1
+        [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "error: published Docker artifact has an invalid tools reference: $image" >&2
+            return 1
+        }
+        hashes+=("$hash")
+    done <<<"$images"
+    if [[ ${#hashes[@]} -gt 0 ]]; then printf '%s\n' "${hashes[@]}" | sort -u; fi
 }
 
-# Garbage collect unprotected hash directories
+# Only a reproducible cache for this recipe is eligible for collection. Legacy
+# snapshots and accepted native changes are retained when ownership is unknown.
+tools_volume_cache_matches() {
+    (
+        local hash="$1" metadata manifest_sha expected
+        [[ "$hash" =~ ^[0-9a-f]{64}$ && "${TOOLS_RECIPE_ID:-}" =~ ^[0-9a-f]{64}$ ]] || exit 1
+        metadata="$(mktemp "${TMPDIR:-/tmp}/c0-cache-toolchain.XXXXXX")" || exit 1
+        trap 'rm -f "$metadata"' EXIT
+        c0_docker_run --user 1000:1000 --network none -v "$SHARED_TOOLS_VOLUME:/tools:ro" alpine \
+            sh -c 'test -f "$1/.c0dev-complete" && test ! -e "$1/.c0dev-parent" && test ! -e "$1/.c0dev-stage-sha256" && cat "$1/.c0dev-toolchain.json"' sh \
+            "/tools/opt/$hash" >"$metadata" 2>/dev/null || exit 1
+        "$C0ROOT/bin/c0-toolchain" --build-args "$metadata" >/dev/null 2>&1 || exit 1
+        manifest_sha="$(shasum -a 256 "$metadata" | awk '{print $1}')" || exit 1
+        expected="$(printf 'c0-toolchain-build-v1\n%s\n%s\n' \
+            "$TOOLS_RECIPE_ID" "$manifest_sha" | shasum -a 256 | awk '{print $1}')" || exit 1
+        [[ "$hash" == "$expected" ]]
+    )
+}
+
 gc_tools_hashes() {
-    if [[ "$IN_CONTAINER" == "true" ]]; then
-        return 0
-    fi
-
-    if ! tools_volume_exists; then
-        return 0
-    fi
-
-    # First, clean up orphan pins
-    cleanup_orphan_pins
-
-    # Compute protected set: active ∪ pinned
-    local active_hashes pinned_hashes
-    active_hashes="$(get_active_hashes)" || return 1
-    pinned_hashes="$(get_pinned_hashes)"
-
-    local -a protected=()
-    if [[ -n "$active_hashes" ]]; then
-        while IFS= read -r hash; do
-            [[ -n "$hash" ]] && protected+=("$hash")
-        done <<<"$active_hashes"
-    fi
-    if [[ -n "$pinned_hashes" ]]; then
-        while IFS= read -r hash; do
-            [[ -n "$hash" ]] && protected+=("$hash")
-        done <<<"$pinned_hashes"
-    fi
-
-    # Get unique protected hashes
-    local protected_set
-    if [[ ${#protected[@]} -gt 0 ]]; then
-        protected_set="$(printf '%s\n' "${protected[@]}" | sort -u)"
-    fi
-
-    # List existing hash dirs in /tools/opt
-    local hash_dirs
-    hash_dirs="$(tools_volume_sh "ls -1 /tools/opt 2>/dev/null || true")"
-    [[ -z "$hash_dirs" ]] && return 0
-
-    local hash
+    [[ "$IN_CONTAINER" != true ]] || return 0
+    tools_volume_exists || return 0
+    local active published protected hash hash_dirs
+    active="$(get_active_hashes)" || return 1
+    published="$(get_published_tools_hashes)" || return 1
+    protected="$(printf '%s\n%s\n' "$active" "$published" | sort -u)"
+    hash_dirs="$(tools_volume_sh "ls -1 /tools/opt 2>/dev/null || true")" || return 1
     while IFS= read -r hash; do
-        [[ -z "$hash" ]] && continue
-
-        # Skip if not 64-hex hash
-        if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
-            continue
-        fi
-
-        # Skip if no completeness marker (weird/partial dir)
-        if ! tools_volume_sh "test -f '/tools/opt/$hash/.c0dev-complete'" 2>/dev/null; then
-            continue
-        fi
-
-        # Skip if protected (active or pinned)
-        if [[ -n "$protected_set" ]] && echo "$protected_set" | grep -qx "$hash"; then
-            continue
-        fi
-
-        # Not protected - remove it
-        if tools_volume_admin_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
-            echo -e "  🗑️  GC: ${YELLOW}${hash:0:12}...${NC}"
-        fi
+        [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || continue
+        if printf '%s\n' "$protected" | grep -qx "$hash"; then continue; fi
+        tools_volume_cache_matches "$hash" || continue
+        tools_volume_admin_sh "rm -rf '/tools/opt/$hash'" || return 1
+        echo -e "  🗑️  GC: ${YELLOW}${hash:0:12}...${NC}"
     done <<<"$hash_dirs"
 }
 
@@ -2833,12 +2701,64 @@ maybe_promote_staged_next() {
     fi
 }
 
+# The constructed image is a filesystem input, never a store writer.
+c0_publish_tools_payload() {
+    local identity="$1" payload="$2"
+    [[ "$identity" =~ ^[0-9a-f]{64}$ && -n "${C0_BASE_IMAGE:-}" ]] || return 1
+    c0_docker_run --pull=never --network none --read-only --user 0:0 \
+        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+        -i -v "$SHARED_TOOLS_VOLUME:/tools" -v "$payload:/payload:ro" \
+        --entrypoint /bin/sh "$C0_BASE_IMAGE" -eu -s -- "$identity" \
+        <"$C0ROOT/docker/c0-publish-tools"
+}
+
+c0_extract_built_tools() {
+    (
+        local image="$1" identity="$2" source_id="" copied operation status owner state
+        [[ "$identity" =~ ^[0-9a-f]{64}$ && -d "$C0_BUILD_CONTEXT" ]] || exit 1
+        copied="$(mktemp -d "$C0_BUILD_CONTEXT/.tools-payload.XXXXXX")" || exit 1
+        operation="$(basename "$copied")"
+        c0_finish_extraction() {
+            status=$?
+            trap - EXIT INT TERM HUP
+            if [[ -n "$source_id" ]]; then
+                owner="$(docker inspect --format '{{index .Config.Labels "c0dev.extraction_operation"}}' "$source_id")" || owner=""
+                state="$(docker inspect --format '{{.State.Status}}' "$source_id")" || state=""
+                if [[ "$owner" == "$operation" && "$state" == created ]]; then
+                    docker rm "$source_id" >/dev/null || status=1
+                else
+                    echo "error: retaining extraction container $source_id: ownership or stopped state is uncertain" >&2
+                    status=1
+                fi
+            fi
+            rm -rf -- "$copied"
+            exit "$status"
+        }
+        trap c0_finish_extraction EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        source_id="$(docker create --pull=never --network none --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --label "c0dev.extraction_operation=$operation" \
+            --entrypoint /bin/false "$image")" || exit 1
+        if [[ ! "$source_id" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'error: invalid extraction container identity; no named cleanup attempted' >&2
+            source_id=""
+            exit 1
+        fi
+        state="$(docker inspect --format '{{.State.Status}}' "$source_id")" || exit 1
+        [[ "$state" == created ]] || { echo 'error: extraction source was unexpectedly started' >&2; exit 1; }
+        docker cp "$source_id:/home/dev/." "$copied" || exit 1
+        c0_publish_tools_payload "$identity" "$copied"
+    )
+}
+
 build_tools_volume() {
     local force="${1:-false}"
     local nocache="${2:-}"
     local H="$TOOLS_BUILD_ID"
     local VOL="$SHARED_TOOLS_VOLUME"
-    local TAG="c0dev-tools-builder:$H"
+    local TAG="c0dev-tools-builder-${C0_MODE_KEY}:$H"
 
     if ! verify_moby_seccomp_profile; then
         return 1
@@ -2855,9 +2775,7 @@ build_tools_volume() {
 
     echo -e "📦 Tools: building..."
 
-    # Clean up any leftover containers from previous/interrupted builds
-    docker rm -f "$MAIN_SERVICE-tools-build" 2>/dev/null || true
-    docker rm -f "$MAIN_SERVICE-tools" 2>/dev/null || true
+    # Existing containers are never ours to delete merely by a legacy name.
 
     # 1) Ensure volume exists
     docker volume create "$VOL" >/dev/null
@@ -2866,7 +2784,9 @@ build_tools_volume() {
     echo -e "  🔧 Building tools-builder stage..."
     export DOCKER_BUILDKIT=1
     c0_prepare_tools_dockerfile
-    if ! docker build --pull $nocache "${C0_TOOLCHAIN_BUILD_ARGS[@]}" -f "$DOCKERFILE_TOOLS_BUILD" --target tools-builder -t "$TAG" "$C0_BUILD_CONTEXT"; then
+    if ! docker build --pull $nocache "${C0_TOOLCHAIN_BUILD_ARGS[@]}" \
+        --label "c0dev.mode=$C0_MODE_KEY" --label "c0dev.tools_hash=$H" \
+        -f "$DOCKERFILE_TOOLS_BUILD" --target tools-builder -t "$TAG" "$C0_BUILD_CONTEXT"; then
         return 1
     fi
 
@@ -2881,33 +2801,7 @@ build_tools_volume() {
         "; then
         return 1
     fi
-    if ! c0_docker_run -u dev -v "$VOL:/tools" "$TAG" bash -lc "
-            set -e -o pipefail
-            cd /home/dev
-            paths=''
-            for p in \
-                .cargo/bin \
-                .rustup \
-                .local
-            do
-                if [ -e \"\$p\" ]; then
-                    paths=\"\$paths \$p\"
-                fi
-            done
-            if [ -z \"\$paths\" ]; then
-                echo 'error: no immutable tool paths to pack' >&2
-                exit 1
-            fi
-            tar -cf - \$paths | tar -C '/tools/tmp/$H.partial' --no-same-owner -xf -
-            cp /home/dev/.local/share/c0/toolchain.json '/tools/tmp/$H.partial/.c0dev-toolchain.json'
-        "; then
-        tools_volume_admin_sh "rm -rf '/tools/tmp/$H.partial'" 2>/dev/null || true
-        return 1
-    fi
-
-    # 4) Write completeness marker (as dev so volume tree matches image USER)
-    echo -e "  ✓ Marking complete..."
-    if ! c0_docker_run -u dev -v "$VOL:/tools" "$TAG" touch "/tools/tmp/$H.partial/.c0dev-complete"; then
+    if ! c0_extract_built_tools "$TAG" "$H"; then
         tools_volume_admin_sh "rm -rf '/tools/tmp/$H.partial'" 2>/dev/null || true
         return 1
     fi
@@ -2979,7 +2873,7 @@ build_tools_volume() {
 c0_create_runtime() {
     local name="$1" selection
     local C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL
-    selection="$(c0_read_overlay_selection)" || return 1
+    selection="$(c0_discover_home_storage)" || return 1
     IFS=$'\t' read -r C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL <<<"$selection"
     # These are computed Compose inputs, never caller-supplied options.
     export C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL
@@ -2990,6 +2884,7 @@ c0_create_runtime() {
 cmd_start() {
     require_host "start"
     c0_require_docker || return 1
+    c0_resolve_runtime_context || return 1
     local cid state name arg
     cid="$(get_c0_container_id_any)" || return 1
     if [[ -n "$cid" ]]; then
@@ -3024,6 +2919,15 @@ cmd_start() {
         print_orca_endpoint
         print_web_port_mapping
         return 0
+    fi
+
+    # Writable home overlays belong to the workspace. Two different builds
+    # must not mount the same upper/work directories concurrently.
+    local workspace_running
+    workspace_running="$(c0_list_workspace_containers -q)" || return 1
+    if [[ -n "$workspace_running" ]]; then
+        echo "error: another build is running in this workspace; use c0 stop before starting the current build" >&2
+        return 1
     fi
 
     resolve_c0_security_for_start "$@" || return 1
@@ -3074,6 +2978,7 @@ cmd_logs() {
     local service="${1:-$MAIN_SERVICE}" cid
     [[ "$service" == "$MAIN_SERVICE" ]] || { echo "error: unknown service: $service" >&2; return 1; }
     c0_require_docker || return 1
+    c0_resolve_runtime_context || return 1
     cid="$(get_c0_container_id_any)" || return 1
     [[ -n "$cid" ]] || { echo "error: no container for $C0_INSTANCE_ID" >&2; return 1; }
     docker logs -f "$cid"
@@ -3084,9 +2989,16 @@ cmd_status() {
     c0_require_docker || exit 1
     # Status must not execute guest code or depend on any container image.
     # Pins and completeness markers are volume contents, not Docker metadata.
-    # Report the existing container's identity without resolving/validating pins.
+    # Report Docker-owned runtime identity without depending on an image tag.
     local TOOLS_ID="" status_cid
     status_cid="$(get_c0_container_id_any)"
+    if [[ -z "$status_cid" ]]; then
+        local workspace_ids
+        workspace_ids="$(c0_list_workspace_containers -aq)" || return 1
+        if [[ -n "$workspace_ids" && "$workspace_ids" != *$'\n'* ]]; then
+            status_cid="$workspace_ids"
+        fi
+    fi
     if [[ -n "$status_cid" ]]; then
         TOOLS_ID="$(get_tools_hash_label "$status_cid")"
         [[ "$TOOLS_ID" =~ ^[0-9a-f]{64}$ ]] || TOOLS_ID=""
@@ -3236,8 +3148,7 @@ cmd_status() {
     echo -e "  snapshot completeness: ${YELLOW}(not checked)${NC}"
     echo ""
 
-    # Container labels describe existing workspaces without mounting the volume
-    # to enumerate pins. Removed containers and pin-only workspaces are unknown.
+    # Docker labels describe the runtime/build ownership of existing workspaces.
     echo -e "${BOLD}workspace containers:${NC}"
     local workspace_containers workspace
     workspace_containers="$(docker ps -a \
@@ -3293,8 +3204,57 @@ cmd_tools_stage_output() {
     echo "  restore: c0 tools restore"
 }
 
+# Native tools acceptance produces an ordinary shared runtime artifact. Its
+# immutable labels, rather than a workspace selector, publish the new payload.
+c0_accept_runtime_metadata() {
+    local cid="$1" image metadata build mode recipe tools volume base
+    image="$(docker inspect --format '{{.Image}}' "$cid")" || return 1
+    [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s" .Id (index .Config.Labels "c0dev.build") (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.tools_hash") (index .Config.Labels "c0dev.tools_volume") (index .Config.Labels "c0dev.base_image")}}' "$image")" || return 1
+    IFS=$'\t' read -r image build mode recipe tools volume base <<<"$metadata"
+    if [[ ! "$build" =~ ^[0-9a-f]{64}$ || "$mode" != "$C0_MODE_KEY" ||
+          "$recipe" != "$C0_RECIPE_ID" || "$tools" != "$TOOLS_ID" ||
+          "$volume" != "$SHARED_TOOLS_VOLUME" || "$base" != "c0dev-base-${C0_MODE_KEY}:$build" ]]; then
+        echo 'error: tools acceptance requires a runtime from the shared build for this mode and recipe; guest data was not changed' >&2
+        return 1
+    fi
+    printf '%s\n' "$metadata"
+}
+
+c0_publish_accepted_runtime() {
+    (
+        local metadata="$1" accepted="$2" image parent mode recipe tools volume base build source image_id
+        local C0_BUILD_ID C0_BASE_IMAGE C0_RUNTIME_IMAGE C0_TOOLS_BUILDER_IMAGE C0_INSTANCE_ID
+        local TOOLS_ID="$accepted" TOOLS_BUILD_ID="$accepted"
+        local C0_BUILD_CONTEXT C0_RUNTIME_BUILD_TAG
+        [[ "$accepted" =~ ^[0-9a-f]{64}$ ]] || exit 1
+        IFS=$'\t' read -r image parent mode recipe tools volume base <<<"$metadata"
+        [[ "$image" =~ ^sha256:[0-9a-f]{64}$ && "$parent" =~ ^[0-9a-f]{64}$ &&
+           "$mode" == "$C0_MODE_KEY" && "$recipe" == "$C0_RECIPE_ID" &&
+           "$volume" == "$SHARED_TOOLS_VOLUME" && "$base" == "c0dev-base-${C0_MODE_KEY}:$parent" ]] || exit 1
+        docker image inspect "$base" >/dev/null || exit 1
+        build="$(printf 'c0-tools-accept-build-v1\n%s\n%s\n' "$parent" "$accepted" | shasum -a 256 | awk '{print $1}')" || exit 1
+        c0_set_build_identity "$build" || exit 1
+        C0_BUILD_CONTEXT="$(mktemp -d "${TMPDIR:-/tmp}/c0-tools-image.XXXXXX")" || exit 1
+        C0_RUNTIME_BUILD_TAG="c0dev-runtime-${C0_MODE_KEY}-build:$(basename "$C0_BUILD_CONTEXT")"
+        source="$C0_RUNTIME_BUILD_TAG-source"
+        trap 'docker image rm "$C0_RUNTIME_BUILD_TAG" "$source" >/dev/null 2>&1 || true; rm -rf "$C0_BUILD_CONTEXT"' EXIT
+        docker image tag "$image" "$source" || exit 1
+        printf 'FROM %s\n' "$source" >"$C0_BUILD_CONTEXT/Dockerfile" || exit 1
+        docker build --pull=false --network none \
+            --label "c0dev.mode=$C0_MODE_KEY" --label "c0dev.recipe=$C0_RECIPE_ID" \
+            --label "c0dev.build=$build" --label "c0dev.tools_hash=$accepted" \
+            --label "c0dev.tools_volume=$SHARED_TOOLS_VOLUME" --label "c0dev.base_image=$C0_BASE_IMAGE" \
+            -t "$C0_RUNTIME_BUILD_TAG" "$C0_BUILD_CONTEXT" || exit 1
+        c0_validate_runtime_image || exit 1
+        image_id="$(cat "$C0_BUILD_CONTEXT/.runtime-image-id")" || exit 1
+        docker image tag "$base" "$C0_BASE_IMAGE" || exit 1
+        c0_publish_runtime_image "$image_id"
+    )
+}
+
 cmd_tools_accept() {
-    local cid changes snapshot_dir stage_sha accepted_id folder_id C0_TOOLS_HELPER_IMAGE
+    local cid changes snapshot_dir stage_sha accepted_id metadata C0_TOOLS_HELPER_IMAGE
 
     c0_require_container_running || exit 1
     cid="$(get_c0_container_id)"
@@ -3305,6 +3265,7 @@ cmd_tools_accept() {
         echo -e "${BOLD}tools:${NC} ${GREEN}clean${NC}"
         return 0
     fi
+    metadata="$(c0_accept_runtime_metadata "$cid")" || return 1
     C0_TOOLS_HELPER_IMAGE="$(c0_tools_helper_image)" || return 1
 
     cmd_tools_stage_output false || return 1
@@ -3338,9 +3299,7 @@ cmd_tools_accept() {
     rm -rf "$snapshot_dir"
     trap - INT TERM
 
-    folder_id="$(compute_folder_id)" || return 1
-    c0_read_tools_pin_strict "$folder_id" >/dev/null || return 1
-    write_pin_for_folder_id "$folder_id" "$accepted_id" "$C0ROOT" "$C0_MODE" || return 1
+    c0_publish_accepted_runtime "$metadata" "$accepted_id" || return 1
     echo -e "✅ Accepted tools: ${GREEN}${accepted_id:0:12}...${NC}"
     echo "warning: the running guest still uses its mounted tools snapshot and writable stage; its fixed Docker mount cannot change in place" >&2
 }
@@ -3387,14 +3346,16 @@ c0_clear_tools_stage() {
 }
 
 cmd_tools_restore() {
-    local cid changes folder_id selected volume image result=0
+    local cid changes selected volume image result=0
 
     c0_require_container_running || return 1
     cid="$C0_RUNTIME_CID"
     c0_validate_container_mounts "$cid" true true || return 1
     set_tools_id "$C0_CONTAINER_TOOLS_ID" || return 1
-    folder_id="$(compute_folder_id)" || return 1
-    selected="$(c0_read_tools_pin_strict "$folder_id")" || return 1
+    selected="$TOOLS_ID"
+    if docker image inspect "$(c0_runtime_recipe_ref)" >/dev/null 2>&1; then
+        selected="$(c0_resolve_shared_build >/dev/null && printf '%s\n' "$TOOLS_BUILD_ID")" || return 1
+    fi
     if [[ -n "$selected" && "$selected" != "$TOOLS_ID" ]]; then
         echo "error: accepted tools differ from the guest's fixed Docker mount; cannot restore that selection in place; guest data was not changed" >&2
         return 1
@@ -3433,7 +3394,6 @@ cmd_tools_restore() {
 cmd_tools() {
     require_host "tools"
     c0_require_docker || exit 1
-    resolve_tools_selection || exit 1
 
     case "${1:-}" in
         '')       cmd_tools_stage_output false ;;
@@ -3541,7 +3501,7 @@ c0_build_cleanup() {
             TOOLS_BUILD_ID="$resolved_id"
         fi
     fi
-    local tag="c0dev-tools-builder:$TOOLS_BUILD_ID"
+    local tag="c0dev-tools-builder-${C0_MODE_KEY}:$TOOLS_BUILD_ID"
     docker rmi "$tag" >/dev/null 2>&1 || true
     tools_volume_exists || return 0
     # Cancellation must not download an image merely to clean up a partial tree.
@@ -3638,6 +3598,11 @@ c0_build_steps() {
     # exists; stale metadata is never substituted after an upstream failure.
     c0_resolve_toolchain || exit 1
 
+    if ! c0_build_base_image "$nocache"; then
+        echo 'error: base image build or validation failed' >&2
+        exit 1
+    fi
+
     # Build/validate tools volume
     if ! build_tools_volume "$force" "$nocache"; then
         echo "error: tools build failed" >&2
@@ -3657,19 +3622,6 @@ c0_build_steps() {
         exit 1
     fi
 
-    # Update pin on successful build (Phase 3)
-    if [[ "$IN_CONTAINER" == "false" ]]; then
-        local folder_id
-        folder_id="$(compute_folder_id)"
-        if [[ -n "$folder_id" ]]; then
-            if ! write_pin_for_folder_id "$folder_id" "$TOOLS_ID" "$C0ROOT" "$C0_MODE"; then
-                echo 'error: tools selection publication failed; build did not complete' >&2
-                c0_restore_build_image || echo 'warning: previous published image could not be restored' >&2
-                exit 1
-            fi
-        fi
-    fi
-
     # Run garbage collection after successful build (Phase 5)
     gc_tools_hashes
 
@@ -3679,80 +3631,37 @@ c0_build_steps() {
 cmd_clean() {
     require_host "clean"
     c0_require_docker || return 1
-    local references
-    references="$(list_container_ids_using_tools_volume)" || return 1
-    if [[ -n "$references" ]]; then
-        echo "error: tools storage is referenced by active, stopped, or recovery guests; nothing was removed" >&2
-        return 1
-    fi
-
-    local clean_all=false
+    local clean_all=false references published remaining
     case "${1:-}" in
         '') [[ $# -eq 0 ]] || return 1 ;;
         --all|-a) [[ $# -eq 1 ]] || return 1; clean_all=true ;;
         *) echo "error: usage: c0 clean [--all]" >&2; return 1 ;;
     esac
-
-    if [[ "$clean_all" == "true" ]]; then
-        # Never remove containers as a side effect of tools cleanup.
-        echo -e "🧹 Removing volume ${CYAN}$SHARED_TOOLS_VOLUME${NC}..."
-        if docker volume rm "$SHARED_TOOLS_VOLUME" >/dev/null 2>&1; then
-            echo -e "✅ Removed: ${GREEN}$SHARED_TOOLS_VOLUME${NC}"
-        else
-            if docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
-                echo "error: failed to remove $SHARED_TOOLS_VOLUME (in use?)" >&2
-                exit 1
-            else
-                echo -e "${YELLOW}$SHARED_TOOLS_VOLUME does not exist${NC}"
-            fi
+    if ! tools_volume_exists; then
+        echo -e "${YELLOW}volume $SHARED_TOOLS_VOLUME does not exist${NC}"
+        return 0
+    fi
+    references="$(list_container_ids_using_tools_volume)" || return 1
+    if [[ -n "$references" ]]; then
+        echo 'error: tools storage is referenced by Docker containers; nothing was removed' >&2
+        return 1
+    fi
+    if [[ "$clean_all" == true ]]; then
+        published="$(get_published_tools_hashes)" || return 1
+        if [[ -n "$published" ]]; then
+            echo 'error: tools storage is referenced by published images; nothing was removed' >&2
+            return 1
         fi
-    else
-        # Remove current + pinned hash folders and unpin (Phase 3)
-        if ! docker volume inspect "$SHARED_TOOLS_VOLUME" &>/dev/null; then
-            echo -e "${YELLOW}volume $SHARED_TOOLS_VOLUME does not exist${NC}"
-            return 0
+    fi
+    gc_tools_hashes || return 1
+    if [[ "$clean_all" == true ]]; then
+        remaining="$(tools_volume_sh "find /tools -mindepth 1 -maxdepth 1 ! -name opt ! -name tmp -print; find /tools/opt /tools/tmp -mindepth 1 -maxdepth 1 -print 2>/dev/null || true")" || return 1
+        if [[ -n "$remaining" ]]; then
+            echo 'error: retained tools or legacy data remains; tools volume was not removed' >&2
+            return 1
         fi
-
-        local current_hash="$TOOLS_ID"
-        local pinned_hash=""
-        local folder_id
-        folder_id="$(compute_folder_id)"
-        if [[ -n "$folder_id" ]]; then
-            pinned_hash="$(read_pin_for_folder_id "$folder_id")"
-        fi
-
-        # Collect unique hashes to remove
-        local -a hashes_to_remove=("$current_hash")
-        if [[ -n "$pinned_hash" && "$pinned_hash" != "$current_hash" ]]; then
-            hashes_to_remove+=("$pinned_hash")
-        fi
-        for hash in "${hashes_to_remove[@]}"; do
-            [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || {
-                echo "error: invalid tools selection; nothing was removed" >&2
-                return 1
-            }
-        done
-
-        echo -e "🧹 Cleaning tools for this folder..."
-        for hash in "${hashes_to_remove[@]}"; do
-            if tools_volume_sh "test -d '/tools/opt/$hash'" 2>/dev/null; then
-                if tools_volume_sh "rm -rf '/tools/opt/$hash'" 2>/dev/null; then
-                    echo -e "  ✅ Removed: ${GREEN}/tools/opt/${hash:0:12}...${NC}"
-                else
-                    echo "error: failed to remove /tools/opt/$hash" >&2
-                    exit 1
-                fi
-            fi
-        done
-
-        # Delete pin file
-        if [[ -n "$folder_id" ]]; then
-            delete_pin_for_folder_id "$folder_id"
-            echo -e "  ✅ Removed pin"
-        fi
-
-        # Run garbage collection after clean (Phase 5)
-        gc_tools_hashes
+        docker volume rm "$SHARED_TOOLS_VOLUME" >/dev/null || return 1
+        echo -e "✅ Removed unused tools cache: ${GREEN}$SHARED_TOOLS_VOLUME${NC}"
     fi
 }
 
@@ -3795,25 +3704,25 @@ Commands:
   cp-term       Copy caller terminfo system-wide; sh/ssh also sync it as dev.
   build [-f]    Build tools and image (-f forces tools re-extract)
                 TOOLS_BUILD_ID = hash(recipe identity + freshly resolved toolchain manifest).
-                TOOLS_ID may select a complete accepted snapshot; pins select and protect it.
+                Docker image labels select the completed tools payload.
   seccomp-upgrade [--dry-run]
                 Use git ls-remote on moby/profiles, pick latest seccomp/vM.m.p tag,
                 curl raw default.json, verify sha256, then rewrite docker/seccomp when newer.
                 --dry-run shows target tag, peeled commit OID, profile sha256; no writes.
   clean [-a]    Remove shared tools volume hashes only (never host .cache or projects).
                 Refuses while any guest/recovery uses the store; never removes containers.
-                Unpins this folder; runs garbage collection. (-a removes entire unused tools volume)
+                Collects unused rebuildable tools. (-a removes an entirely unused store)
   help          Show this help message
 
 Environment:
   C0_MODE       Set to 'dev' for dev mode (default: production)
   C0_SECURITY   permissive (default) or cap-drop-all; overridden by start --cap-drop-all
   C0_SECCOMP_NOTIFY=0  Skip upstream seccomp "newer available" notices on build/start
-  C0_SECCOMP_REMOTE_CACHE_TTL  Seconds to cache git ls-remote + profile hash (default 21600)
   MOBY_PROFILES_GIT_URL  Override moby/profiles.git URL (default https://github.com/moby/profiles.git)
 
 Notes:
-  - Each folder pins tools_id on successful build (GC metadata; not startup validation)
+  - Mode/build artifacts are shared; working folders add container isolation.
+  - Docker tags, labels and mounts provide discovery; no c0 state files are written.
   - Tools referenced by active, stopped, or recovery containers are protected
   - Force rebuild of active tools_id stages to .next, promotes after stop
   - Ephemeral docker runs during build use --cap-drop ALL and no-new-privileges; tools-volume

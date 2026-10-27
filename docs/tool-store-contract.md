@@ -4,15 +4,24 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 # c0dev Tool-Store Contract
 
-| Metadata      | Value                         |
-| ------------- | -------------------------     |
-| Contract kind | immutable-snapshot-stage      |
-| Visibility    | public                        |
-| Owner         | `docs/tool-store-contract.md` |
+| Metadata      | Value                    |
+| ------------- | ------------------------ |
+| Contract kind | immutable-snapshot-stage |
+| Visibility    | public                   |
 
 ## Purpose
 
-Fix the store grammar, identities, selection rule, whole-stage acceptance, restoration, failure behavior, and garbage-collection protection implemented by c0dev.
+Fix the immutable tools-storage, identity, selection, stage, publication, restoration, and collection seam owned by the tools-store module in [design](design.md#module-inventory). This contract describes the current Docker-derived selection model; it does not create a package manager or a persistent checkout selector.
+
+## Terminology
+
+| Term                | Meaning                                                                                 |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| Tools recipe        | Comment-stripped base/tools Dockerfile identity.                                        |
+| Release manifest    | Canonical resolved toolchain JSON captured for a build.                                 |
+| Complete payload    | Tools directory with its completeness marker written after payload and provenance.      |
+| Published reference | Docker image labels binding mode, recipe, runtime build, tools payload, and base image. |
+| Tools stage         | Configured tool-home upper and work directories; launcher upper is separate.            |
 
 ## Store Grammar
 
@@ -20,116 +29,122 @@ Fix the store grammar, identities, selection rule, whole-stage acceptance, resto
 /tools/
   opt/<tools-id>/
     .c0dev-complete
-    .c0dev-accepted-from      # accepted snapshots only
-    .c0dev-stage-sha256       # accepted snapshots only
+    .c0dev-toolchain.json       # build payload provenance
+    .c0dev-accepted-from        # accepted payload parent
+    .c0dev-stage-sha256         # accepted archive identity
     .cargo/bin/
     .rustup/
     .local/
-  pins/<folder-id>.pin
   tmp/<tools-id>.partial
-  tmp/<build-id>.next
+  tmp/<tools-id>.next
 ```
 
-```text
-complete-snapshot := /tools/opt/<64-lower-hex> containing .c0dev-complete
-build-snapshot    := complete-snapshot whose id is TOOLS_BUILD_ID
-accepted-snapshot := complete-snapshot containing accepted-from and stage-sha256
-selected-snapshot := complete-snapshot named by the valid checkout pin, else build-snapshot
-runtime-mount     := selected-snapshot mounted at /tools/current read-only
-writable-stage    := complete per-instance OverlayFS upper for configured home overlays
-```
+`tools-id` is exactly 64 lowercase hexadecimal digits. A marker establishes completion, not authenticity or vulnerability clearance. Build reuse additionally requires valid provenance matching the resolved recipe and release manifest. Accepted payloads retain their parent and stage digest. Legacy and unknown content remains subject to conservative retention.
 
-The runtime receives the selected volume subpath only. It does not receive `/tools`, pins, temporary paths, or other snapshots.
+There is no persistent `pins/` or `state/` selector directory. The runtime receives only `opt/<tools-id>` at `/tools/current:ro`; other payloads and store metadata are absent from its mount view.
 
 ## Identity
 
-`TOOLS_BUILD_ID` is the existing comment-stripped hash of `Dockerfile.base` and `Dockerfile.tools`.
+Let `manifest-sha256` be SHA-256 of the exact canonical release-manifest bytes and `tools-recipe-id` the base/tools recipe hash. The build tools identity is:
 
-An acceptance snapshots the complete merged overlay archives while the runtime is paused. `stage-sha256` hashes the ordered archive digests. The accepted ID is:
+```text
+sha256("c0-toolchain-build-v1\n" + tools-recipe-id + "\n" + manifest-sha256 + "\n")
+```
+
+The runtime recipe also includes its runtime Dockerfile and copied build inputs; its build identity is distinct from the tools identity. Absolute working-folder paths do not participate in shared recipe/build identity. Mode partitions published artifacts and storage; mode/build/real-working-folder identifies a runtime, and mode/real-working-folder identifies persistent workspace storage.
+
+For acceptance, hash the ordered archive-digest stream to obtain `stage-sha256`; the payload identity is:
 
 ```text
 sha256("c0-tools-accept-v1\n" + parent-tools-id + "\n" + stage-sha256 + "\n")
 ```
 
-The archive digest includes file content and archive metadata. It identifies the captured snapshot operation; it is not claimed to be a reproducible package lock.
+Archive digests include captured content and metadata and are not a reproducible source lock. The derived runtime build identity uses the parent runtime's `c0dev.build` label and the accepted tools identity:
+
+```text
+sha256("c0-tools-accept-build-v1\n" + parent-runtime-build-id + "\n" + accepted-tools-id + "\n")
+```
+
+The actual parent image is separately selected by its inspected immutable Docker image ID as the derived image's `FROM` source. Image labels and recipe aliases publish the resulting selection through Docker.
 
 ## Roles And Authority
 
-| Role             | Network | Read authority                                | Write authority                                   |
-| ---------------- | ------- | --------------------------------------------- | ------------------------------------------------  |
-| Runtime          | Normal  | Selected snapshot RO; host mounts; own stage  | Container layer, host RW mounts, own stage        |
-| Overlay helper   | None    | Selected lower and overlay state              | Runtime mount namespace and overlay upper/work    |
-| Snapshot helper  | None    | Paused runtime merged overlay                 | Host-owned temporary archive stream only          |
-| Publisher        | None    | Parent snapshot and snapshot archives         | `/tools/{opt,tmp,pins}` through fixed host code   |
-| Collector        | None    | Pins and active container labels              | Unprotected complete snapshots and temporary data |
+| Role                    | Network      | Read authority                                               | Write authority                                             |
+| ----------------------- | ------------ | ------------------------------------------------------------ | ----------------------------------------------------------- |
+| Runtime                 | Guest egress | Selected payload, declared host mounts                       | Container layer, declared writable mounts, workspace uppers |
+| Overlay helper          | None         | Selected lower, host launcher lower, exact runtime namespace | Exact overlay mount and workspace upper/work                |
+| Snapshot helper         | None         | Paused runtime's configured tool overlays                    | Private host archive stream                                 |
+| Publisher               | None         | Complete parent and captured archives                        | Unpublished candidate, new complete tools payload           |
+| Runtime-image publisher | None         | Verified parent runtime and accepted payload metadata        | Derived Docker runtime image and publication tags           |
+| Collector               | None         | Container/image references and payload provenance            | Unreferenced positively identified rebuildable caches       |
 
-The runtime never receives the Docker socket, tools-volume write access, `SYS_ADMIN`, or publication metadata. The publisher uses a read-only root filesystem, no network, dropped capabilities plus the documented ownership/DAC capabilities needed to copy and normalize the snapshot, and no runtime mount-namespace authority.
+Constructed-image filesystem content is copied from a never-started container with no tools-store mount. The fixed build-payload publisher receives that data read-only and the candidate store writable, runs without network, and never executes the copied content. Actual privilege profiles and their trust limits are explained by the [security model](security-model.md#process-variants). Guest identities receive no tools-volume writer or daemon socket.
 
 ## Stage Contract
 
-The stage is the entire upper, not a classifier result. `c0 tools --detail` exposes observable entries as:
+The stage covers the complete configured tools upper, not a payload classifier. Launcher state is excluded from tools acceptance and restoration.
 
-| Status | Meaning                                                    |
-| ------ | ---------------------------------------------------------  |
-| `A`    | Upper entry has no corresponding selected-lower entry      |
-| `M`    | Upper non-directory shadows a selected-lower path          |
-| `D`    | Overlay whiteout hides a selected-lower path               |
-| `O`    | Opaque upper directory hides selected-lower directory data |
+| Status | Meaning                                       |
+| ------ | --------------------------------------------- |
+| A      | Upper entry has no corresponding lower entry. |
+| M      | Upper non-directory shadows a lower path.     |
+| D      | Whiteout hides a lower path.                  |
+| O      | Opaque directory hides lower directory data.  |
 
-Default `c0 tools` may collapse added paths to a count but must show the total stage disposition and the commands affecting it. `--detail` must list all entries observable by the checker. Neither display mode decides whether a path is payload or state.
+Default display may collapse additions but retains their count and non-additive changes. Detailed display enumerates every entry observable by the checker. Neither status nor a path-only report establishes that content is free of secrets.
 
 ## Accept Transition
 
 ```text
-selected + staged
-  -> pause runtime
-  -> snapshot merged configured overlays
-  -> resume runtime
-  -> copy selected to /tools/tmp/<accepted-id>.partial
-  -> replace configured paths with merged archives
-  -> record parent and stage digest
-  -> normalize ownership
-  -> write .c0dev-complete last
-  -> move to /tools/opt/<accepted-id>
-  -> update checkout pin
-  -> remove runtime
-  -> clear complete upper/work state
-  -> recreate with accepted-id mounted RO
+running + staged
+  -> validate actual runtime ownership, mounts, tools, and metadata
+  -> pause runtime and capture configured merged tool overlays
+  -> resume the same runtime
+  -> verify archive paths and derive accepted payload identity
+  -> copy complete parent into unpublished candidate
+  -> replace configured tool paths and record parent/archive identity
+  -> normalize ownership and write completeness last
+  -> publish a derived runtime image through Docker
+  -> retain the running container, mounted lower, and writable stage
 ```
 
-Acceptance is a host authorization event. It includes every path in the merged configured overlays, including direct non-XDG runtime state. A complete existing accepted ID is reused; an existing incomplete target is never replaced implicitly.
+Acceptance does not remove the guest, clear its files, or change its fixed tools mount. A complete identical target can be reused; an incomplete existing target blocks publication. The current shared runtime publication becomes eligible for later creation. Starting a replacement build requires the workspace's existing runtime to be stopped so writable home storage is not mounted concurrently by incompatible builds.
 
 ## Restore Transition
 
 ```text
-selected + staged
-  -> retain selected pin
-  -> remove runtime
-  -> clear complete upper/work state
-  -> recreate with the same selected-id mounted RO
+running + staged
+  -> validate mounted tools and compare publication when recipe inspection succeeds
+  -> prove exclusive ownership of the exact overlay volume
+  -> stop the same container
+  -> recheck references and clear only configured tool upper/work paths
+  -> start and validate the same container
 ```
 
-Restore is intentionally destructive and provides no c0 recovery for the discarded upper. Host paths outside the overlay volume are unaffected.
+Current restore starts from the mounted tools identity. When its initial recipe-image inspection succeeds, it resolves publication and refuses a different tools identity or failed resolution before clearing; an absent recipe image or failed initial inspection skips this comparison. Another retained container referencing the stage still refuses clearing. This conditional probe does not establish the hardened fail-closed requirement in [containment](spec.md#containment). Restore retains the mounted payload, container filesystem, launcher upper, and direct host mounts. The discarded tool upper has no c0 recovery. A clear failure still attempts to resume the same guest and remains a failed operation.
 
 ## Build Transition
 
-`c0 build` remains separate. It creates `/tools/tmp/<TOOLS_BUILD_ID>.partial`, extracts the builder-created payload, writes completeness last, publishes or safely stages a force rebuild, and pins the complete build ID after successful image construction. `c0 tools` never invokes this transition.
+Construction resolves the release manifest, verifies declared version/security floors, builds and validates tools and runtime artifacts, and publishes the completed runtime image. Extraction copies the stopped constructed image into private host staging and uses fixed base-image code for candidate publication; constructed-image programs receive no writable store. Admitted root directories and the provenance path reject symlink redirection, while nested payload links remain literal copied links. Source-container cleanup requires the exact issued operation label and never-started state and uses its captured CID; no fixed-name container is removed as legacy cleanup. Payload and provenance are prepared under `.partial`; completeness precedes publication. A forced rebuild still referenced by a container remains under `.next` until safe promotion. Incomplete or mismatched staged provenance is not promotion authority. A failed build neither publishes its candidate runtime nor triggers success-path collection.
 
 ## Selection And Protection
 
-The checkout pin is both the selection ref and a garbage-collection claim. A running container label protects the exact snapshot mounted into that runtime. Resolution falls back to `TOOLS_BUILD_ID` when no valid complete pin exists; malformed or incomplete selections produce a warning.
+Existing-runtime commands use the actual inspected container, image, mounts, and tools identity. New creation requires a validated Docker-published reference and refuses missing, conflicting, or unavailable required publication metadata; no saved default or pin supplies absent facts. Restore's publication comparison follows the conditional probe described above, so a failed initial recipe-image inspection is not demonstrated refusal on that path.
 
 ```text
-protected := valid checkout pins union running-container tools labels
+protected := tools references from all running/stopped/recovery containers
+             union tools references from all published runtime images
+collectable := complete, verifiably rebuildable cache payloads
+               with no protected reference
 ```
 
-Collection may delete only complete 64-hex snapshots absent from `protected`. Build failure never updates the pin or triggers success-path collection.
+Accepted payloads and unknown legacy data are retained when rebuildability or ownership is unproved. Failure to enumerate references grants no deletion authority. Ordinary clean refuses while any container references the store. Whole-store removal also refuses published-image references and retained unknown data. Cleanup never removes host caches, projects, guest containers, or persistent home-overlay volumes.
 
 ## Failure Contract
 
-- Snapshot failure resumes the paused runtime and leaves stage, pin, and selected snapshot unchanged.
-- Publisher failure leaves the parent selected and the upper intact.
-- Pin update occurs only after the accepted snapshot is complete.
-- Stage clearing occurs only after successful publication and pin update.
-- Failure after publication but before clearing may leave the new snapshot selected with the old upper still staged; a later explicit accept or restore resolves it.
-- Runtime recreation failure leaves the complete selected snapshot and persistent stage storage available for diagnosis.
+- Capture failure attempts to resume the same paused guest and leaves its stage and parent payload intact.
+- Publication failure preserves the complete parent, running guest, and writable stage; a completed orphan candidate may remain for diagnosis.
+- Tools acceptance and restore never replace the guest filesystem.
+- Required ownership, reference, mount, and build-provenance validations must succeed before their dependent effects. Restore's skipped comparison after initial recipe-image inspection failure remains a current gap against hardened fail-closed inspection.
+- Rebuild, promotion, and collection preserve payloads still referenced by retained containers or published images.
+- Secret-free and vulnerability-free release claims require the separate [release-security gate](spec.md#release-security), not this storage transaction.

@@ -9,6 +9,7 @@ Builds the actual runtime recipe with the Bun security-floor fixture release.
 Does not create guest containers, touch shared tools, or change checkout pins.
 """
 import os
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -101,8 +102,12 @@ tools_volume_build_matches "$TEST_ID"
         docker = shutil.which('docker')
         self.assertTrue(docker)
         instance = 'c0-build-audit-' + uuid.uuid4().hex[:10]
-        published = instance+'-c0dev:latest'
-        tags = [published]
+        build = hashlib.sha256((instance+'build').encode()).hexdigest()
+        recipe = hashlib.sha256((instance+'recipe').encode()).hexdigest()
+        published = 'c0dev-runtime-prod:'+build
+        alias = 'c0dev-runtime-prod:recipe-'+recipe
+        base = 'c0dev-base-prod:'+build
+        tags = [published, alias, base]
         with tempfile.TemporaryDirectory(prefix='c0-runtime-audit-') as temporary:
             root = Path(temporary)
             context = root/'context'
@@ -111,15 +116,17 @@ tools_volume_build_matches "$TEST_ID"
             wrapper.mkdir()
             (wrapper/'docker').write_text('#!'+sys.executable+'\n'+'''
 import os, sys
-if sys.argv[1] == 'run' and os.environ.get('TEST_FAIL_SMOKE') == '1':
+if sys.argv[1] == 'run' and ((os.environ.get('TEST_FAIL_SMOKE') == '1' and not any(arg.startswith('c0dev-base-prod') for arg in sys.argv)) or (os.environ.get('TEST_FAIL_BASE') == '1' and any(arg.startswith('c0dev-base-prod') for arg in sys.argv))):
     print('injected Docker image launch failure', file=sys.stderr)
     sys.exit(29)
 os.execv('''+repr(docker)+', ['+repr(docker)+']+sys.argv[1:])\n')
             (wrapper/'docker').chmod(0o755)
             helpers = '\n'.join(function(name) for name in (
                 'c0_prepare_build_context', 'c0_prepare_runtime_dockerfile',
-                'c0_prepare_terminfo', 'dc_build', 'c0_docker_content_failure',
-                'c0_validate_runtime_image', 'c0_build_runtime_image'))
+                'c0_prepare_terminfo', 'dc_build', 'c0_build_base_image',
+                'c0_base_image_matches', 'c0_validate_base_image', 'c0_runtime_image_matches', 'c0_docker_content_failure',
+                'c0_validate_runtime_image', 'c0_build_runtime_image',
+                'c0_runtime_recipe_ref', 'c0_publish_runtime_image'))
             script = root/'build.sh'
             script.write_text('set -e\n'+helpers+'''
 C0ROOT="$TEST_CHECKOUT"
@@ -128,6 +135,11 @@ DOCKERFILE_BASE="$C0ROOT/docker/Dockerfile.base"
 DOCKERFILE_RUNTIME="$C0ROOT/docker/Dockerfile.runtime"
 DOCKERFILE_RUNTIME_BUILD="$C0_BUILD_CONTEXT/Dockerfile.runtime.build"
 C0_INSTANCE_ID="$TEST_INSTANCE"
+C0_MODE_KEY=prod
+C0_BUILD_ID="$TEST_BUILD"
+C0_RECIPE_ID="$TEST_RECIPE"
+C0_RUNTIME_IMAGE="c0dev-runtime-prod:$C0_BUILD_ID"
+C0_BASE_IMAGE="c0dev-base-prod:$C0_BUILD_ID"
 MAIN_SERVICE=c0dev
 SHARED_TOOLS_VOLUME=unused-build-audit
 TOOLS_ID=unused-build-audit
@@ -137,27 +149,42 @@ VOLUMES_FILES_FILE="$C0ROOT/docker/volumes-files.yaml"
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
 C0_TOOLCHAIN_BUILD_ARGS=(--build-arg BUN_VERSION=1.4.4)
 c0_prepare_build_context
+c0_build_base_image ''
 c0_prepare_runtime_dockerfile
 c0_prepare_terminfo
 c0_build_runtime_image ''
 ''')
             env = dict(os.environ, PATH=str(wrapper)+os.pathsep+os.environ['PATH'],
                        TEST_CHECKOUT=str(ROOT), TEST_CONTEXT=str(context),
-                       TEST_INSTANCE=instance, TERM='xterm-256color')
+                       TEST_INSTANCE=instance, TEST_BUILD=build, TEST_RECIPE=recipe, TERM='xterm-256color')
             try:
                 result = subprocess.run(['/bin/bash', str(script)], env=env,
                                         capture_output=True, text=True, timeout=900)
                 self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
-                tags.append(instance+'-build:'+root.name)
+                tags.append('c0dev-runtime-prod-build:'+root.name)
                 image = subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', published], text=True).strip()
                 # Docker really launches this immutable image with no network and
                 # no writable image filesystem in the production validator above.
                 self.assertEqual(image, (context/'.runtime-image-id').read_text().strip())
+                base_image = subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', base], text=True).strip()
+                reused = subprocess.run(['/bin/bash', str(script)], env=env,
+                                        capture_output=True, text=True, timeout=900)
+                self.assertEqual(reused.returncode, 0, reused.stdout+reused.stderr)
+                self.assertIn('Base: valid', reused.stdout)
+                self.assertIn('Image: valid', reused.stdout)
+                self.assertEqual(subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', base], text=True).strip(), base_image)
+                self.assertEqual(subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', alias], text=True).strip(), image)
+                failed_base = subprocess.run(['/bin/bash', str(script)],
+                                            env=dict(env, TEST_FAIL_BASE='1'),
+                                            capture_output=True, text=True, timeout=900)
+                self.assertNotEqual(failed_base.returncode, 0)
+                self.assertEqual(subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', base], text=True).strip(), base_image)
+                self.assertEqual(subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', alias], text=True).strip(), image)
                 result = subprocess.run(['/bin/bash', str(script)],
                                         env=dict(env, TEST_FAIL_SMOKE='1'),
                                         capture_output=True, text=True, timeout=900)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('previous published image and tools selection retained', result.stderr)
+                self.assertIn('previous shared image retained', result.stderr)
                 retained = subprocess.check_output([docker, 'image', 'inspect', '--format', '{{.Id}}', published], text=True).strip()
                 self.assertEqual(retained, image)
             finally:

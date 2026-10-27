@@ -51,7 +51,7 @@ check_overlay() {
         return
     fi
     case ",$options," in
-        *,lowerdir="$lower",*|*,lowerdir="$lower":*) ;;
+        *,lowerdir="$lower",*|*,lowerdir="$lower":*|*,lowerdir="/proc/1/root$lower",*|*,lowerdir="/proc/1/root$lower":*|*,lowerdir="1/root$lower",*|*,lowerdir="1/root$lower":*) ;;
         *)
             printf 'c0 overlay error: %s has unexpected lowerdir\n' "$target" >&2
             errors=$((errors + 1))

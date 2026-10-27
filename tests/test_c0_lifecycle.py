@@ -11,8 +11,8 @@ class Lifecycle(unittest.TestCase):
     def test_stop_removes_runtime_then_start_uses_current_image_and_attaches(self):
         state = self.f.read()
         current = 'sha256:' + '2' * 64
-        state['new_container']['image'] = current
         self.f.write(state)
+        self.f.publish_runtime(current, build='c' * 64)
         stopped = self.f.run('stop')
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertIn('Stopped', stopped.stdout)
@@ -68,6 +68,29 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(any(c[0] in ('stop', 'rm', 'compose') for c in self.f.read()['calls']))
         self.assertEqual(len(self.f.read()['containers']), 2)
 
+    def test_stop_removes_workspace_builds_without_touching_other_workspaces_or_modes(self):
+        state = self.f.read()
+        another_build = self.f.container('other-build')
+        another_build['instance'] = self.f.instance + '-another-build'
+        another_build['labels'] = {'c0dev.workspace': self.f.workspace,
+                                   'c0dev.mode': 'prod', 'c0dev.build': 'b' * 64}
+        other_mode = self.f.container('other-mode')
+        other_mode['instance'] = 'c0dev-dev-another-workspace'
+        other_mode['labels'] = {'c0dev.workspace': 'c0dev-dev-another-workspace',
+                                'c0dev.mode': 'dev', 'c0dev.build': 'b' * 64}
+        other_folder = self.f.container('other-folder')
+        other_folder['instance'] = 'another-folder'
+        other_folder['labels'] = {'c0dev.workspace': 'another-folder',
+                                  'c0dev.mode': 'prod', 'c0dev.build': 'b' * 64}
+        state['containers'] += [another_build, other_mode, other_folder]
+        self.f.write(state)
+        result = self.f.run('stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.f.read()['containers'], [other_mode, other_folder])
+        self.assertFalse(any(call[0] == 'rm' and '-v' in call
+                             for call in self.f.read()['calls']))
+        self.assertFalse((self.f.checkout / '.local/c0').exists())
+
     def test_stop_does_not_remove_unrelated_container(self):
         state = self.f.read()
         unrelated = self.f.container('unrelated')
@@ -112,7 +135,8 @@ class Lifecycle(unittest.TestCase):
                      'launcher/upper/note': 'keep launcher'}
         state['volumes'] = {
             volume: dict(Labels={'c0dev.instance': self.f.instance,
-                                 'c0dev.overlay_generation': generation}, data=persisted),
+                                 'c0dev.overlay_generation': generation,
+                                 'c0dev.overlay_source': canonical}, data=persisted),
             canonical: dict(Labels={}, data={'canonical-only': 'untouched'}),
         }
         mount = next(m for m in state['containers'][0]['mounts']
@@ -125,8 +149,7 @@ class Lifecycle(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(self.f.run('stop').returncode, 0)
             self.assertEqual(self.f.read()['containers'], [])
-            selection = self.f.checkout / '.local/c0' / (self.f.instance + '.home-overlays-volume')
-            self.assertEqual(selection.read_text(), volume + '\n')
+            self.assertFalse((self.f.checkout / '.local/c0').exists())
             # This is internal storage selection, not a caller-controlled option.
             self.f.env['C0_HOME_OVERLAYS_VOLUME'] = canonical
             started = self.f.run('start')

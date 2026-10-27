@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+"""Fixed host-side config/log I/O beneath a held checkout directory."""
+import os
+from pathlib import Path
+import secrets
+import stat
+import subprocess
+import tempfile
+import sys
+import time
+
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+def regular(info):
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+        raise ValueError('expected an owned regular file with one link')
+
+
+def parent_fd(root, target, create=False):
+    # The caller supplies the trusted executable-root identity. Only that root's
+    # host spelling is canonicalized; no descendant selected by the guest is.
+    lexical = os.path.abspath(root)
+    canonical = os.path.realpath(root)
+    absolute = os.path.abspath(target)
+    relative = os.path.relpath(absolute, lexical)
+    parts = Path(relative).parts
+    if not os.path.isabs(target) or not parts or any(p in ('', '.', '..') for p in parts):
+        raise ValueError('target is outside the selected checkout')
+    descriptor = os.open(canonical, DIR_FLAGS)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, DIR_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, parts[-1]
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def current(parent, name):
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    regular(info)
+    return info
+
+
+def open_regular(parent, name, flags, create=False):
+    prior = current(parent, name)
+    options = flags | FILE_FLAGS
+    if prior is None:
+        if not create:
+            raise FileNotFoundError(name)
+        options |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(name, options, 0o600, dir_fd=parent)
+    try:
+        actual = os.fstat(descriptor)
+        regular(actual)
+        if prior is not None and (prior.st_dev, prior.st_ino) != (actual.st_dev, actual.st_ino):
+            raise ValueError('file identity changed during opening')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def write_config(parent, name, data=None, mode=0o644, require_absent=False):
+    if current(parent, name) is not None and require_absent:
+        raise ValueError('key destination already exists')
+    temporary = '.c0-config-' + secrets.token_hex(16)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | FILE_FLAGS,
+                         0o600, dir_fd=parent)
+    try:
+        with os.fdopen(descriptor, 'wb', closefd=False) as output:
+            if data is not None:
+                output.write(data)
+            else:
+                while True:
+                    chunk = sys.stdin.buffer.read(65536)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+            output.flush()
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        if current(parent, name) is not None and require_absent:
+            raise ValueError('key destination appeared during generation')
+        staged = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+        actual = os.fstat(descriptor)
+        if (staged.st_dev, staged.st_ino) != (actual.st_dev, actual.st_ino):
+            raise ValueError('config staging identity changed')
+        if require_absent:
+            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent,
+                    follow_symlinks=False)
+        else:
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+    finally:
+        os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+
+
+def prepare_ssh(parent, instance):
+    info = os.fstat(parent)
+    if info.st_uid != os.geteuid():
+        raise ValueError('SSH directory has another owner')
+    for name in ('id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key',
+                 'ssh_host_ed25519_key.pub', 'authorized_keys', 'sshd_config', 'known_hosts'):
+        current(parent, name)
+    os.fchmod(parent, 0o700)
+    for name, comment in (('id_ed25519', 'c0dev@'), ('ssh_host_ed25519_key', 'c0dev-sshd@')):
+        if current(parent, name) is not None:
+            continue
+        if current(parent, name + '.pub') is not None:
+            raise ValueError('public key exists without its private key')
+        with tempfile.TemporaryDirectory(prefix='c0-ssh-keygen-') as temp:
+            key = Path(temp) / 'key'
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-a', '100',
+                            '-f', str(key), '-N', '', '-C', comment + instance],
+                           check=True, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            write_config(parent, name, key.read_bytes(), 0o600, require_absent=True)
+            write_config(parent, name + '.pub', key.with_suffix('.pub').read_bytes(),
+                         0o644, require_absent=True)
+    auth = current(parent, 'authorized_keys')
+    if auth is None or auth.st_size == 0:
+        descriptor = open_regular(parent, 'id_ed25519.pub', os.O_RDONLY)
+        try:
+            with os.fdopen(descriptor, 'rb', closefd=False) as public:
+                data = public.read()
+            write_config(parent, 'authorized_keys', data, 0o600)
+        finally:
+            os.close(descriptor)
+
+
+def read_log(descriptor, wait=False):
+    prefix = b'Pairing URL:'
+    matched = 0
+    line_start = True
+    # Preserve the existing 80 x 0.25-second startup wait without reopening a
+    # guest-writable pathname. All emitted bytes come from the held file.
+    for attempt in range(81 if wait else 1):
+        found = False
+        while True:
+            data = os.read(descriptor, 65536)
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            if wait:
+                for value in data:
+                    if line_start:
+                        if value == prefix[matched]:
+                            matched += 1
+                            if matched == len(prefix):
+                                found = True
+                                line_start = False
+                        else:
+                            line_start = False
+                    if value == 10:
+                        line_start = True
+                        matched = 0
+        if not wait or found:
+            return 0
+        if attempt != 80:
+            time.sleep(0.25)
+    return 1
+
+
+def main(argv):
+    if len(argv) not in (4, 5) or argv[2] not in ('write-config', 'reset-log', 'read-log', 'wait-log', 'prepare-ssh') or (len(argv) == 5) != (argv[2] == 'prepare-ssh'):
+        print('usage: c0-host-io ROOT OP PATH [INSTANCE]', file=sys.stderr)
+        return 2
+    operation = argv[2]
+    parent = descriptor = None
+    try:
+        try:
+            parent, name = parent_fd(argv[1], os.path.join(argv[3], '.c0-ssh-entry') if operation == 'prepare-ssh' else argv[3], operation == 'reset-log')
+        except FileNotFoundError:
+            if operation == 'read-log':
+                return 0
+            raise
+        if operation == 'prepare-ssh':
+            prepare_ssh(parent, argv[4])
+            return 0
+        if operation == 'write-config':
+            write_config(parent, name)
+            return 0
+        try:
+            descriptor = open_regular(parent, name,
+                                      os.O_WRONLY if operation == 'reset-log' else os.O_RDONLY,
+                                      operation == 'reset-log')
+        except FileNotFoundError:
+            if operation == 'read-log':
+                return 0
+            raise
+        if operation == 'reset-log':
+            os.fchmod(descriptor, 0o600)
+            os.ftruncate(descriptor, 0)
+            return 0
+        return read_log(descriptor, operation == 'wait-log')
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        # Do not include file contents, redirect targets, or raw exceptions.
+        print('error: refused unsafe or unavailable host config/log path', file=sys.stderr)
+        return 1
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

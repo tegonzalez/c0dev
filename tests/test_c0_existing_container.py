@@ -55,6 +55,26 @@ class ExistingContainer(unittest.TestCase):
             calls = self.f.read()['calls']
             self.assertTrue(any(c[0] == 'compose' and any('security-'+security+'.yaml' in a for a in c) for c in calls))
 
+    def test_legacy_attach_remains_usable_without_a_published_image(self):
+        state = self.f.read()
+        state['images'] = {}
+        self.f.write(state)
+        result = self.f.run('sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('oneoff-runtime', self.f.read()['calls'][-1])
+        self.assertFalse((self.f.checkout / '.local/c0').exists())
+
+    def test_fresh_creation_requires_a_published_docker_artifact(self):
+        state = self.f.read()
+        state['images'] = {}
+        state['containers'] = []
+        self.f.write(state)
+        result = self.f.run('start')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run 'c0 build'", result.stderr)
+        self.assertFalse(any(call[0] in ('run', 'compose') for call in self.f.read()['calls']))
+        self.assertFalse((self.f.checkout / '.local/c0').exists())
+
     def test_attach_propagates_docker_failure(self):
         state = self.f.read(); state['shell_status'] = 27; self.f.write(state)
         result = self.f.run('sh')

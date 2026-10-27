@@ -324,14 +324,18 @@ class Fixture:
         for name, content in (('id_ed25519', client_private), ('id_ed25519.pub', client_public)):
             (self.checkout/'auth/ssh-client'/name).write_bytes(content)
             (self.checkout/'auth/ssh-client'/name).chmod(0o600)
-        self.tools = subprocess.check_output(
-            [str(self.checkout/'bin/docker-hash'), 'docker/Dockerfile.base',
-             'docker/Dockerfile.tools'], cwd=self.checkout, text=True).strip()
         self.instance = 'c0dev-'+hashlib.sha256(str(self.checkout).encode()).hexdigest()[:8]
         self.workspace = self.instance
         source = (self.checkout/'bin/c0').read_text()
         recipe_function = re.search(r'^c0_recipe_hash\(\) \{\n.*?^\}', source,
                                     re.M | re.S).group()
+        tools_function = re.search(r'^c0_tools_recipe_hash\(\) \{\n.*?^\}', source,
+                                   re.M | re.S).group()
+        # Arranged artifact labels use the current recipe calculation; semantic
+        # identity assertions live in SharingIdentity, independently of this double.
+        self.tools = subprocess.check_output(
+            ['/bin/bash', '-c', 'C0ROOT="$TEST_CHECKOUT"\n' + tools_function + '\nc0_tools_recipe_hash'],
+            env=dict(os.environ, TEST_CHECKOUT=str(self.checkout)), text=True).strip()
         self.recipe = subprocess.check_output(
             ['/bin/bash', '-c', 'C0ROOT="$TEST_CHECKOUT"\n' + recipe_function + '\nc0_recipe_hash'],
             env=dict(os.environ, TEST_CHECKOUT=str(self.checkout)), text=True).strip()

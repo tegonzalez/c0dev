@@ -272,6 +272,8 @@ c0 ssh --keygen           # Prepare separate host client and guest server/auth k
 
 Use `c0 build -f` to force tool re-extraction.
 
+`c0 status` includes a shell-escaped `command environment (launcher inputs)` section. It shows the same nonsecret launcher settings passed to Compose, including production mode, separately from container observations. Empty optional values are shown as `''`; their Compose defaults still apply. Status does not load `auth/.env` or display arbitrary host environment values.
+
 Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps running in the background (`docker attach` does not open a shell).
 
 ### Web port mapping
@@ -363,7 +365,7 @@ On `c0 build`:
 1. Builds or reuses the mode/build runtime image. New images pass a networkless UID-1000 launch check before publication.
 1. Publishes the completed runtime image under its shared build tag and recipe alias. Docker image labels identify its build, mode, recipe, tools payload, and base image.
 
-Every `c0 build` resolves the latest stable Bun, uv, fnm, Node 22 patch, Python 3.15 patch, pip, and Semgrep. npm and pnpm select the newest stable versions compatible with the selected Node 22 release. Prereleases, releases below the security floors, malformed metadata, and upstream lookup failures stop the build; failed builds leave the previously published shared runtime image intact.
+Every `c0 build` resolves the latest stable Bun, uv, fnm, Node 22 patch, pip, and Semgrep. Python selects the newest published final 3.15 patch with an official Linux arm64 GNU standalone asset, at or above 3.15.2. Its exact download URL and SHA-256 are bound into the manifest; a scoped uv catalog installs that fixed artifact even when uv’s bundled catalog predates it. npm and pnpm select the newest stable versions compatible with the selected Node 22 release. Prereleases, releases below the security floors, malformed metadata, and upstream lookup failures stop the build; failed builds leave the previously published shared runtime image intact.
 
 The canonical manifest and Dockerfile recipe determine shared artifact identities. A new resolved release changes the build and tools identities even when the Dockerfiles are unchanged. Identical mode/recipe/release inputs in different working folders reuse the same completed tools, base, and runtime artifacts. Containers add the working-folder identity. A running container keeps its fixed image and tools mount until stopped; the next start uses the current published shared image. The exact versions are passed to both image builds and verified during installation; the manifest is retained in `/tools/current/.c0dev-toolchain.json` and `/tools/current/.local/share/c0/toolchain.json` for inspection.
 
@@ -371,7 +373,7 @@ The canonical manifest and Dockerfile recipe determine shared artifact identitie
 
 Normal `c0 sh` and `c0 ssh` select the mounted snapshot's Node/Python, package-manager and uv defaults, even when a persistent home overlay contains older generic launchers or fnm defaults. Selection uses private cache shims without deleting staged files or rewriting custom fnm aliases. Node/Python versions remain available for explicit per-session selection. Login, status, start, and SSH do not resolve toolchain releases or install tools; `c0 build` resolves toolchain releases.
 
-Debian's `/usr/bin/python3` remains available for system-package shebangs and dependencies; replacing or removing it would break those consumers. Existing project virtual environments keep their own interpreter and packages. Pip is resolved independently of Python, so a pip security release can refresh the tools snapshot without a CPython release. CPython's embedded `ensurepip` wheel remains the vendor-supplied wheel and is checked against the certificate-security floor rather than rewritten.
+Debian's `/usr/bin/python3` remains available for system-package shebangs and dependencies; replacing or removing it would break those consumers. Image construction backports the destination-link rejection in its `tarfile.tar_filter` and rechecks it after runtime package installation. Existing project virtual environments keep their own interpreter and packages. Pip is resolved independently of Python, so a pip security release can refresh the tools snapshot without a CPython release. CPython's embedded `ensurepip` wheel remains the vendor-supplied wheel and is checked against the certificate-security floor rather than rewritten.
 
 The base upgrades inherited Debian packages, requires the eMudhra fixed CA package, and checks that the affected root and cross-sign trust paths are absent. Bun, Node, uv and Electron use their corresponding patched releases; the reviewed Orca package is 1.4.239 with Electron 43.8.1. Zellij and Nushell resolve updated compatible Rust dependencies, and build checks inspect their actual compiled certificate-verifier/root-store versions. Guest activation supplies system trust defaults for Python/OpenSSL, Requests and uv, including SSH sessions. Explicit application trust overrides and old virtual environments still need their own review.
 

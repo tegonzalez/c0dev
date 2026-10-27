@@ -26,6 +26,7 @@ SOURCES = {
     'fnm': 'https://api.github.com/repos/Schniz/fnm/releases/latest',
     'node': 'https://nodejs.org/dist/index.json',
     'python': 'https://www.python.org/api/v2/downloads/release/?is_published=true',
+    'python-build': 'https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest',
     'pip': 'https://pypi.org/pypi/pip/json',
     'npm': 'https://registry.npmjs.org/npm/latest',
     'pnpm': 'https://registry.npmjs.org/pnpm/latest',
@@ -33,7 +34,7 @@ SOURCES = {
 }
 FLOORS = {
     'bun': '1.4.4', 'uv': '0.13.5', 'fnm': '1.39.0',
-    'node': '22.23.4', 'python': '3.15.1', 'pip': '26.2.2', 'npm': '12.2.1',
+    'node': '22.23.4', 'python': '3.15.2', 'pip': '26.2.2', 'npm': '12.2.1',
     'pnpm': '12.15.0', 'semgrep': '1.182.1',
 }
 BUILD_ARGS = (
@@ -210,9 +211,26 @@ def _latest_node(data):
     return '.'.join(map(str, selected))
 
 
-def _latest_python(data):
+def python_download(source, selected):
+    """Validate the exact official standard Linux arm64 asset and checksum."""
+    match = re.fullmatch(
+        r'https://github\.com/astral-sh/python-build-standalone/releases/download/'
+        r'(?P<build>[0-9]{8})/cpython-(?P<version>3\.15\.[0-9]+)%2B(?P=build)'
+        r'-aarch64-unknown-linux-gnu-install_only_stripped\.tar\.gz'
+        r'#sha256=(?P<sha256>[0-9a-f]{64})', source) if isinstance(source, str) else None
+    if match is None or match['version'] != selected:
+        raise ResolutionError('python: missing trusted download URL or checksum for selected release')
+    return source.split('#', 1)[0], match['sha256'], match['build']
+
+
+def _latest_python(data, downloads):
     if not isinstance(data, list):
         raise ResolutionError('python: expected official release records')
+    if not isinstance(downloads, dict) or downloads.get('draft') is not False or downloads.get('prerelease') is not False:
+        raise ResolutionError('python: latest standalone build release is missing, draft, or prerelease')
+    build = downloads.get('tag_name')
+    if not isinstance(build, str) or not re.fullmatch(r'[0-9]{8}', build) or not isinstance(downloads.get('assets'), list):
+        raise ResolutionError('python: missing standalone build release tag or assets')
     candidates = []
     for entry in data:
         if not isinstance(entry, dict):
@@ -223,7 +241,25 @@ def _latest_python(data):
             candidates.append(match[1])
     if not candidates:
         raise ResolutionError('python: no published final Python 3.15 release found')
-    return max(candidates, key=version)
+    for candidate in sorted(set(candidates), key=version, reverse=True):
+        if version(candidate) < version(FLOORS['python']):
+            continue
+        name = 'cpython-' + candidate + '+' + build + '-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'
+        assets = [asset for asset in downloads['assets'] if isinstance(asset, dict) and asset.get('name') == name]
+        if not assets:
+            continue
+        if len(assets) != 1:
+            raise ResolutionError('python: ambiguous standalone Linux arm64 GNU asset')
+        location = assets[0].get('browser_download_url')
+        digest = assets[0].get('digest')
+        if not isinstance(digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or not isinstance(location, str):
+            raise ResolutionError('python: missing trusted download URL or checksum')
+        source = location + '#sha256=' + digest[len('sha256:'):]
+        _, _, source_build = python_download(source, candidate)
+        if source_build != build:
+            raise ResolutionError('python: standalone asset does not match release build tag')
+        return candidate, source
+    raise ResolutionError('python: latest standalone release has no published final Python 3.15 Linux arm64 GNU download at or above security floor ' + FLOORS['python'])
 
 
 def _npm_package(tool, latest, node, fetch):
@@ -264,13 +300,13 @@ def _npm_package(tool, latest, node, fetch):
     return max(candidates, key=version)
 
 
-def source_urls(versions):
+def source_urls(versions, python_source=None):
     return {
         'bun': 'https://github.com/oven-sh/bun/releases/tag/bun-v' + versions['bun'],
         'uv': 'https://github.com/astral-sh/uv/releases/tag/' + versions['uv'],
         'fnm': 'https://github.com/Schniz/fnm/releases/tag/v' + versions['fnm'],
         'node': 'https://nodejs.org/en/blog/release/v' + versions['node'],
-        'python': 'https://www.python.org/downloads/release/python-' + versions['python'].replace('.', '') + '/',
+        'python': python_source if python_source is not None else 'https://www.python.org/downloads/release/python-' + versions['python'].replace('.', '') + '/',
         'pip': 'https://pypi.org/project/pip/' + versions['pip'] + '/',
         'npm': 'https://registry.npmjs.org/npm/' + versions['npm'],
         'pnpm': 'https://registry.npmjs.org/pnpm/' + versions['pnpm'],
@@ -291,7 +327,12 @@ def validate_manifest(manifest):
             raise ResolutionError('{}: {} is below security floor {}'.format(tool, versions[tool], minimum))
     if version(versions['node'])[0] != 22 or version(versions['python'])[:2] != (3, 15):
         raise ResolutionError('toolchain must remain on Node 22 and Python 3.15')
-    if manifest['sources'] != source_urls(versions):
+    sources = manifest['sources']
+    if not isinstance(sources, dict):
+        raise ResolutionError('toolchain manifest sources must be official release URLs')
+    python_source = sources.get('python')
+    python_download(python_source, versions['python'])
+    if sources != source_urls(versions, python_source):
         raise ResolutionError('toolchain manifest sources do not match selected official releases')
     return manifest
 
@@ -309,8 +350,9 @@ def resolve(fetch=fetch_json):
         'uv': _github_release(metadata['uv'], '', 'uv'),
         'fnm': _github_release(metadata['fnm'], 'v', 'fnm'),
         'node': _latest_node(metadata['node']),
-        'python': _latest_python(metadata['python']),
     }
+    # Bind the standalone asset independently of uv's frozen download catalog.
+    versions['python'], python_source = _latest_python(metadata['python'], metadata['python-build'])
     for tool in ('npm', 'pnpm'):
         versions[tool] = _npm_package(tool, metadata[tool], versions['node'], fetch)
     for tool in ('semgrep', 'pip'):
@@ -321,7 +363,7 @@ def resolve(fetch=fetch_json):
         (pip_version if tool == 'pip' else version)(versions[tool])
         if not satisfies(versions['python'], package['info'].get('requires_python')):
             raise ResolutionError(tool + ': latest release does not support Python ' + versions['python'])
-    return validate_manifest({'schema': 1, 'versions': versions, 'sources': source_urls(versions)})
+    return validate_manifest({'schema': 1, 'versions': versions, 'sources': source_urls(versions, python_source)})
 
 
 def canonical_json(manifest):
@@ -354,6 +396,9 @@ def main(argv=None):
             manifest = validate_manifest(json.loads(args.build_args.read_text()))
             for argument, tool in BUILD_ARGS:
                 print(argument + '=' + manifest['versions'][tool])
+            location, checksum, _ = python_download(manifest['sources']['python'], manifest['versions']['python'])
+            print('PYTHON_DOWNLOAD_URL=' + location)
+            print('PYTHON_DOWNLOAD_SHA256=' + checksum)
         else:
             manifest = resolve()
             text = canonical_json(manifest)

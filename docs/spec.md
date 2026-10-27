@@ -66,7 +66,11 @@ The [tools-store contract](tool-store-contract.md) owns exact identity, storage 
 
 ### Build
 
-Build resolves current supported releases once, captures the canonical manifest, and binds both tools and runtime construction to those selections. Changed resolved inputs change identity. Cached artifacts require matching provenance and validation. Force rebuild changes cache/extraction disposition without granting permission to overwrite referenced content or replace a running guest. Current core includes Rust/Cargo-built tools, managed Node/Python and package managers, Semgrep, and assistant CLIs; no `c0 pkg` or named-environment facade is supplied by this branch.
+Build resolves current supported releases once, captures the canonical manifest, and binds both tools and runtime construction to those selections. Managed Python selection stays on 3.15 and chooses the newest published final standalone build available on the supported target, without crossing below the 3.15.2 security floor. Its exact artifact URL and checksum participate in build identity. The system interpreter remains available to Debian consumers, with the same destination-link archive rejection backported into its stdlib. Changed resolved inputs change identity. Cached artifacts require matching provenance and validation. Force rebuild changes cache/extraction disposition without granting permission to overwrite referenced content or replace a running guest. Current core includes Rust/Cargo-built tools, managed Node/Python and package managers, Semgrep, and assistant CLIs; no `c0 pkg` or named-environment facade is supplied by this branch.
+
+### Command Environment
+
+Build and runtime command invocations must receive consistent resolved launcher settings. Status displays the explicitly selected nonsecret launcher inputs separately from observed container state, including the default production mode. Optional inputs that have not been resolved remain distinguishable from observed values. Status neither loads session credentials nor executes guest code, creates containers, or depends on an image being available.
 
 ### Tools Disposition
 

@@ -21,25 +21,87 @@ resolver = importlib.util.module_from_spec(spec)
 loader.exec_module(resolver)
 
 
+PBS_RELEASE = 'https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest'
+UV_PYTHON_CATALOG = 'https://raw.githubusercontent.com/astral-sh/uv/0.13.5/crates/uv-python-managed/download-metadata.json'
+DOWNLOAD_ROOT = 'https://github.com/astral-sh/python-build-standalone/releases/download/'
+PYTHON_SHA256 = 'a' * 64
+
+
+def python_asset(patch=2, build='20261026'):
+    """Official GitHub release asset shape; expectations do not use IUT helpers."""
+    name = f'cpython-3.15.{patch}+{build}-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'
+    return {'name': name, 'browser_download_url': DOWNLOAD_ROOT + build + '/' + name.replace('+', '%2B'),
+            'digest': 'sha256:' + PYTHON_SHA256}
+
+
+def python_source(patch=2, build='20261026'):
+    return python_asset(patch, build)['browser_download_url'] + '#sha256=' + PYTHON_SHA256
+
+
+def published_python(patch, **changes):
+    return dict({'name': f'Python 3.15.{patch}', 'is_published': True, 'pre_release': False}, **changes)
+
+
+def supported_manifest():
+    # Contract fixture, including all nine existing keys, independent of resolve.
+    return {
+        'schema': 1,
+        'versions': dict(bun='1.4.4', uv='0.13.5', fnm='1.39.0', node='22.23.4',
+                         python='3.15.2', pip='26.2.2', npm='12.2.1', pnpm='12.15.0', semgrep='1.182.1'),
+        'sources': {
+            'bun': 'https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4',
+            'uv': 'https://github.com/astral-sh/uv/releases/tag/0.13.5',
+            'fnm': 'https://github.com/Schniz/fnm/releases/tag/v1.39.0',
+            'node': 'https://nodejs.org/en/blog/release/v22.23.4',
+            'python': python_source(),
+            'pip': 'https://pypi.org/project/pip/26.2.2/',
+            'npm': 'https://registry.npmjs.org/npm/12.2.1',
+            'pnpm': 'https://registry.npmjs.org/pnpm/12.15.0',
+            'semgrep': 'https://pypi.org/project/semgrep/1.182.1/',
+        },
+    }
+
+
 def metadata():
-    result = {
+    return {
         resolver.SOURCES['bun']: {'tag_name': 'bun-v1.4.4', 'draft': False, 'prerelease': False},
         resolver.SOURCES['uv']: {'tag_name': '0.13.5', 'draft': False, 'prerelease': False},
         resolver.SOURCES['fnm']: {'tag_name': 'v1.39.0', 'draft': False, 'prerelease': False},
         resolver.SOURCES['node']: [{'version': 'v22.23.4', 'files': ['linux-arm64']}],
-        resolver.SOURCES['python']: [{'name': 'Python 3.15.1', 'is_published': True, 'pre_release': False}],
+        resolver.SOURCES['python']: [published_python(1), published_python(2)],
         resolver.SOURCES['pip']: {'info': {'version': '26.2.2', 'requires_python': '>=3.9'}},
         resolver.SOURCES['npm']: {'version': '12.2.1', 'engines': {'node': '^22.22.2 || ^24.15.0 || >=26.0.0'}},
         resolver.SOURCES['pnpm']: {'version': '12.15.0', 'engines': {'node': '>=22.0.0'}},
         resolver.SOURCES['semgrep']: {'info': {'version': '1.182.1', 'requires_python': '>=3.10'}},
+        PBS_RELEASE: {'tag_name': '20261026', 'draft': False, 'prerelease': False,
+                      'assets': [python_asset(1), python_asset(2)]},
     }
-    return result
 
 
 class ToolchainResolver(unittest.TestCase):
     def resolve(self, fixtures=None):
         data = fixtures or metadata()
         return resolver.resolve(lambda url: copy.deepcopy(data[url]))
+
+    def test_published_security_patch_uses_standalone_asset_despite_frozen_uv_catalog(self):
+        data = metadata()
+        # uv 0.13.5 shipped before this security fix. Its frozen index is not
+        # an authority for whether a newer official standalone build exists.
+        requested = []
+        def fetch(url):
+            requested.append(url)
+            if url == UV_PYTHON_CATALOG:
+                self.fail('resolution must not consult the frozen uv Python catalog')
+            return copy.deepcopy(data[url])
+        result = resolver.resolve(fetch)
+        self.assertEqual(result['versions']['python'], '3.15.2')
+        self.assertEqual(result['sources']['python'], python_source())
+        self.assertIn(PBS_RELEASE, requested)
+        self.assertEqual(set(result), {'schema', 'versions', 'sources'})
+        self.assertEqual(result['schema'], 1)
+        expected_tools = {'bun', 'uv', 'fnm', 'node', 'python', 'pip', 'npm', 'pnpm', 'semgrep'}
+        self.assertEqual(set(result['versions']), expected_tools)
+        self.assertEqual(set(result['sources']), expected_tools)
 
     def test_selects_latest_numeric_patch_on_fixed_language_branches(self):
         data = metadata()
@@ -51,19 +113,21 @@ class ToolchainResolver(unittest.TestCase):
         ]
         data[resolver.SOURCES['python']] += [
             {'name': 'Python 3.16.0', 'is_published': True, 'pre_release': False},
-            {'name': 'Python 3.15.2', 'is_published': True, 'pre_release': False},
-            {'name': 'Python 3.15.99', 'is_published': False, 'pre_release': False},
-            {'name': 'Python 3.15.3', 'is_published': True, 'pre_release': True},
+            published_python(10), published_python(99, is_published=False),
+            published_python(11, pre_release=True),
         ]
+        data[PBS_RELEASE]['assets'] += [python_asset(10), python_asset(99), python_asset(11)]
         result = self.resolve(data)
         self.assertEqual(result['versions']['node'], '22.24.1')
-        self.assertEqual(result['versions']['python'], '3.15.2')
+        self.assertEqual(result['versions']['python'], '3.15.10')
+        self.assertEqual(result['sources']['python'], python_source(10))
         self.assertIn('/v22.24.1', result['sources']['node'])
 
     def test_new_metadata_without_new_versions_does_not_change_identity(self):
         data = metadata()
         first = resolver.canonical_json(self.resolve(data))
         data[resolver.SOURCES['bun']].update(download_count=999, body='edited release notes')
+        data[PBS_RELEASE].update(download_count=999, body='edited standalone release notes')
         second = resolver.canonical_json(self.resolve(data))
         self.assertEqual(first, second)
         self.assertEqual(first, json.dumps(json.loads(first), sort_keys=True, separators=(',', ':')) + '\n')
@@ -72,7 +136,121 @@ class ToolchainResolver(unittest.TestCase):
         before = resolver.canonical_json(self.resolve())
         data = metadata()
         data[resolver.SOURCES['uv']]['tag_name'] = '0.13.6'
-        self.assertNotEqual(before, resolver.canonical_json(self.resolve(data)))
+        after = self.resolve(data)
+        self.assertEqual(after['versions']['python'], '3.15.2')
+        self.assertNotEqual(before, resolver.canonical_json(after))
+
+    def test_distribution_build_or_checksum_change_changes_manifest_identity(self):
+        before = resolver.canonical_json(self.resolve())
+        for change in ('build', 'checksum'):
+            with self.subTest(change=change):
+                data = metadata()
+                if change == 'build':
+                    data[PBS_RELEASE].update(tag_name='20261027', assets=[python_asset(2, '20261027')])
+                else:
+                    data[PBS_RELEASE]['assets'][1]['digest'] = 'sha256:' + 'b' * 64
+                after = self.resolve(data)
+                self.assertEqual(after['versions']['python'], '3.15.2')
+                self.assertNotEqual(before, resolver.canonical_json(after))
+
+    def test_standalone_catalog_cannot_promote_unpublished_prerelease_or_unlisted_python(self):
+        data = metadata()
+        data[resolver.SOURCES['python']] += [published_python(3, is_published=False),
+                                            published_python(4, pre_release=True)]
+        data[PBS_RELEASE]['assets'] += [python_asset(3), python_asset(4), python_asset(5)]
+        self.assertEqual(self.resolve(data)['versions']['python'], '3.15.2')
+
+    def test_official_python_release_flags_require_json_boolean_values(self):
+        for changes in ({'is_published': 1}, {'pre_release': 0}):
+            with self.subTest(changes=changes):
+                data = metadata()
+                data[resolver.SOURCES['python']] = [published_python(2, **changes)]
+                with self.assertRaisesRegex(resolver.ResolutionError, 'published final'):
+                    self.resolve(data)
+                data[resolver.SOURCES['python']] = [published_python(2)]
+                self.assertEqual(self.resolve(data)['versions']['python'], '3.15.2')
+
+    def test_published_new_patch_without_standalone_asset_keeps_available_fixed_patch(self):
+        data = metadata()
+        data[resolver.SOURCES['python']].append(published_python(3))
+        self.assertEqual(self.resolve(data)['versions']['python'], '3.15.2')
+
+    def test_wrong_arch_libc_or_variant_cannot_satisfy_security_floor(self):
+        for suffix in ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-musl',
+                       'aarch64-apple-darwin', 'aarch64-unknown-linux-gnu-freethreaded',
+                       'aarch64-unknown-linux-gnu-debug'):
+            with self.subTest(suffix=suffix):
+                data = metadata()
+                asset = python_asset()
+                for key in ('name', 'browser_download_url'):
+                    asset[key] = asset[key].replace('aarch64-unknown-linux-gnu', suffix)
+                data[PBS_RELEASE]['assets'] = [python_asset(1), asset]
+                with self.assertRaisesRegex(resolver.ResolutionError, '[Pp]ython'):
+                    self.resolve(data)
+                data[PBS_RELEASE]['assets'].append(python_asset())
+                self.assertEqual(self.resolve(data)['versions']['python'], '3.15.2')
+
+    def test_malformed_selected_download_refuses_instead_of_falling_back(self):
+        asset = python_asset(3)
+        url = asset['browser_download_url']
+        corruptions = [
+            {'browser_download_url': url.replace('https:', 'http:')},
+            {'browser_download_url': url.replace('github.com', 'github.com.untrusted.example')},
+            {'browser_download_url': url.replace('github.com', 'user@github.com')},
+            {'browser_download_url': url.replace('github.com', 'github.com:443')},
+            {'browser_download_url': url.replace('astral-sh/', 'other-owner/')},
+            {'browser_download_url': url.replace('3.15.3', '3.15.2')},
+            {'browser_download_url': url.replace('/20261026/', '/20261025/')},
+            {'browser_download_url': url.replace('%2B20261026', '%2B20261025')},
+            {'browser_download_url': url.replace('%2B', '+')},
+            {'browser_download_url': url + '?download=1'},
+            {'browser_download_url': url + '#sha256=' + PYTHON_SHA256},
+            {'digest': None}, {'digest': 'sha256:' + 'A' * 64},
+            {'digest': 'sha256:' + 'a' * 63}, {'digest': 'sha512:' + 'a' * 64},
+        ]
+        for changes in corruptions:
+            with self.subTest(changes=changes):
+                data = metadata()
+                data[resolver.SOURCES['python']].append(published_python(3))
+                selected = dict(asset, **changes)
+                data[PBS_RELEASE]['assets'].append(selected)
+                with self.assertRaises(resolver.ResolutionError):
+                    self.resolve(data)
+                data[PBS_RELEASE]['assets'][-1] = asset
+                self.assertEqual(self.resolve(data)['versions']['python'], '3.15.3')
+
+    def test_standalone_release_must_be_final_and_unambiguous(self):
+        for changes in ({'draft': True}, {'draft': 0}, {'prerelease': True}, {'prerelease': 0},
+                        {'tag_name': '20261026rc1'},
+                        {'tag_name': True}, {'assets': None},
+                        {'assets': [python_asset(), python_asset()]}):
+            with self.subTest(changes=changes):
+                data = metadata()
+                data[PBS_RELEASE].update(changes)
+                with self.assertRaises(resolver.ResolutionError):
+                    self.resolve(data)
+        self.assertEqual(self.resolve()['versions']['python'], '3.15.2')
+
+    def test_python_security_floor_refuses_old_or_missing_download(self):
+        for assets in ([], [python_asset(1)], [python_asset(0)]):
+            with self.subTest(assets=assets):
+                data = metadata()
+                data[PBS_RELEASE]['assets'] = assets
+                with self.assertRaisesRegex(resolver.ResolutionError, 'security floor'):
+                    self.resolve(data)
+        data = metadata()
+        data[resolver.SOURCES['python']] = [published_python(1)]
+        with self.assertRaisesRegex(resolver.ResolutionError, 'security floor'):
+            self.resolve(data)
+
+    def test_python_standalone_fetch_failure_refuses_resolution(self):
+        data = metadata()
+        def fetch(url):
+            if url == PBS_RELEASE:
+                raise resolver.ResolutionError('standalone catalog unavailable')
+            return copy.deepcopy(data[url])
+        with self.assertRaisesRegex(resolver.ResolutionError, 'standalone catalog unavailable'):
+            resolver.resolve(fetch)
 
     def test_node_arm64_build_must_exist_for_latest_patch(self):
         data = metadata()
@@ -196,6 +374,57 @@ class ToolchainResolver(unittest.TestCase):
         with self.assertRaisesRegex(resolver.ResolutionError, 'official'):
             resolver.validate_manifest(manifest)
 
+    def test_offline_manifest_accepts_bound_security_fix_and_later_build(self):
+        for build in ('20261026', '20261027'):
+            with self.subTest(build=build):
+                manifest = supported_manifest()
+                manifest['sources']['python'] = python_source(build=build)
+                self.assertEqual(resolver.validate_manifest(manifest), manifest)
+
+    def test_offline_manifest_refuses_vulnerable_python_even_with_legacy_release_source(self):
+        manifest = supported_manifest()
+        manifest['versions']['python'] = '3.15.1'
+        manifest['sources']['python'] = 'https://www.python.org/downloads/release/python-3151/'
+        with self.assertRaisesRegex(resolver.ResolutionError, 'security floor'):
+            resolver.validate_manifest(manifest)
+
+    def test_offline_manifest_requires_exact_distribution_version_build_and_sha256(self):
+        valid = python_source()
+        for source in (
+                'https://www.python.org/downloads/release/python-3152/',
+                valid.split('#')[0], valid.replace('3.15.2', '3.15.1'),
+                valid.replace('/20261026/', '/20261025/'),
+                valid.replace('github.com', 'github.com.untrusted.example'),
+                valid.replace('https:', 'http:'), valid.replace('%2B', '+'),
+                valid.replace('aarch64-', 'x86_64-'),
+                valid.replace('install_only_stripped', 'install_only'),
+                valid.replace('sha256=', 'sha512='), valid[:-1],
+                valid[:-64] + 'A' * 64, valid + '&other=1'):
+            with self.subTest(source=source):
+                manifest = supported_manifest()
+                manifest['sources']['python'] = source
+                with self.assertRaises(resolver.ResolutionError):
+                    resolver.validate_manifest(manifest)
+                manifest['sources']['python'] = valid
+                resolver.validate_manifest(manifest)
+
+    def test_offline_manifest_keeps_exact_schema_and_tool_membership(self):
+        for change in ('bool-schema', 'extra-field', 'missing-source', 'extra-tool', 'bool-version'):
+            with self.subTest(change=change):
+                manifest = supported_manifest()
+                if change == 'bool-schema':
+                    manifest['schema'] = True
+                elif change == 'extra-field':
+                    manifest['distribution'] = {}
+                elif change == 'missing-source':
+                    del manifest['sources']['python']
+                elif change == 'extra-tool':
+                    manifest['versions']['other'] = '1.2.3'
+                else:
+                    manifest['versions']['python'] = True
+                with self.assertRaises(resolver.ResolutionError):
+                    resolver.validate_manifest(manifest)
+
     def test_failed_resolution_preserves_prior_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'manifest.json'
@@ -213,7 +442,13 @@ class ToolchainResolver(unittest.TestCase):
             with mock.patch.object(resolver, 'resolve', side_effect=AssertionError('network not allowed')):
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(resolver.main(['--build-args', str(path)]), 0)
-            expected = [name + '=' + resolver.FLOORS[tool] for name, tool in resolver.BUILD_ARGS]
+            expected = [
+                'BUN_VERSION=1.4.4', 'UV_VERSION=0.13.5', 'FNM_VERSION=1.39.0',
+                'NODE_VERSION=22.23.4', 'PYTHON_VERSION=3.15.2', 'PIP_VERSION=26.2.2',
+                'NPM_VERSION=12.2.1', 'PNPM_VERSION=12.15.0', 'SEMGREP_VERSION=1.182.1',
+                'PYTHON_DOWNLOAD_URL=' + python_asset()['browser_download_url'],
+                'PYTHON_DOWNLOAD_SHA256=' + PYTHON_SHA256,
+            ]
             self.assertEqual(output.getvalue().splitlines(), expected)
 
     def test_network_failure_does_not_produce_a_manifest(self):

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 # Base stage with system dependencies
 # c0 build resolves this once and passes the same release to both images.
-ARG BUN_VERSION
+# A valid security-floor default keeps Docker validation meaningful.
+# c0 always overrides it with the freshly resolved release.
+ARG BUN_VERSION=1.4.4
 FROM oven/bun:${BUN_VERSION} AS base
 ARG BUN_VERSION
 
@@ -13,7 +15,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     cmake \
     curl \
     git \
-    libssl-dev \
+    libssl-dev python3 \
     tzdata
 
 # Debian #1151413: distrust the compromised eMudhra hierarchy and its
@@ -39,6 +41,11 @@ RUN dpkg --compare-versions "$BUN_VERSION" ge 1.4.4 \
 
 # Rename bun user to dev (keeping same UID/GID); login shell matches c0 sh / c0 ssh
 RUN usermod -l dev bun && groupmod -n dev bun && usermod -d /home/dev -m dev && usermod -s /bin/bash dev
+
+# Preserve Debian's interpreter for package consumers while fixing tar_filter
+# in the system stdlib too. Managed Python is installed separately as dev.
+COPY c0-security.py /usr/local/libexec/c0-security.py
+RUN /usr/bin/python3 -I /usr/local/libexec/c0-security.py system-python
 
 WORKDIR /home/dev
 RUN rmdir app

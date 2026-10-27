@@ -42,6 +42,7 @@ REQUIRED_FILES=(
     "$C0ROOT/docker/home-overlays.conf"
     "$C0ROOT/docker/c0-overlay-check"
     "$C0ROOT/docker/c0-publish-tools"
+    "$C0ROOT/docker/c0-security.py"
     "$C0ROOT/bin/docker-hash"
     "$C0ROOT/bin/c0-host-io"
     "$C0ROOT/bin/c0-credentials"
@@ -124,21 +125,27 @@ export C0_HOME_OVERLAYS_VOLUME="${C0_INSTANCE_ID}-home-overlays"
 export C0_HOME_OVERLAYS_EXTERNAL=false
 
 # Hash logical input names and contents, never the checkout's absolute path.
+c0_tools_recipe_hash() {
+    local recipe helper
+    recipe="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" docker/Dockerfile.base docker/Dockerfile.tools)" || return 1
+    helper="$(shasum -a 256 <"$C0ROOT/docker/c0-security.py")" || return 1
+    printf 'c0-tools-recipe-v2\n%s\n%s\n' "$recipe" "${helper:0:64}" | shasum -a 256 | awk '{print $1}'
+}
+
 c0_recipe_hash() {
     local input digest values
     digest="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" \
         docker/Dockerfile.base docker/Dockerfile.tools docker/Dockerfile.runtime)" || return 1
     values="c0-recipe-v1"$'\n'"$digest"
     for input in 1password.asc cloud.google.gpg install-orca.sh docker-entrypoint.sh \
-        home-overlays.conf c0-overlay-check; do
+        home-overlays.conf c0-overlay-check c0-security.py; do
         digest="$(shasum -a 256 <"$C0ROOT/docker/$input")" || return 1
         values+=$'\n'"docker/$input:${digest:0:64}"
     done
     printf '%s\n' "$values" | shasum -a 256 | awk '{print $1}'
 }
 
-TOOLS_RECIPE_ID="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" \
-    docker/Dockerfile.base docker/Dockerfile.tools)"
+TOOLS_RECIPE_ID="$(c0_tools_recipe_hash)"
 C0_RECIPE_ID="$(c0_recipe_hash)"
 TOOLS_BUILD_ID="$TOOLS_RECIPE_ID"
 TOOLS_ID="$TOOLS_BUILD_ID"
@@ -197,7 +204,7 @@ c0_prepare_build_context() {
     mkdir -p "$C0_BUILD_CONTEXT/.terminfo" || return 1
     local input
     for input in 1password.asc cloud.google.gpg install-orca.sh docker-entrypoint.sh \
-        home-overlays.conf c0-overlay-check; do
+        home-overlays.conf c0-overlay-check c0-security.py; do
         cp "$C0ROOT/docker/$input" "$C0_BUILD_CONTEXT/$input" || return 1
     done
 }
@@ -758,14 +765,34 @@ print_ssh_auth_mapping() {
 # Helper: docker-compose wrapper (one compose project per instance id)
 # =============================================================================
 
-dc() {
-    export SHARED_TOOLS_VOLUME
-    export TOOLS_ID
-    export TOOLS_PREFIX
-    export C0_INSTANCE_ID
-    export C0_WORKSPACE_ID C0_BUILD_ID C0_RECIPE_ID C0_MODE_KEY C0_RUNTIME_IMAGE
-    export C0DEV_SSH_PORT
+c0_command_environment() {
+    local action="$1" name assignment
+    shift
+    local -a environment=()
+    # Only nonsecret launcher inputs belong here. Keep the same projection for
+    # every Compose invocation and status; optional defaults remain in Compose.
+    for name in C0_MODE_KEY C0_RECIPE_ID C0_WORKSPACE_ID C0_INSTANCE_ID \
+        C0_BUILD_ID C0_RUNTIME_IMAGE SHARED_TOOLS_VOLUME TOOLS_ID TOOLS_PREFIX \
+        C0DEV_WEB_PORT C0DEV_SSH_PORT C0_SECURITY C0_HOME_OVERLAYS_VOLUME \
+        C0_HOME_OVERLAYS_EXTERNAL C0_BUILD_CONTEXT DOCKERFILE_RUNTIME_BUILD TERM; do
+        environment+=("$name=${!name-}")
+    done
+    case "$action" in
+        run)
+            [[ $# -gt 0 ]] || { echo 'error: command environment requires a command' >&2; return 2; }
+            env "${environment[@]}" "$@"
+            ;;
+        show)
+            [[ $# -eq 0 ]] || { echo 'error: command environment display takes no arguments' >&2; return 2; }
+            for assignment in "${environment[@]}"; do
+                printf '  %s=%q\n' "${assignment%%=*}" "${assignment#*=}"
+            done
+            ;;
+        *) echo 'error: invalid command environment operation' >&2; return 2 ;;
+    esac
+}
 
+dc() {
     local -a compose_files=(
         -f "$VOLUMES_FOLDERS_FILE"
         -f "$VOLUMES_FILES_FILE"
@@ -779,7 +806,6 @@ dc() {
             ensure_c0_security_resolved || return 1
             local security_file
             security_file="$(c0_security_compose_file)" || return 1
-            export C0_SECURITY
             compose_files+=(-f "$security_file")
             ;;
     esac
@@ -787,23 +813,21 @@ dc() {
     case "${1:-}" in
         up|create|run|config)
             if c0_ssh_agent_enabled; then
-                docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" \
+                c0_command_environment run docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" \
                     -f <(ensure_ssh_auth_compose_fragment) "$@"
                 return $?
             fi
             ;;
     esac
-    docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" "$@"
+    c0_command_environment run docker compose -p "$C0_INSTANCE_ID" "${compose_files[@]}" "$@"
 }
 
 # Image construction does not use runtime security, ports, or SSH mounts. Keep
 # it independent of running-container labels and avoid runtime setup helpers.
 dc_build() {
-    export SHARED_TOOLS_VOLUME TOOLS_ID TOOLS_PREFIX C0_INSTANCE_ID
-    export C0_BUILD_CONTEXT DOCKERFILE_RUNTIME_BUILD
     # Compose adds its project to image labels, so this project must have the
     # shared build identity rather than the working-folder runtime identity.
-    docker compose -p "c0dev-build-${C0_MODE_KEY}-${C0_BUILD_ID}" \
+    c0_command_environment run docker compose -p "c0dev-build-${C0_MODE_KEY}-${C0_BUILD_ID}" \
         -f "$VOLUMES_FOLDERS_FILE" \
         -f "$VOLUMES_FILES_FILE" \
         -f "$COMPOSE_PUBLIC_FILE" \
@@ -1130,7 +1154,7 @@ ensure_ssh_port() {
     fi
 
     local container_id
-    container_id="$(docker compose -p "$C0_INSTANCE_ID" \
+    container_id="$(c0_command_environment run docker compose -p "$C0_INSTANCE_ID" \
         -f "$VOLUMES_FOLDERS_FILE" -f "$VOLUMES_FILES_FILE" -f "$COMPOSE_PUBLIC_FILE" \
         ps -aq "$MAIN_SERVICE" 2>/dev/null | head -n 1 || true)"
     if [[ -n "$container_id" ]]; then
@@ -2767,7 +2791,6 @@ c0_create_runtime() {
     selection="$(c0_discover_home_storage)" || return 1
     IFS=$'\t' read -r C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL <<<"$selection"
     # These are computed Compose inputs, never caller-supplied options.
-    export C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL
     # One-off creation leaves any retained containers with Compose labels intact.
     dc run --no-deps -d --pull never --service-ports --name "$name" "$MAIN_SERVICE" >/dev/null
 }
@@ -2882,6 +2905,7 @@ cmd_status() {
     # Status must not execute guest code or depend on any container image.
     # Pins and completeness markers are volume contents, not Docker metadata.
     # Report Docker-owned runtime identity without depending on an image tag.
+    local launcher_tools_id="$TOOLS_ID"
     local TOOLS_ID="" status_cid
     status_cid="$(get_c0_container_id_any)"
     if [[ -z "$status_cid" ]]; then
@@ -2899,9 +2923,7 @@ cmd_status() {
     echo -e "${BOLD}instance:${NC} ${CYAN}$C0_INSTANCE_ID${NC}"
     echo -e "${BOLD}c0:${NC} ${YELLOW}$C0_BIN${NC}"
     echo -e "${BOLD}root:${NC} ${YELLOW}$C0ROOT${NC}"
-    if [[ -n "$C0_MODE" ]]; then
-        echo -e "${BOLD}mode:${NC} $C0_MODE"
-    fi
+    echo -e "${BOLD}mode:${NC} $C0_MODE_KEY"
     echo ""
 
     # Port mapping (if container exists)
@@ -3038,6 +3060,10 @@ cmd_status() {
         echo -e "  volume: ${YELLOW}missing${NC} (${CYAN}$SHARED_TOOLS_VOLUME${NC})"
     fi
     echo -e "  snapshot completeness: ${YELLOW}(not checked)${NC}"
+    echo ""
+
+    echo -e "${BOLD}command environment (launcher inputs):${NC}"
+    ( TOOLS_ID="$launcher_tools_id"; c0_command_environment show )
     echo ""
 
     # Docker labels describe the runtime/build ownership of existing workspaces.

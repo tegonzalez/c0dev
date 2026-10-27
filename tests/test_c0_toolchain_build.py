@@ -21,8 +21,8 @@ def function(name):
 RESOLVER = r'''
 import json, os, sys
 from pathlib import Path
-versions = dict(bun='1.4.4', uv='0.13.5', fnm='1.39.0',
-                node=os.environ['TEST_NODE'], python='3.15.1',
+versions = dict(bun=os.environ.get('TEST_BUN', '1.4.4'), uv='0.13.5', fnm='1.39.0',
+                node=os.environ['TEST_NODE'], python='3.15.2',
                 npm='12.2.1', pnpm='12.15.0', semgrep='1.182.1',
                 pip=os.environ['TEST_PIP'])
 if sys.argv[1] == '--output':
@@ -33,11 +33,108 @@ if sys.argv[1] == '--output':
 elif sys.argv[1] == '--build-args':
     for key, value in json.loads(Path(sys.argv[2]).read_text())['versions'].items():
         print(key.upper()+'_VERSION='+value)
+    print('PYTHON_DOWNLOAD_URL=https://github.com/astral-sh/python-build-standalone/releases/download/'
+          '20261026/cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz')
+    print('PYTHON_DOWNLOAD_SHA256='+'a'*64)
 else: sys.exit(99)
 '''
 
 
 class ToolchainBuild(unittest.TestCase):
+    def test_resolved_arguments_reach_base_tools_and_runtime_builds(self):
+        # Exercise the actual resolver adapter and three build command owners.
+        # The peer observes argv only; real BuildKit ARG/FROM validation belongs
+        # to the Docker check, not this portable orchestration regression.
+        with tempfile.TemporaryDirectory(prefix='c0-build-args-') as temp:
+            root = Path(temp)
+            (root / 'bin').mkdir()
+            resolver = root / 'bin/c0-toolchain'
+            resolver.write_text('#!' + sys.executable + '\n' + RESOLVER)
+            resolver.chmod(0o755)
+            docker = root / 'bin/docker'
+            docker.write_text('#!' + sys.executable + r'''
+import json, os, sys
+with open(os.environ['TEST_DOCKER_LOG'], 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\n')
+''')
+            docker.chmod(0o755)
+            script = '\n'.join(function(name) for name in (
+                'short_hash', 'c0_instance_id_for', 'c0_set_build_identity',
+                'set_tools_id', 'c0_resolve_toolchain', 'c0_build_base_image',
+                'build_tools_volume', 'c0_build_runtime_image', 'dc_build')) + r'''
+set -e
+C0ROOT="$TEST_ROOT"
+C0_BUILD_CONTEXT="$TEST_CONTEXT"
+C0_MODE=""
+C0_MODE_KEY=prod
+C0_RECIPE_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TOOLS_RECIPE_ID="$C0_RECIPE_ID"
+TOOLS_BUILD_ID="$C0_RECIPE_ID"
+SHARED_TOOLS_VOLUME=test-tools
+MAIN_SERVICE=c0dev
+DOCKERFILE_BASE="$TEST_ROOT/Dockerfile.base"
+DOCKERFILE_TOOLS_BUILD="$TEST_CONTEXT/Dockerfile.tools"
+VOLUMES_FOLDERS_FILE="$TEST_ROOT/volumes-folders.yaml"
+VOLUMES_FILES_FILE="$TEST_ROOT/volumes-files.yaml"
+COMPOSE_PUBLIC_FILE="$TEST_ROOT/docker-compose.public.yaml"
+# Peers below exclude image contents, extraction, publication and cache reuse;
+# none replaces the resolver adapter or a build command under observation.
+verify_moby_seccomp_profile() { :; }
+maybe_promote_staged_next() { :; }
+tools_volume_build_matches() { :; }
+tools_volume_admin_sh() { :; }
+c0_prepare_tools_dockerfile() { :; }
+c0_extract_built_tools() { :; }
+get_active_hashes() { :; }
+c0_validate_base_image() { :; }
+c0_validate_runtime_image() {
+    printf '%s\n' 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' > "$C0_BUILD_CONTEXT/.runtime-image-id"
+}
+c0_publish_runtime_image() { :; }
+c0_command_environment() { shift; "$@"; }
+c0_resolve_toolchain
+c0_build_base_image --no-cache
+build_tools_volume true --no-cache
+c0_build_runtime_image --no-cache
+'''
+            for bun in ('1.4.4', '1.4.5'):
+                with self.subTest(bun=bun):
+                    context = root / bun
+                    context.mkdir()
+                    log = context / 'docker.jsonl'
+                    env = dict(os.environ, TEST_ROOT=str(root), TEST_CONTEXT=str(context),
+                               TEST_BUN=bun, TEST_NODE='22.23.4', TEST_PIP='26.2.2',
+                               TEST_RESOLUTIONS=str(context / 'resolutions'),
+                               TEST_DOCKER_LOG=str(log),
+                               PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+                    result = subprocess.run(['/bin/bash', '-c', script], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    builds = [call for call in calls if call[0] == 'build' or
+                              (call[0] == 'compose' and 'build' in call)]
+                    self.assertEqual(len(builds), 3, calls)
+                    stages = ['runtime' if call[0] == 'compose' else
+                              call[call.index('--target') + 1] for call in builds]
+                    self.assertEqual(stages, ['base', 'tools-builder', 'runtime'])
+                    expected = {
+                        'BUN_VERSION': bun, 'UV_VERSION': '0.13.5', 'FNM_VERSION': '1.39.0',
+                        'NODE_VERSION': '22.23.4', 'PYTHON_VERSION': '3.15.2',
+                        'PIP_VERSION': '26.2.2', 'NPM_VERSION': '12.2.1',
+                        'PNPM_VERSION': '12.15.0', 'SEMGREP_VERSION': '1.182.1',
+                        'PYTHON_DOWNLOAD_URL': 'https://github.com/astral-sh/'
+                        'python-build-standalone/releases/download/20261026/'
+                        'cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz',
+                        'PYTHON_DOWNLOAD_SHA256': 'a' * 64,
+                    }
+                    for stage, call in zip(stages, builds):
+                        supplied = [call[index + 1] for index, value in enumerate(call)
+                                    if value == '--build-arg']
+                        self.assertEqual(len(supplied), len(expected), (stage, call))
+                        self.assertEqual(dict(value.split('=', 1) for value in supplied),
+                                         expected, stage)
+                    self.assertEqual((context / 'resolutions').read_text(), 'resolved\n')
+
     def test_build_cache_requires_marker_and_exact_resolved_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -113,6 +210,13 @@ build_tools_volume false ''
                 self.assertEqual((context/'.c0-build-id').read_text().strip(), identity)
                 self.assertIn('BUILD_ARG=NODE_VERSION='+node, result.stdout)
                 self.assertIn('BUILD_ARG=PIP_VERSION='+pip, result.stdout)
+                self.assertIn('BUILD_ARG=PYTHON_VERSION=3.15.2', result.stdout)
+                self.assertIn(
+                    'BUILD_ARG=PYTHON_DOWNLOAD_URL=https://github.com/astral-sh/'
+                    'python-build-standalone/releases/download/20261026/'
+                    'cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz',
+                    result.stdout)
+                self.assertIn('BUILD_ARG=PYTHON_DOWNLOAD_SHA256='+'a'*64, result.stdout)
                 self.assertEqual(json.loads((context/'c0-toolchain.json').read_text())
                                  ['versions']['node'], node)
                 records.append(identity)

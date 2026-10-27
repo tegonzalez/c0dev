@@ -17,7 +17,7 @@ Fix the immutable tools-storage, identity, selection, stage, publication, restor
 
 | Term                | Meaning                                                                                 |
 | ------------------- | --------------------------------------------------------------------------------------- |
-| Tools recipe        | Comment-stripped base/tools Dockerfile identity.                                        |
+| Tools recipe        | Base/tools Docker recipe identity bound to the exact security-helper bytes.             |
 | Release manifest    | Canonical resolved toolchain JSON captured for a build.                                 |
 | Complete payload    | Tools directory with its completeness marker written after payload and provenance.      |
 | Published reference | Docker image labels binding mode, recipe, runtime build, tools payload, and base image. |
@@ -45,7 +45,13 @@ There is no persistent `pins/` or `state/` selector directory. The runtime recei
 
 ## Identity
 
-Let `manifest-sha256` be SHA-256 of the exact canonical release-manifest bytes and `tools-recipe-id` the base/tools recipe hash. The build tools identity is:
+Let `docker-recipe-sha256` be the existing logical-name/content hash of `Dockerfile.base` and `Dockerfile.tools`, and `security-helper-sha256` be SHA-256 of the exact `docker/c0-security.py` bytes. The tools recipe identity is:
+
+```text
+tools-recipe-id = sha256("c0-tools-recipe-v2\n" + docker-recipe-sha256 + "\n" + security-helper-sha256 + "\n")
+```
+
+Let `manifest-sha256` be SHA-256 of the exact canonical release-manifest bytes. Schema 1 retains its nine version and source keys; its Python source is the exact official standalone asset URL followed by `#sha256=` and 64 lowercase hexadecimal checksum digits. The build tools identity is:
 
 ```text
 sha256("c0-toolchain-build-v1\n" + tools-recipe-id + "\n" + manifest-sha256 + "\n")

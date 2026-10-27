@@ -139,9 +139,12 @@ class CacheIdentity(unittest.TestCase):
         import runpy
         resolver = runpy.run_path(str(ROOT / 'bin/c0-toolchain'))
         versions = dict(bun='1.4.4', uv='0.13.5', fnm='1.39.0', node='22.23.4',
-                        python='3.15.1', pip='26.2.2', npm='12.2.1', pnpm='12.15.0', semgrep='1.182.1')
+                        python='3.15.2', pip='26.2.2', npm='12.2.1', pnpm='12.15.0', semgrep='1.182.1')
         payload = resolver['canonical_json'](dict(schema=1, versions=versions,
-                                                  sources=resolver['source_urls'](versions)))
+                                                  sources=resolver['source_urls'](
+                                             versions, 'https://github.com/astral-sh/python-build-standalone/releases/download/'
+                                             '20261026/cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'
+                                             '#sha256=' + 'a' * 64)))
         recipe = 'a' * 64
         identity = hashlib.sha256(('c0-toolchain-build-v1\n' + recipe + '\n' +
                                    hashlib.sha256(payload.encode()).hexdigest() + '\n').encode()).hexdigest()

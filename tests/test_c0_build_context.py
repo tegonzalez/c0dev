@@ -26,7 +26,7 @@ class BuildContext(unittest.TestCase):
             shutil.copyfile(ROOT/'bin/dockerfile-concat', root/'bin/dockerfile-concat')
             (root/'bin/dockerfile-concat').chmod(0o755)
             inputs = ('1password.asc', 'cloud.google.gpg', 'install-orca.sh',
-                      'docker-entrypoint.sh', 'home-overlays.conf', 'c0-overlay-check')
+                      'docker-entrypoint.sh', 'home-overlays.conf', 'c0-overlay-check', 'c0-security.py')
             for name in inputs: (root/'docker'/name).write_text('canonical '+name+'\n')
             for name in ('base', 'tools', 'runtime'):
                 (root/'docker'/('Dockerfile.'+name)).write_text('# canonical '+name+'\n')
@@ -70,6 +70,8 @@ cmd_build
                                  '# canonical base\n\n# canonical tools\n')
                 self.assertEqual((capture/'Dockerfile.runtime.build').read_text(),
                                  '# canonical base\n\n# canonical runtime\n')
+                for name in inputs:
+                    self.assertEqual((capture/name).read_bytes(), (root/'docker'/name).read_bytes(), name)
                 self.assertEqual(set(p.name for p in capture.iterdir()),
                                  set(inputs)|{'.terminfo', 'Dockerfile.tools.build', 'Dockerfile.runtime.build'})
             self.assertNotEqual(paths[0], paths[1])

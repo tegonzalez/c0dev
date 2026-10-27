@@ -4,10 +4,13 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from c0_fixture import Fixture
 
 C0 = Path(__file__).resolve().parents[1] / 'bin/c0'
 SNAPSHOT = 'a' * 64
@@ -97,6 +100,52 @@ class Status(unittest.TestCase):
 
     def test_default_command_is_also_observational(self):
         self.check_status(command='')
+
+    def test_launcher_identity_is_visible_and_auth_file_is_not_loaded(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        secret = 'STATUS_AUTH_VALUE_MUST_STAY_PRIVATE'
+        auth_file = fixture.checkout / 'auth/.env'
+        # A shell source would execute this command. These are disposable test
+        # bytes only; status must neither load credentials nor execute them.
+        marker = fixture.root / 'auth-was-sourced'
+        auth_file.write_text('export TEST_PRIVATE_TOKEN="'+secret+'"\n'
+                             'touch '+shlex.quote(str(marker))+'\n')
+        fixture.env['TEST_INHERITED_AUTH_TOKEN'] = secret
+        container_tools = 'd' * 64
+        state = fixture.read()
+        state['containers'][0]['tools'] = container_tools
+        fixture.write(state)
+        for mode in ('', 'dev'):
+            with self.subTest(mode=mode or 'prod'):
+                fixture.env['C0_MODE'] = mode
+                state = fixture.read()
+                state['calls'] = []
+                fixture.write(state)
+                result = fixture.run('status')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout)
+                self.assertIn('mode: '+(mode or 'prod')+'\n', output)
+                self.assertIn('command environment (launcher inputs):', output)
+                assignments = {}
+                for line in output.splitlines():
+                    if re.match(r'^  [A-Z][A-Z0-9_]*=', line):
+                        assignment, = shlex.split(line)
+                        name, value = assignment.split('=', 1)
+                        assignments[name] = value
+                self.assertEqual(assignments['C0_MODE_KEY'], mode or 'prod')
+                self.assertEqual(assignments['C0_RECIPE_ID'], fixture.recipe)
+                self.assertEqual(assignments['TOOLS_ID'], fixture.tools)
+                self.assertEqual(assignments['SHARED_TOOLS_VOLUME'], 'c0dev-tools-shared'+('-dev' if mode else ''))
+                if not mode:
+                    self.assertIn('container tools id: '+container_tools[:12]+'...', output)
+                self.assertNotIn(secret, output + result.stderr)
+                self.assertNotIn('TEST_PRIVATE_TOKEN', assignments)
+                self.assertNotIn('TEST_INHERITED_AUTH_TOKEN', assignments)
+                self.assertFalse(marker.exists())
+                for call in fixture.read()['calls']:
+                    self.assertTrue(call[0] in ('version', 'ps', 'inspect') or
+                                    call[:2] == ['volume', 'inspect'], call)
 
 
 if __name__ == '__main__':

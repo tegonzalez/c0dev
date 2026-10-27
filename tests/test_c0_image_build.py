@@ -19,7 +19,7 @@ FUNCTIONS = '\n'.join(
                  'c0_base_image_matches', 'c0_validate_base_image', 'c0_runtime_image_matches',
                  'c0_build_runtime_image', 'c0_validate_runtime_image',
                  'c0_docker_content_failure', 'c0_publish_runtime_image',
-                 'c0_runtime_recipe_ref')
+                 'c0_runtime_recipe_ref', 'c0_command_environment')
 )
 DOCKER = '''
 import json, os, sys

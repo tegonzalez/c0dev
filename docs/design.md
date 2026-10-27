@@ -58,11 +58,13 @@ The product is one development-environment tool. These are engineering modules, 
 
 ### Build Path
 
-`bin/c0` constructs an owned temporary build context and concatenates base/tools or base/runtime fragments. `bin/c0-toolchain` resolves the supported releases once and emits canonical JSON plus build arguments. The tools identity binds the base/tools recipe and manifest; the runtime identity additionally binds runtime inputs. Equivalent mode/recipe/releases share completed artifacts across working folders.
+`bin/c0` constructs an owned temporary build context and concatenates base/tools or base/runtime fragments. `bin/c0-toolchain` resolves the supported releases once and emits canonical JSON plus build arguments. The tools identity binds the base/tools recipe and manifest; the runtime identity additionally binds runtime inputs. Equivalent mode/recipe/releases share completed artifacts across working folders. Python resolution intersects published final releases with the current official standalone build assets for standard CPython on Linux aarch64 GNU, retaining the 3.15 line and 3.15.2 security floor. The canonical manifest’s Python source binds the exact asset URL and SHA-256; the tools build constructs a private, scoped uv catalog for that asset and removes it after installation. This separates fixed-distribution availability from uv’s frozen internal catalog without falling back below the security floor.
 
 The current tools builder installs non-system tools as `dev`, including managed Python/pip, Node/npm/pnpm through fnm, Semgrep, Rust/Cargo tools, and assistant installers. It retains explicit version and certificate-trust checks. Payload extraction includes `.cargo/bin`, `.rustup`, and complete `.local`. Cache acceptance compares completeness and embedded provenance; validated runtime images are published only after successful construction. Acquisition paths with executable upstream installers remain assurance limits, not verified routes merely because their final versions match.
 
 Tools extraction creates a never-started container from the constructed image without store access or network, then copies its home data into private host staging. A fixed networkless publisher running the base image copies only the admitted tool roots into the unpublished candidate, preserves nested links without following them, records provenance, and writes completeness last. Constructed-image programs and startup hooks never execute with the tools volume writable. Source-container retirement requires the exact operation label and created state; fixed legacy container names supply no cleanup authority.
+
+The private `docker/c0-security.py` construction helper backports the upstream destination-link guard to Debian’s system Python without replacing its interpreter. Base and runtime construction apply it after package installation, refuse unrecognized unprotected source, and retain before/after hashes. Tools and runtime recipe identities bind the helper bytes; a changed repair cannot reuse the previous default payload. The helper’s recorded patch provenance is not vulnerability clearance.
 
 ### Runtime Mount Path
 
@@ -71,6 +73,12 @@ Docker labels, actual container/image state, and mount inventories bind workspac
 Tools lower mounts expose only the selected payload. Tool upper/work storage lives in a Linux Docker volume; current macOS bind-backed upper semantics do not support the needed writes. A networkless host helper opens its own root and proc-directory descriptors before entering the exact runtime mount namespace, restores those held root/cwd bindings before executing programs, mounts configured paths, and exits. Programs and their loader stay in the protected helper filesystem; guest data is reached through the held proc directory. Overlay checks recognize the corresponding kernel option spelling and existing supported lower bindings. The runtime entrypoint waits for overlays before services.
 
 The host `bin/` lower is read-only at `/run/c0/host-bin`; a separate guest launcher overlay exposes `/home/dev/bin`. Guest edits persist without writing host orchestration source. Git configuration, entrypoint, and overlay-control inputs are read-only. Declared configuration, caches, projects, and selected auth remain explicit host data surfaces, with confidentiality exposure distinct from write permission.
+
+### Host Command Environment
+
+M-01 owns one explicit projection of nonsecret launcher variables for every Compose call, including image construction and SSH-port discovery. The projection passes literal assignments to a child command without adding per-wrapper exports to the invoking shell. Optional Compose defaults remain in the YAML rather than being duplicated in Bash. Construction remains independent of runtime security selection.
+
+Status uses that same projection for its shell-escaped launcher-input display, separately from observed container metadata. Its container tools selection cannot replace the launcher's tools value in that display. Per-session authentication files and unrelated host environment values never enter the projection; status remains metadata-only and performs no guest execution or image construction.
 
 ### Host Config And Log I/O
 

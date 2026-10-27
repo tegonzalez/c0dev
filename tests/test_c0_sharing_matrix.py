@@ -32,10 +32,13 @@ RESOLVER = runpy.run_path(str(ROOT / 'bin/c0-toolchain'))
 
 def controlled_manifest():
     versions = dict(bun='1.4.4', uv='0.13.5', fnm='1.39.0', node='22.23.4',
-                    python='3.15.1', pip='26.2.2', npm='12.2.1', pnpm='12.15.0',
+                    python='3.15.2', pip='26.2.2', npm='12.2.1', pnpm='12.15.0',
                     semgrep='1.182.1')
     return RESOLVER['canonical_json'](dict(schema=1, versions=versions,
-                                         sources=RESOLVER['source_urls'](versions)))
+                                         sources=RESOLVER['source_urls'](
+                                             versions, 'https://github.com/astral-sh/python-build-standalone/releases/download/'
+                                             '20261026/cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'
+                                             '#sha256=' + 'a' * 64)))
 
 
 def checkout(parent, name, token):
@@ -114,6 +117,26 @@ class SharingIdentity(unittest.TestCase):
             install = first / 'docker/install-orca.sh'
             install.write_text(install.read_text() + '\n# changed copied bytes\n')
             self.assertNotEqual(a['recipe'], probe(first)['recipe'])
+
+    def test_security_helper_bytes_change_both_recipes_with_unchanged_dockerfiles(self):
+        with tempfile.TemporaryDirectory(prefix='c0-sharing-security-input-') as temporary:
+            directory = checkout(Path(temporary).resolve(), 'checkout', uuid.uuid4().hex)
+            dockerfiles = {name: (directory / 'docker' / name).read_bytes()
+                           for name in ('Dockerfile.base', 'Dockerfile.tools', 'Dockerfile.runtime')}
+            before = probe(directory)
+            helper = directory / 'docker/c0-security.py'
+            original = helper.read_bytes()
+            helper.write_bytes(original + b'\n# synthetic changed security helper bytes\n')
+            after = probe(directory)
+            for key in ('recipe', 'tools_recipe'):
+                self.assertNotEqual(before[key], after[key], key)
+            self.assertEqual(before['workspace'], after['workspace'])
+            for name, content in dockerfiles.items():
+                self.assertEqual((directory / 'docker' / name).read_bytes(), content)
+            helper.write_bytes(original)
+            restored = probe(directory)
+            for key in ('recipe', 'tools_recipe'):
+                self.assertEqual(before[key], restored[key], key)
 
 
 @unittest.skipUnless(os.environ.get('C0_SHARING_DOCKER') == '1', 'opt-in owned Docker sharing matrix')

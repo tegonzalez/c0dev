@@ -11,6 +11,8 @@ WORKDIR /home/dev
 # manifest also participates in c0's snapshot identity. Missing args fail closed.
 ARG UV_VERSION
 ARG PYTHON_VERSION
+ARG PYTHON_DOWNLOAD_URL
+ARG PYTHON_DOWNLOAD_SHA256
 RUN dpkg --compare-versions "$UV_VERSION" ge 0.13.5 \
     && curl -fsSL "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/install-uv.sh \
     && UV_NO_MODIFY_PATH=1 sh /tmp/install-uv.sh \
@@ -19,11 +21,44 @@ RUN dpkg --compare-versions "$UV_VERSION" ge 0.13.5 \
 ENV PATH="/home/dev/.local/bin:$PATH"
 # --default supplies python and python3 in ~/.local/bin, ahead of /usr/bin.
 # Keep Debian's interpreter for packages with /usr/bin/python3 shebangs.
-RUN case "$PYTHON_VERSION" in 3.15.*) ;; *) echo 'Python must stay on 3.15' >&2; exit 1 ;; esac \
-    && dpkg --compare-versions "$PYTHON_VERSION" ge 3.15.1 \
-    && uv python install --default "$PYTHON_VERSION" \
-    && test "$(python3 -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION" \
-    && test "$(python -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION"
+# A scoped native catalog supplies the exact checksummed standalone asset even
+# when this uv release predates the latest security-patched Python build.
+RUN /usr/bin/python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+release = os.environ['PYTHON_VERSION']
+if not re.fullmatch(r'3\.15\.(?:0|[1-9][0-9]*)', release) or int(release.rsplit('.', 1)[1]) < 2:
+    raise SystemExit('Python must stay on 3.15 at or above security floor 3.15.2')
+location = os.environ['PYTHON_DOWNLOAD_URL']
+checksum = os.environ['PYTHON_DOWNLOAD_SHA256']
+match = re.fullmatch(
+    r'https://github\.com/astral-sh/python-build-standalone/releases/download/'
+    r'(?P<build>[0-9]{8})/cpython-' + re.escape(release) + r'%2B(?P=build)'
+    r'-aarch64-unknown-linux-gnu-install_only_stripped\.tar\.gz', location)
+if match is None or not re.fullmatch(r'[0-9a-f]{64}', checksum):
+    raise SystemExit('Python requires its official standalone asset URL and SHA-256')
+catalog = {'cpython-' + release + '-linux-aarch64-gnu': {
+    'name': 'cpython', 'arch': {'family': 'aarch64', 'variant': None},
+    'os': 'linux', 'libc': 'gnu', 'major': 3, 'minor': 15,
+    'patch': int(release.rsplit('.', 1)[1]), 'prerelease': '', 'variant': None,
+    'url': location, 'sha256': checksum, 'build': match['build'],
+}}
+with tempfile.TemporaryDirectory(prefix='c0-python-downloads-') as directory:
+    path = Path(directory) / 'downloads.json'
+    path.write_text(json.dumps(catalog))
+    subprocess.run(['uv', 'python', 'install', '--default', release], check=True,
+                   env=dict(os.environ, UV_PYTHON_DOWNLOADS_JSON_URL=str(path)))
+for executable in ('python3', 'python'):
+    actual = subprocess.check_output(
+        [executable, '-c', 'import platform; print(platform.python_version())'], text=True).strip()
+    if actual != release:
+        raise SystemExit(executable + ' does not match selected Python ' + release)
+PY
 
 # Resolve pip independently: a new pip security release need not wait for the
 # next CPython release. Explicitly target managed Python, never Debian Python.
@@ -168,4 +203,6 @@ manifest = json.loads(Path('/home/dev/.local/share/c0/toolchain.json').read_text
 assert manifest['schema'] == 1
 for name in ('bun', 'uv', 'python', 'pip', 'fnm', 'node', 'npm', 'pnpm', 'semgrep'):
     assert manifest['versions'][name] == os.environ[f'{name.upper()}_VERSION'], name
+assert manifest['sources']['python'] == (
+    os.environ['PYTHON_DOWNLOAD_URL'] + '#sha256=' + os.environ['PYTHON_DOWNLOAD_SHA256'])
 PY

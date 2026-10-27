@@ -32,6 +32,9 @@ RUN apt install -y \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxrender1 libx11-xcb1 \
     libxcb-dri3-0 libxss1
 
+# A package update must not reintroduce the system-Python tar-filter flaw.
+RUN /usr/bin/python3 -I /usr/local/libexec/c0-security.py system-python
+
 COPY install-orca.sh /usr/local/libexec/install-orca.sh
 RUN /bin/sh /usr/local/libexec/install-orca.sh
 

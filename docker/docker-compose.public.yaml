@@ -12,8 +12,9 @@ services:
   c0dev:
     init: true
     build:
-      context: .
-      dockerfile: .Dockerfile.build
+      # c0 build supplies an isolated temporary context and combined Dockerfile.
+      context: ${C0_BUILD_CONTEXT:-.}
+      dockerfile: ${DOCKERFILE_RUNTIME_BUILD:-Dockerfile.runtime}
     hostname: ${C0_INSTANCE_ID:-c0dev}
     ports:
       - "${C0DEV_WEB_PORT:-3000}:3000"

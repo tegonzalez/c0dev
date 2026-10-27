@@ -84,6 +84,12 @@ if [ -n "${TOOLS_PREFIX:-}" ]; then
 	export RUSTUP_HOME="$TOOLS_PREFIX/.rustup"
 	export CARGO_HOME="${HOME}/.cache/cargo"
 	export UV_CACHE_DIR="${HOME}/.cache/uv"
+	# sshd strips image ENV; keep the same maintained trust defaults in SSH.
+	# Explicit per-project trust settings remain available to the developer.
+	export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+	export REQUESTS_CA_BUNDLE="${REQUESTS_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+	export UV_NATIVE_TLS="${UV_NATIVE_TLS:-true}"
+	export UV_SYSTEM_CERTS="${UV_SYSTEM_CERTS:-${UV_NATIVE_TLS}}"
 	export XDG_CONFIG_HOME="${HOME}/.config"
 	export XDG_CACHE_HOME="${HOME}/.cache"
 	export RUSTUP_NO_UPDATE=1
@@ -93,6 +99,199 @@ fi
 
 prepend_path "$(resolve_path "$root_dir/bin")"
 
-eval $(fnm env)
+# A persistent home upper may retain old generic Python links and fnm aliases.
+# Select the successful snapshot's defaults without rewriting those overrides.
+_c0_toolchain_defaults() {
+	if [ -z "${TOOLS_PREFIX:-}" ]; then
+		eval "$(fnm env)"
+		return $?
+	fi
+	_c0_manifest="$TOOLS_PREFIX/.local/share/c0/toolchain.json"
+	# Older accepted snapshots predate automatic release manifests.
+	if [ ! -e "$_c0_manifest" ] && [ ! -L "$_c0_manifest" ]; then
+		eval "$(fnm env)"
+		return $?
+	fi
+	if ! _c0_selection=$(/usr/bin/python3 -I - "$_c0_manifest" "$TOOLS_PREFIX" "$HOME" "$XDG_CACHE_HOME" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import sys
+import tempfile
+
+try:
+    manifest, prefix, home, cache = map(Path, sys.argv[1:])
+    payload = manifest.read_bytes()
+    document = json.loads(payload)
+    if (not isinstance(document, dict) or type(document.get("schema")) is not int
+            or document["schema"] != 1):
+        raise ValueError("unsupported manifest schema")
+    versions = document["versions"]
+    if not isinstance(versions, dict):
+        raise ValueError("manifest versions must be an object")
+    for tool in ("node", "python", "uv", "fnm", "npm", "pnpm", "semgrep"):
+        if not isinstance(versions[tool], str) or not re.fullmatch(r"\d+\.\d+\.\d+", versions[tool]):
+            raise ValueError(f"invalid stable {tool} version in manifest")
+    if (not isinstance(versions["pip"], str)
+            or not re.fullmatch(r"\d+\.\d+(?:\.\d+)?(?:\.post\d+)?", versions["pip"])):
+        raise ValueError("invalid stable pip version in manifest")
+    node, python = versions["node"], versions["python"]
+    if not isinstance(node, str) or not re.fullmatch(r"22\.\d+\.\d+", node):
+        raise ValueError("manifest Node version must remain on stable 22")
+    if not isinstance(python, str) or not re.fullmatch(r"3\.15\.\d+", python):
+        raise ValueError("manifest Python version must remain on stable 3.15")
+    node_bin = home / f".local/share/fnm/node-versions/v{node}/installation/bin/node"
+    if not node_bin.is_file() or not os.access(node_bin, os.X_OK):
+        raise ValueError(f"selected Node {node} is unavailable in the guest")
+
+    targets = {}
+    for name in ("python", "python3"):
+        launcher = prefix / ".local/bin" / name
+        if not launcher.is_symlink():
+            raise ValueError(f"snapshot {name} launcher is not a managed symlink")
+        target = Path(os.readlink(launcher))
+        if not target.is_absolute():
+            target = (launcher.parent / target).resolve()
+        relative = target.relative_to(home / ".local/share/uv/python")
+        if (len(relative.parts) != 3 or relative.parts[1] != "bin"
+                or relative.parts[2] not in ("python", "python3", "python3.15")):
+            raise ValueError(f"snapshot {name} target differs from Python {python}")
+        # uv's default launchers may use a minor alias (cpython-3.15-...).
+        # Follow that alias inside the immutable snapshot, not the old upper.
+        immutable_python_root = prefix / ".local/share/uv/python"
+        installation_name = relative.parts[0]
+        for _ in range(8):
+            installation = immutable_python_root / installation_name
+            if not installation.is_symlink():
+                break
+            alias = Path(os.readlink(installation))
+            if alias.is_absolute():
+                alias = alias.relative_to(home / ".local/share/uv/python")
+            if len(alias.parts) != 1 or alias.parts[0] in (".", ".."):
+                raise ValueError("snapshot Python alias leaves its managed directory")
+            installation_name = alias.parts[0]
+        else:
+            raise ValueError("snapshot Python alias cycle")
+        if not installation_name.startswith(f"cpython-{python}-"):
+            raise ValueError(f"snapshot {name} target differs from Python {python}")
+        target = home / ".local/share/uv/python" / installation_name / "bin" / relative.parts[2]
+        if not target.is_file() or not os.access(target, os.X_OK):
+            raise ValueError(f"selected Python {python} is unavailable in the guest")
+        targets[name] = target
+
+    # A manager may change while Node/Python stay on the same patch. Select its
+    # immutable snapshot files rather than same-version package files in upper.
+    immutable_python = prefix / targets["python3"].relative_to(home)
+    installation = prefix / f".local/share/fnm/node-versions/v{node}/installation"
+    executables = {
+        "uv": prefix / ".local/bin/uv",
+        "fnm": prefix / ".local/share/fnm/fnm",
+        "python for pip": immutable_python,
+        "node": installation / "bin/node",
+        "semgrep Python": prefix / ".local/share/uv/tools/semgrep/bin/python",
+    }
+    scripts = {"semgrep": prefix / ".local/share/uv/tools/semgrep/bin/semgrep"}
+    for package, required, optional in (("npm", ("npm", "npx"), ()),
+                                        ("pnpm", ("pnpm",), ("pnpx",))):
+        package_root = installation / "lib/node_modules" / package
+        metadata = json.loads((package_root / "package.json").read_text())
+        entries = metadata.get("bin") if isinstance(metadata, dict) else None
+        if isinstance(entries, str):
+            entries = {package: entries}
+        if not isinstance(entries, dict):
+            raise ValueError(f"snapshot {package} bin metadata is unavailable")
+        for command in required + optional:
+            if command in optional and command not in entries:
+                continue
+            entry = entries.get(command)
+            if not isinstance(entry, str) or not entry or Path(entry).is_absolute():
+                raise ValueError(f"snapshot {command} bin metadata is invalid")
+            path = (package_root / entry).resolve()
+            try:
+                path.relative_to(package_root.resolve())
+            except ValueError:
+                raise ValueError(f"snapshot {command} entry point escapes its package")
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise ValueError(f"snapshot {command} entry point is unavailable")
+            scripts[command] = path
+    for name, path in executables.items():
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError(f"snapshot {name} executable is unavailable")
+    for name, path in scripts.items():
+        if not path.is_file() or not os.access(path, os.R_OK):
+            raise ValueError(f"snapshot {name} entry point is unavailable")
+    targets.update({name: executables[name] for name in ("uv", "fnm")})
+    # Bun belongs to the runtime image rather than the shared tools snapshot.
+    for name in ("bun", "bunx"):
+        runtime_tool = Path("/usr/local/bin") / name
+        if runtime_tool.is_file() and os.access(runtime_tool, os.X_OK):
+            targets[name] = runtime_tool
+    uvx = prefix / ".local/bin/uvx"
+    has_uvx = uvx.is_file() and os.access(uvx, os.X_OK)
+    wrappers = {name: "exec " + shlex.quote(str(immutable_python)) + ' -I -m pip "$@"\n'
+                for name in ("pip", "pip3")}
+    if has_uvx:
+        wrappers["uvx"] = "exec " + shlex.quote(str(executables["uv"])) + ' tool run "$@"\n'
+    wrappers.update({name: "exec " + shlex.quote(str(path)) + ' "$@"\n'
+                     for name, path in scripts.items() if name != "semgrep"})
+    wrappers["semgrep"] = ("exec " + shlex.quote(str(executables["semgrep Python"]))
+                           + " " + shlex.quote(str(scripts["semgrep"])) + ' "$@"\n')
+
+    cache_bin = cache / "c0/toolchain-defaults" / hashlib.sha256(payload).hexdigest() / "bin"
+    if any(character in str(cache_bin) for character in ("\n", "\r", "\t", ":")):
+        raise ValueError("cache path cannot contain PATH separators or control characters")
+    for directory in (cache / "c0", cache / "c0/toolchain-defaults", cache_bin.parent, cache_bin):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or directory.stat().st_uid != os.getuid():
+            raise ValueError("toolchain cache must be a directory owned by the guest user")
+        directory.chmod(stat.S_IRWXU)
+    for name, target in targets.items():
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{name}-", dir=cache_bin)
+        os.close(descriptor)
+        os.unlink(temporary)
+        try:
+            os.symlink(str(target), temporary)
+            os.replace(temporary, cache_bin / name)
+        finally:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+    for name, body in wrappers.items():
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{name}-", dir=cache_bin)
+        try:
+            with os.fdopen(descriptor, "w") as output:
+                output.write("#!/bin/sh\n" + body)
+            os.chmod(temporary, 0o700)
+            os.replace(temporary, cache_bin / name)
+        finally:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+    print(node)
+    print(cache_bin)
+except (OSError, ValueError, KeyError, TypeError) as error:
+    raise SystemExit(f"error: c0 toolchain defaults: {error}")
+PY
+	); then
+		return 1
+	fi
+	# Values were validated above; quoted data is never evaluated as shell code.
+	_c0_newline='
+'
+	_c0_node=${_c0_selection%%"$_c0_newline"*}
+	_c0_bin=${_c0_selection#*"$_c0_newline"}
+	# Bootstrap fnm itself from the selected snapshot, never a stale home override.
+	_c0_fnm_env=$(FNM_DIR="$HOME/.local/share/fnm" "$_c0_bin/fnm" env) || return 1
+	eval "$_c0_fnm_env"
+	if ! FNM_DIR="$HOME/.local/share/fnm" FNM_INSTALL_IF_MISSING=false "$_c0_bin/fnm" use "$_c0_node" >/dev/null; then
+		echo "error: c0 could not select Node $_c0_node from the built snapshot" >&2
+		return 1
+	fi
+	prepend_path "$_c0_bin"
+}
+
+_c0_toolchain_defaults || return 1
 
 export PATH

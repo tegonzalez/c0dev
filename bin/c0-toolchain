@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+"""Resolve the public, stable toolchain used by c0 builds; no local packages queried."""
+import argparse
+import concurrent.futures
+import functools
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+TIMEOUT = 20
+MAX_BYTES = 16 * 1024 * 1024
+DISTRUSTED_ROOTS = {'emSign ECC Root CA - G3', 'AAA Certificate Services'}
+SOURCES = {
+    'bun': 'https://api.github.com/repos/oven-sh/bun/releases/latest',
+    'uv': 'https://api.github.com/repos/astral-sh/uv/releases/latest',
+    'fnm': 'https://api.github.com/repos/Schniz/fnm/releases/latest',
+    'node': 'https://nodejs.org/dist/index.json',
+    'python': 'https://www.python.org/api/v2/downloads/release/?is_published=true',
+    'pip': 'https://pypi.org/pypi/pip/json',
+    'npm': 'https://registry.npmjs.org/npm/latest',
+    'pnpm': 'https://registry.npmjs.org/pnpm/latest',
+    'semgrep': 'https://pypi.org/pypi/semgrep/json',
+}
+FLOORS = {
+    'bun': '1.4.4', 'uv': '0.13.5', 'fnm': '1.39.0',
+    'node': '22.23.4', 'python': '3.15.1', 'pip': '26.2.2', 'npm': '12.2.1',
+    'pnpm': '12.15.0', 'semgrep': '1.182.1',
+}
+BUILD_ARGS = (
+    ('BUN_VERSION', 'bun'), ('UV_VERSION', 'uv'), ('FNM_VERSION', 'fnm'),
+    ('NODE_VERSION', 'node'), ('PYTHON_VERSION', 'python'),
+    ('PIP_VERSION', 'pip'),
+    ('NPM_VERSION', 'npm'), ('PNPM_VERSION', 'pnpm'),
+    ('SEMGREP_VERSION', 'semgrep'),
+)
+
+
+class ResolutionError(ValueError):
+    pass
+
+
+def version(value):
+    """Only final numeric releases are eligible; never accept shell fragments."""
+    if not isinstance(value, str) or not re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', value):
+        raise ResolutionError('expected a stable major.minor.patch version, got {!r}'.format(value))
+    return tuple(map(int, value.split('.')))
+
+
+def pip_version(value):
+    """pip uses PEP 440 releases, including two components and post-releases."""
+    number = r'(0|[1-9]\d*)'
+    match = re.fullmatch(number + r'\.' + number + r'(?:\.' + number + r')?(?:\.post' + number + r')?', value) if isinstance(value, str) else None
+    if not match:
+        raise ResolutionError('expected a stable pip major.minor[.patch][.postN] version, got {!r}'.format(value))
+    return tuple(int(part) if part is not None else 0 for part in match.groups())
+
+
+def _range_token(op, text, target):
+    parts = text.split('.')
+    numbers = []
+    for part in parts:
+        if part.lower() in ('x', '*'):
+            break
+        numbers.append(int(part))
+    if any(p.lower() not in ('x', '*') for p in parts[len(numbers):]):
+        raise ResolutionError('invalid version range token: ' + text)
+    count = len(numbers)
+    low = tuple((numbers + [0, 0, 0])[:3])
+    if not count:
+        if op not in ('', '='):
+            raise ResolutionError('unsupported wildcard comparator')
+        return True
+    high = (low[0] + 1, 0, 0) if count == 1 else (low[0], low[1] + 1, 0)
+    if op in ('', '='):
+        return target == low if count == 3 else low <= target < high
+    if op == '^':
+        if low[0]:
+            high = (low[0] + 1, 0, 0)
+        elif count == 1:
+            high = (1, 0, 0)
+        elif low[1] or count == 2:
+            high = (0, low[1] + 1, 0)
+        else:
+            high = (0, 0, low[2] + 1)
+        return low <= target < high
+    if op in ('~', '~='):
+        if op == '~=':
+            high = (low[0] + 1, 0, 0) if count <= 2 else (low[0], low[1] + 1, 0)
+        return low <= target < high
+    if op == '>=':
+        return target >= low
+    if op == '>':
+        return target > low if count == 3 else target >= high
+    if op == '<':
+        return target < low
+    if op == '<=':
+        return target <= low if count == 3 else target < high
+    if op == '!=':
+        return target != low if count == 3 else not low <= target < high
+    raise ResolutionError('unsupported version comparator: ' + op)
+
+
+def satisfies(release, expression):
+    """Conservative npm/PEP 440 comparator subset; unknown syntax fails closed."""
+    target = version(release)
+    if not isinstance(expression, str) or not expression.strip():
+        raise ResolutionError('missing engine version range')
+    token = re.compile(r'(\^|~=|~|>=|<=|!=|>|<|=)?\s*(\d+(?:\.(?:\d+|[xX*])){0,2}|[xX*])')
+    results = []
+    for clause in expression.split('||'):
+        clause = clause.strip()
+        # npm's inclusive hyphen ranges are common in older compatible releases.
+        hyphen = re.fullmatch(r'(\d+(?:\.\d+){0,2})\s+-\s+(\d+(?:\.\d+){0,2})', clause)
+        if hyphen:
+            clause = '>=' + hyphen[1] + ' <=' + hyphen[2]
+        cursor = 0
+        matches = []
+        for match in token.finditer(clause):
+            if clause[cursor:match.start()].strip(' ,'):
+                raise ResolutionError('unsupported engine range: ' + expression)
+            matches.append(_range_token(match[1] or '', match[2], target))
+            cursor = match.end()
+        if not matches or clause[cursor:].strip(' ,'):
+            raise ResolutionError('unsupported engine range: ' + expression)
+        results.append(all(matches))
+    return any(results)
+
+
+@functools.lru_cache(maxsize=1)
+def tls_context():
+    """Preserve host/enterprise roots except Debian's eMudhra distrust paths.
+
+    Host Python can predate the guest's patched trust store. Rebuild its trust
+    anchors explicitly rather than relying on online revocation checks. Passing
+    cadata to the final context deliberately avoids loading default roots again.
+    """
+    anchors = ssl.create_default_context().get_ca_certs(binary_form=True)
+    retained = []
+    for anchor in anchors:
+        pem = ssl.DER_cert_to_PEM_cert(anchor)
+        single = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        single.load_verify_locations(cadata=pem)
+        decoded = single.get_ca_certs()
+        if len(decoded) != 1:
+            raise ResolutionError('cannot inspect a host TLS trust anchor')
+        names = {value for row in decoded[0]['subject']
+                 for key, value in row if key == 'commonName'}
+        if not names.intersection(DISTRUSTED_ROOTS):
+            retained.append(pem)
+    if not retained:
+        raise ResolutionError('no safe host TLS trust anchors available')
+    return ssl.create_default_context(cadata='\n'.join(retained))
+
+
+def fetch_json(url):
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'c0-toolchain/1', 'Cache-Control': 'no-cache',
+        'Accept': 'application/vnd.npm.install-v1+json' if url in (
+            'https://registry.npmjs.org/npm', 'https://registry.npmjs.org/pnpm') else 'application/json',
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT, context=tls_context()) as response:
+            expected = urllib.parse.urlsplit(url)
+            final = urllib.parse.urlsplit(response.geturl())
+            if (final.scheme != 'https' or final.hostname != expected.hostname or
+                    final.port not in (None, 443) or final.username is not None):
+                raise ResolutionError('release metadata redirected outside its HTTPS source: ' + url)
+            data = response.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise ResolutionError('release metadata exceeds size limit: ' + url)
+        return json.loads(data)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise ResolutionError('cannot read release metadata from {}: {}'.format(url, error)) from error
+
+
+def _github_release(data, prefix, tool):
+    if not isinstance(data, dict) or data.get('draft') is not False or data.get('prerelease') is not False:
+        raise ResolutionError(tool + ': latest release is missing, draft, or prerelease')
+    tag = data.get('tag_name', '')
+    if not isinstance(tag, str) or not tag.startswith(prefix):
+        raise ResolutionError(tool + ': unexpected release tag')
+    selected = tag[len(prefix):]
+    version(selected)
+    return selected
+
+
+def _latest_node(data):
+    if not isinstance(data, list):
+        raise ResolutionError('node: expected a release index')
+    candidates = []
+    for entry in data:
+        raw = entry.get('version', '') if isinstance(entry, dict) else ''
+        if isinstance(raw, str) and re.fullmatch(r'v22\.\d+\.\d+', raw):
+            candidates.append((version(raw[1:]), entry))
+    if not candidates:
+        raise ResolutionError('node: no stable Node 22 release found')
+    selected, metadata = max(candidates, key=lambda item: item[0])
+    if not isinstance(metadata.get('files'), list) or 'linux-arm64' not in metadata['files']:
+        raise ResolutionError('node: latest Node 22 release has no Linux arm64 build')
+    return '.'.join(map(str, selected))
+
+
+def _latest_python(data):
+    if not isinstance(data, list):
+        raise ResolutionError('python: expected official release records')
+    candidates = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get('name')
+        match = re.fullmatch(r'Python (3\.15\.\d+)', name) if isinstance(name, str) else None
+        if match and entry.get('is_published') is True and entry.get('pre_release') is False:
+            candidates.append(match[1])
+    if not candidates:
+        raise ResolutionError('python: no published final Python 3.15 release found')
+    return max(candidates, key=version)
+
+
+def _npm_package(tool, latest, node, fetch):
+    if not isinstance(latest, dict):
+        raise ResolutionError(tool + ': expected package metadata')
+    selected = latest.get('version')
+    version(selected)
+    engines = latest.get('engines')
+    if not isinstance(engines, dict):
+        raise ResolutionError(tool + ': missing Node engine compatibility metadata')
+    engine = engines.get('node')
+    if satisfies(node, engine) and not latest.get('deprecated'):
+        return selected
+    # A new npm/pnpm major may drop Node 22. Select the newest compatible final
+    # release, rather than silently installing a package that cannot run.
+    data = fetch('https://registry.npmjs.org/' + tool)
+    candidates = []
+    if not isinstance(data, dict) or not isinstance(data.get('versions'), dict):
+        raise ResolutionError(tool + ': missing compatible release history')
+    for release, metadata in data['versions'].items():
+        try:
+            number = version(release)
+        except ResolutionError:
+            continue
+        if not isinstance(metadata, dict) or metadata.get('version') != release or metadata.get('deprecated'):
+            continue
+        if number > version(selected):
+            continue  # Dist-tags, not an unpromoted future stable release, set the ceiling.
+        try:
+            engines = metadata.get('engines')
+            compatible = isinstance(engines, dict) and satisfies(node, engines.get('node'))
+        except ResolutionError:
+            compatible = False
+        if compatible:
+            candidates.append(release)
+    if not candidates:
+        raise ResolutionError(tool + ': no stable release supports Node ' + node)
+    return max(candidates, key=version)
+
+
+def source_urls(versions):
+    return {
+        'bun': 'https://github.com/oven-sh/bun/releases/tag/bun-v' + versions['bun'],
+        'uv': 'https://github.com/astral-sh/uv/releases/tag/' + versions['uv'],
+        'fnm': 'https://github.com/Schniz/fnm/releases/tag/v' + versions['fnm'],
+        'node': 'https://nodejs.org/en/blog/release/v' + versions['node'],
+        'python': 'https://www.python.org/downloads/release/python-' + versions['python'].replace('.', '') + '/',
+        'pip': 'https://pypi.org/project/pip/' + versions['pip'] + '/',
+        'npm': 'https://registry.npmjs.org/npm/' + versions['npm'],
+        'pnpm': 'https://registry.npmjs.org/pnpm/' + versions['pnpm'],
+        'semgrep': 'https://pypi.org/project/semgrep/' + versions['semgrep'] + '/',
+    }
+
+
+def validate_manifest(manifest):
+    if not isinstance(manifest, dict) or set(manifest) != {'schema', 'versions', 'sources'} or type(manifest['schema']) is not int or manifest['schema'] != 1:
+        raise ResolutionError('invalid toolchain manifest schema')
+    versions = manifest['versions']
+    if not isinstance(versions, dict) or set(versions) != set(FLOORS):
+        raise ResolutionError('toolchain manifest must contain exactly the supported tools')
+    for tool, minimum in FLOORS.items():
+        parse = pip_version if tool == 'pip' else version
+        selected = parse(versions[tool])
+        if selected < parse(minimum):
+            raise ResolutionError('{}: {} is below security floor {}'.format(tool, versions[tool], minimum))
+    if version(versions['node'])[0] != 22 or version(versions['python'])[:2] != (3, 15):
+        raise ResolutionError('toolchain must remain on Node 22 and Python 3.15')
+    if manifest['sources'] != source_urls(versions):
+        raise ResolutionError('toolchain manifest sources do not match selected official releases')
+    return manifest
+
+
+def resolve(fetch=fetch_json):
+    if fetch is fetch_json:
+        tls_context()  # Initialize once before parallel metadata requests.
+    metadata = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCES)) as pool:
+        pending = {name: pool.submit(fetch, url) for name, url in SOURCES.items()}
+        for name, future in pending.items():
+            metadata[name] = future.result()
+    versions = {
+        'bun': _github_release(metadata['bun'], 'bun-v', 'bun'),
+        'uv': _github_release(metadata['uv'], '', 'uv'),
+        'fnm': _github_release(metadata['fnm'], 'v', 'fnm'),
+        'node': _latest_node(metadata['node']),
+        'python': _latest_python(metadata['python']),
+    }
+    for tool in ('npm', 'pnpm'):
+        versions[tool] = _npm_package(tool, metadata[tool], versions['node'], fetch)
+    for tool in ('semgrep', 'pip'):
+        package = metadata[tool]
+        if not isinstance(package, dict) or not isinstance(package.get('info'), dict):
+            raise ResolutionError(tool + ': missing package metadata')
+        versions[tool] = package['info'].get('version')
+        (pip_version if tool == 'pip' else version)(versions[tool])
+        if not satisfies(versions['python'], package['info'].get('requires_python')):
+            raise ResolutionError(tool + ': latest release does not support Python ' + versions['python'])
+    return validate_manifest({'schema': 1, 'versions': versions, 'sources': source_urls(versions)})
+
+
+def canonical_json(manifest):
+    return json.dumps(validate_manifest(manifest), sort_keys=True, separators=(',', ':')) + '\n'
+
+
+def write_atomic(path, text):
+    path = Path(path)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.' + path.name + '.', delete=False) as output:
+            name = output.name
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--output', type=Path, metavar='PATH', help='resolve releases and atomically write the canonical manifest')
+    mode.add_argument('--build-args', type=Path, metavar='MANIFEST', help='offline: validate manifest and print Docker NAME=value arguments')
+    args = parser.parse_args(argv)
+    try:
+        if args.build_args:
+            manifest = validate_manifest(json.loads(args.build_args.read_text()))
+            for argument, tool in BUILD_ARGS:
+                print(argument + '=' + manifest['versions'][tool])
+        else:
+            manifest = resolve()
+            text = canonical_json(manifest)
+            if args.output:
+                write_atomic(args.output, text)
+            else:
+                sys.stdout.write(text)
+            print('c0 toolchain: ' + ', '.join(tool + '=' + manifest['versions'][tool] for _, tool in BUILD_ARGS), file=sys.stderr)
+    except (ResolutionError, OSError, TypeError, KeyError, json.JSONDecodeError) as error:
+        print('c0 toolchain: ' + str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

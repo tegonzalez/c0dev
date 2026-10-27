@@ -49,14 +49,23 @@ wait_for_home_overlays() {
     }
 
     while [ "$attempts" -lt 150 ]; do
+        # The host launcher lower is RO; the writable guest view is mounted by c0.
         pending=0
+        # Retained pre-upgrade guests still have the old direct bin mount.
+        # The host validates that layout before restoring their home overlays.
+        if mountpoint -q /run/c0/host-bin; then
+            fstype="$(findmnt -T "$HOME/bin" -n -o FSTYPE 2>/dev/null || true)"
+            { mountpoint -q "$HOME/bin" && [ "$fstype" = overlay ]; } || pending=$((pending + 1))
+        elif ! mountpoint -q "$HOME/bin"; then
+            pending=$((pending + 1))
+        fi
         while IFS='|' read -r guest_rel tools_rel extra; do
             case "$guest_rel" in
                 ''|'#'*) continue ;;
             esac
             target="$HOME/$guest_rel"
             fstype="$(findmnt -T "$target" -n -o FSTYPE 2>/dev/null || true)"
-            [ "$fstype" = overlay ] || pending=$((pending + 1))
+            { mountpoint -q "$target" && [ "$fstype" = overlay ]; } || pending=$((pending + 1))
         done <"$policy_file"
         [ "$pending" -eq 0 ] && return 0
         attempts=$((attempts + 1))

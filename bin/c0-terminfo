@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Tomas Gonzalez
+# SPDX-License-Identifier: MIT
+# Host-side terminfo transfer. Only the caller supplies a terminal identity.
+set -euo pipefail
+
+valid_terminal() {
+    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,127}$ ]]
+}
+
+prepare() {
+    local directory="$1" terminal temporary
+    local -a terminals=(xterm-256color)
+    if [[ -n "${TERM:-}" && "$TERM" != xterm-256color ]]; then
+        terminals+=("$TERM")
+    fi
+    mkdir -p "$directory"
+    temporary="$(mktemp "$directory/.terminfo.XXXXXX")"
+    trap 'rm -f "$temporary"' RETURN
+    for terminal in "${terminals[@]}"; do
+        [[ -n "$terminal" ]] || continue
+        if ! valid_terminal "$terminal"; then
+            echo 'warning: invalid caller TERM; skipping its build definition' >&2
+            continue
+        fi
+        if infocmp -xa "$terminal" >"$temporary" 2>/dev/null && [[ -s "$temporary" ]]; then
+            mv "$temporary" "$directory/$terminal"
+            temporary="$(mktemp "$directory/.terminfo.XXXXXX")"
+        elif [[ "$terminal" == xterm-256color ]]; then
+            echo 'error: host terminfo for xterm-256color is unavailable' >&2
+            return 1
+        else
+            echo "warning: host terminfo for $terminal is unavailable; omitting it from the image" >&2
+        fi
+    done
+}
+
+sync_terminal() {
+    local container="$1" terminal="${TERM:-}" definition
+    [[ -t 0 && -t 1 ]] || return 0
+    [[ -n "$terminal" ]] || return 0
+    if ! valid_terminal "$terminal"; then
+        echo 'error: invalid caller TERM; cannot synchronize its definition' >&2
+        return 1
+    fi
+    if ! definition="$(infocmp -xa "$terminal" 2>/dev/null)" || [[ -z "$definition" ]]; then
+        echo "error: host terminfo for $terminal is unavailable" >&2
+        return 1
+    fi
+    printf '%s\n' "$definition" | docker exec -u 1000 -i "$container" \
+        tic -x -o /home/dev/.terminfo/ -
+}
+
+case "${1:-}" in
+    prepare)
+        [[ $# -eq 2 ]] || { echo 'usage: c0-terminfo prepare DIRECTORY' >&2; exit 2; }
+        prepare "$2"
+        ;;
+    sync)
+        [[ $# -eq 2 && "$2" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
+            echo 'usage: c0-terminfo sync CONTAINER' >&2; exit 2;
+        }
+        sync_terminal "$2"
+        ;;
+    *)
+        echo 'usage: c0-terminfo {prepare DIRECTORY|sync CONTAINER}' >&2
+        exit 2
+        ;;
+esac

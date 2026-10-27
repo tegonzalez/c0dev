@@ -1,16 +1,41 @@
 # SPDX-FileCopyrightText: 2026 Tomas Gonzalez
 # SPDX-License-Identifier: MIT
 # Base stage with system dependencies
-FROM oven/bun:latest AS base
+# c0 build resolves this once and passes the same release to both images.
+ARG BUN_VERSION
+FROM oven/bun:${BUN_VERSION} AS base
+ARG BUN_VERSION
 
 # Install system dependencies once for both stages
-RUN apt update && apt install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     build-essential unzip \
+    ca-certificates openssl \
     cmake \
     curl \
     git \
     libssl-dev \
     tzdata
+
+# Debian #1151413: distrust the compromised eMudhra hierarchy and its
+# cross-signed path via AAA Certificate Services. Fail closed on stale mirrors.
+RUN dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && update-ca-certificates --fresh \
+    && openssl crl2pkcs7 -nocrl -certfile /etc/ssl/certs/ca-certificates.crt -out /tmp/c0-trust.p7b \
+    && openssl pkcs7 -in /tmp/c0-trust.p7b -print_certs -noout > /tmp/c0-trust-subjects \
+    && ! grep -E 'CN ?= ?(emSign ECC Root CA - G3|AAA Certificate Services)(,|$)' /tmp/c0-trust-subjects \
+    && rm /tmp/c0-trust.p7b /tmp/c0-trust-subjects
+
+# Managed Python/OpenSSL and Requests use the maintained distro trust bundle.
+# uv also supports the system trust store; its selected release additionally fixes
+# its own bundled roots and compromised-key checks.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    UV_NATIVE_TLS=true
+
+# Bun embeds its own trust store: 1.4.4 is the security floor, not a release pin.
+RUN dpkg --compare-versions "$BUN_VERSION" ge 1.4.4 \
+    && test "$(bun --version)" = "$BUN_VERSION" \
+    && bun -e 'const {X509Certificate}=require("crypto"); if(require("tls").rootCertificates.some(c=>new X509Certificate(c).subject.split("\n").includes("CN=emSign ECC Root CA - G3"))) throw Error("compromised eMudhra hierarchy still trusted")'
 
 # Rename bun user to dev (keeping same UID/GID); login shell matches c0 sh / c0 ssh
 RUN usermod -l dev bun && groupmod -n dev bun && usermod -d /home/dev -m dev && usermod -s /bin/bash dev

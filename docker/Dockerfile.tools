@@ -7,8 +7,33 @@ FROM base AS tools-builder
 USER dev
 WORKDIR /home/dev
 
-# uv installs in ~/.local/
-RUN curl -fsSL https://astral.sh/uv/install.sh | sh
+# Resolved build arguments participate in Docker's cache keys; the canonical
+# manifest also participates in c0's snapshot identity. Missing args fail closed.
+ARG UV_VERSION
+ARG PYTHON_VERSION
+RUN dpkg --compare-versions "$UV_VERSION" ge 0.13.5 \
+    && curl -fsSL "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/install-uv.sh \
+    && UV_NO_MODIFY_PATH=1 sh /tmp/install-uv.sh \
+    && rm /tmp/install-uv.sh \
+    && test "$(/home/dev/.local/bin/uv --version | cut -d ' ' -f 2)" = "$UV_VERSION"
+ENV PATH="/home/dev/.local/bin:$PATH"
+# --default supplies python and python3 in ~/.local/bin, ahead of /usr/bin.
+# Keep Debian's interpreter for packages with /usr/bin/python3 shebangs.
+RUN case "$PYTHON_VERSION" in 3.15.*) ;; *) echo 'Python must stay on 3.15' >&2; exit 1 ;; esac \
+    && dpkg --compare-versions "$PYTHON_VERSION" ge 3.15.1 \
+    && uv python install --default "$PYTHON_VERSION" \
+    && test "$(python3 -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION" \
+    && test "$(python -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION"
+
+# Resolve pip independently: a new pip security release need not wait for the
+# next CPython release. Explicitly target managed Python, never Debian Python.
+# CPython's stdlib ensurepip wheel remains vendor-managed and is checked apart.
+ARG PIP_VERSION
+RUN dpkg --compare-versions "$PIP_VERSION" ge 26.2.2 \
+    && managed_python="$(readlink -f "$(command -v python3)")" \
+    && case "$managed_python" in /home/dev/.local/share/uv/python/*/bin/python3.15) ;; *) echo 'pip update must target managed Python' >&2; exit 1 ;; esac \
+    && uv pip install --python "$managed_python" --break-system-packages "pip==$PIP_VERSION" \
+    && python3 -c 'import importlib.metadata, os; assert importlib.metadata.version("pip") == os.environ["PIP_VERSION"]'
 
 # cursor CLI installs in ~/.local/
 RUN curl -fsS https://cursor.com/install | bash
@@ -19,8 +44,29 @@ RUN curl -fsSL https://app.factory.ai/cli | sh
 # devin.ai installs in ~/.devin/
 RUN curl -fsSL https://cli.devin.ai/install.sh | sed -e 's/^.*COMPILED_BIN_NAME" setup//' | bash
 
-# fnm for nodejs version management
-RUN curl -fsSL https://fnm.vercel.app/install | bash
+# The resolver selects the latest stable Node 22 patch and compatible managers.
+ARG FNM_VERSION
+ARG NODE_VERSION
+ARG NPM_VERSION
+ARG PNPM_VERSION
+RUN case "$NODE_VERSION" in 22.*) ;; *) echo 'Node must stay on 22' >&2; exit 1 ;; esac \
+    && dpkg --compare-versions "$NODE_VERSION" ge 22.23.4 \
+    && dpkg --compare-versions "$FNM_VERSION" ge 1.39.0 \
+    && dpkg --compare-versions "$NPM_VERSION" ge 12.2.1 \
+    && dpkg --compare-versions "$PNPM_VERSION" ge 12.15.0 \
+    && curl -fsSL https://fnm.vercel.app/install -o /tmp/fnm-install.sh \
+    && bash /tmp/fnm-install.sh --skip-shell --release "v${FNM_VERSION}" \
+    && rm /tmp/fnm-install.sh \
+    && export PATH="/home/dev/.local/share/fnm:$PATH" \
+    && eval "$(fnm env --shell bash)" \
+    && fnm install "${NODE_VERSION}" \
+    && fnm default "${NODE_VERSION}" \
+    && fnm use "${NODE_VERSION}" \
+    && npm install --global "npm@${NPM_VERSION}" "pnpm@${PNPM_VERSION}" \
+    && test "$(fnm --version)" = "fnm ${FNM_VERSION}" \
+    && test "$(node --version)" = "v${NODE_VERSION}" \
+    && test "$(npm --version)" = "${NPM_VERSION}" \
+    && test "$(pnpm --version)" = "${PNPM_VERSION}"
 
 # graph-code (code-graph-rag) installs in ~/.local/
 # WORKDIR /home/dev/.local/shared/
@@ -43,8 +89,14 @@ RUN curl -fsSL https://fnm.vercel.app/install | bash
 # graph-code-linux-arm64
 # RUN cp dist/* ../../bin/graph-code
 
-# semgrep
-RUN ~/.local/bin/uv tool install semgrep
+# Use the managed interpreter and the certificate bundle that distrusts the
+# affected eMudhra/emSign root, including in this independent tool environment.
+ARG SEMGREP_VERSION
+RUN dpkg --compare-versions "$SEMGREP_VERSION" ge 1.182.1 \
+    && uv tool install --managed-python --python "$PYTHON_VERSION" \
+    --with 'certifi>=2026.10.19' "semgrep==$SEMGREP_VERSION" \
+    && /home/dev/.local/share/uv/tools/semgrep/bin/python -c \
+        'import certifi, importlib.metadata, os; assert importlib.metadata.version("semgrep") == os.environ["SEMGREP_VERSION"]; assert tuple(map(int, certifi.__version__.split("."))) >= (2026, 10, 19)'
 
 WORKDIR /home/dev
 
@@ -57,8 +109,45 @@ RUN rustup target add wasm32-unknown-unknown
 RUN cargo install --locked fd-find
 RUN cargo install --locked ripgrep
 RUN cargo install --locked ast-grep
-RUN cargo install --locked zellij
-RUN cargo install --locked nu
+# Upstream release locks predate the eMudhra SPKI distrust fix. Resolve current
+# compatible dependencies and verify the libraries actually compiled below.
+RUN cargo install zellij --message-format=json > /tmp/zellij-cargo.json \
+    || { cat /tmp/zellij-cargo.json; exit 1; }
+RUN cargo install nu --message-format=json > /tmp/nu-cargo.json \
+    || { cat /tmp/nu-cargo.json; exit 1; }
+RUN python3 - <<'PY'
+import json
+import re
+
+for tool in ("zellij", "nu"):
+    versions = {}
+    with open(f"/tmp/{tool}-cargo.json") as messages:
+        for line in messages:
+            if not line.startswith("{"):
+                continue
+            message = json.loads(line)
+            if message.get("reason") != "compiler-artifact":
+                continue
+            package = message["package_id"].rsplit("#", 1)[-1]
+            name, separator, version = package.partition("@")
+            if separator and name in ("rustls-webpki", "webpki-roots", "webpki-root-certs"):
+                versions.setdefault(name, set()).add(version)
+    assert versions.get("rustls-webpki"), f"{tool}: no compiled certificate verifier found"
+    for name, releases in versions.items():
+        for release in releases:
+            match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-alpha\.(\d+))?", release)
+            assert match, f"{tool}: unrecognized {name} version {release}"
+            major, minor, patch = map(int, match.group(1, 2, 3))
+            alpha = match.group(4)
+            if name == "rustls-webpki":
+                patched = ((major, minor, patch) >= (0, 103, 16) and alpha is None) or (
+                    (major, minor, patch) == (0, 104, 0) and alpha is not None and int(alpha) >= 8)
+            else:
+                patched = (major, minor, patch) >= (1, 0, 10) and alpha is None
+            assert patched, f"{tool}: {name} {release} lacks required eMudhra distrust fix"
+        print(f"{tool}: verified {name} {', '.join(sorted(releases))}")
+PY
+RUN rm /tmp/zellij-cargo.json /tmp/nu-cargo.json
 
 # clean up cargo mutable caches (immutable tools pack excludes registry/git)
 RUN cargo install --locked cargo-cache \
@@ -67,3 +156,16 @@ RUN cargo install --locked cargo-cache \
         .cargo/registry .cargo/git .cargo/.package-cache \
         .rustup/downloads .rustup/tmp \
     && true
+
+# Write provenance last: changing release metadata must not rebuild Rust tools.
+COPY --chown=dev:dev c0-toolchain.json /home/dev/.local/share/c0/toolchain.json
+RUN python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest = json.loads(Path('/home/dev/.local/share/c0/toolchain.json').read_text())
+assert manifest['schema'] == 1
+for name in ('bun', 'uv', 'python', 'pip', 'fnm', 'node', 'npm', 'pnpm', 'semgrep'):
+    assert manifest['versions'][name] == os.environ[f'{name.upper()}_VERSION'], name
+PY

@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: MIT
 set -eu
 
-orca_version=1.4.192
-orca_sha256=eab7ea7110a4a89e52573331a613c15bfc30ec5bfaf1f7af2e86db7ce528e508
+orca_version=1.4.239
+orca_sha256=ecf5c891dd2a6275ec1e2a7d4ef60b4119f9a47c1dfa1ff3afd8f5c7bfab1965
 orca_url="https://github.com/stablyai/orca/releases/download/v${orca_version}/orca-ide_${orca_version}_arm64.deb"
 
 architecture="$(dpkg --print-architecture)"

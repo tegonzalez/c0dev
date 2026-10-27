@@ -8,7 +8,7 @@ x-volume-folders: &folders
     - ../.local:/home/dev/.local-rw
     - ../rules:/home/dev/rules
     - ../projects:/home/dev/projects
-    - ../bin:/home/dev/bin
+    - ../bin:/run/c0/host-bin:ro
     - ../auth/ssh:/home/dev/.ssh
     - type: volume
       source: tools-shared
@@ -27,4 +27,5 @@ volumes:
     external: true
     name: ${SHARED_TOOLS_VOLUME:-c0dev-tools-shared}
   home-overlays:
-    name: ${C0_INSTANCE_ID:-c0dev}-home-overlays
+    name: ${C0_HOME_OVERLAYS_VOLUME:-${C0_INSTANCE_ID:-c0dev}-home-overlays}
+    external: ${C0_HOME_OVERLAYS_EXTERNAL:-false}

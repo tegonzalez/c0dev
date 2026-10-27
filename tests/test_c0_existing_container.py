@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Exercise existing-container commands through the actual CLI."""
 import json
+import hashlib
 import unittest
 from c0_fixture import Fixture
 
@@ -18,7 +19,9 @@ class ExistingContainer(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             call = [c for c in self.f.read()['calls'] if c[0] == 'exec'][-1]
             self.assertEqual(call[call.index('-u')+1], user)
-            self.assertIn('TEST_TOKEN=value with spaces', call)
+            self.assertNotIn('TEST_TOKEN=value with spaces', call)
+            self.assertEqual(self.f.read()['exec_env_sha256']['TEST_TOKEN'],
+                             hashlib.sha256(b'value with spaces').hexdigest())
             self.assertIn('umask ', call[-1])
             self.assertIn('project\\ with\\ spaces', call[-1])
             self.assertIn('oneoff-runtime', call)
@@ -47,7 +50,7 @@ class ExistingContainer(unittest.TestCase):
         self.assertFalse(any(c[0] == 'compose' for c in self.f.read()['calls']))
 
     def test_creation_still_applies_supported_policy(self):
-        for security in ('permissive', 'cap-drop-all'):
+        for security in ('guest-admin', 'least-privilege'):
             state = self.f.read(); state['containers'] = []; state['calls'] = []; self.f.write(state)
             self.f.env['C0_SECURITY'] = security
             result = self.f.run('start')
@@ -87,12 +90,11 @@ class ExistingContainer(unittest.TestCase):
         args = json.loads((self.f.root/'ssh-args.json').read_text())
         self.assertEqual(args[args.index('-p')+1], '2223')
         self.assertIn('dev@127.0.0.1', args)
-        self.assertIn('/bin/bash -lc ', args[-1])
         # Decode the quoting OpenSSH passes to the remote user's shell.
         import shlex
         remote = shlex.split(args[-1])
-        self.assertEqual(remote[:2], ['/bin/bash', '-lc'])
-        self.assertEqual(remote[2], 'cd /home/dev/projects/project\\ with\\ spaces && id -u && pwd')
+        self.assertEqual(remote[-3:-1], ['/bin/bash', '-lc'])
+        self.assertEqual(remote[-1], 'cd /home/dev/projects/project\\ with\\ spaces && id -u && pwd')
         calls = self.f.read()['calls']
         self.assertFalse(any(c[0] in ('run', 'compose', 'start') for c in calls))
 
@@ -100,6 +102,38 @@ class ExistingContainer(unittest.TestCase):
         self.f.env['TEST_SSH_STATUS'] = '27'
         result = self.f.run('ssh', 'id -u')
         self.assertEqual(result.returncode, 27, result.stderr)
+
+    def test_retained_runtime_commands_reconcile_management_authorization_without_recreation(self):
+        ssh = self.f.checkout / 'auth/ssh'
+        client = self.f.checkout / 'auth/ssh-client'
+        active = (client / 'id_ed25519.pub').read_bytes()
+        private = (client / 'id_ed25519').read_bytes()
+        server = (ssh / 'ssh_host_ed25519_key').read_bytes()
+        retained = b'# retained guest entry\n'+(ssh / 'ssh_host_ed25519_key.pub').read_bytes()
+        original_containers = self.f.read()['containers']
+        for command, arguments in (('ssh', ('id -u',)), ('start', ())):
+            with self.subTest(command=command):
+                (ssh / 'authorized_keys').write_bytes(retained)
+                state = self.f.read(); state['calls'] = []; self.f.write(state)
+                result = self.f.run(command, *arguments)
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                self.assertIn(active.strip(), (ssh / 'authorized_keys').read_bytes().splitlines(),
+                              'retained runtime command skipped management key reconciliation')
+                self.assertIn(retained, (ssh / 'authorized_keys').read_bytes())
+                self.assertTrue((client / 'id_ed25519').read_bytes() == private)
+                self.assertTrue((ssh / 'ssh_host_ed25519_key').read_bytes() == server)
+                current = self.f.read()
+                self.assertEqual(current['containers'], original_containers)
+                self.assertFalse(any(c[0] in ('compose', 'start', 'stop', 'rm')
+                                     for c in current['calls']))
+                # Existing start also checks home overlays through short-lived
+                # helpers in the selected runtime's PID namespace.
+                for call in (c for c in current['calls'] if c[0] == 'run'):
+                    self.assertIn('--pid=container:oneoff-runtime', call)
+                    self.assertIn('--rm', call)
+                if command == 'start':
+                    self.assertIn('Already running:', result.stdout,
+                                  'retained start returned without its operator status')
 
 
 if __name__ == '__main__': unittest.main()

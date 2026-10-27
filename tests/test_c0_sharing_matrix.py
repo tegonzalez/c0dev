@@ -44,7 +44,7 @@ def checkout(parent, name, token):
     shutil.copytree(ROOT / 'docker', directory / 'docker',
                     ignore=shutil.ignore_patterns('.terminfo', '.Dockerfile*', '.compose.*'))
     for script in ('c0', 'docker-hash', 'dockerfile-concat', 'activate',
-                   'list-listening-ports', 'c0-toolchain', 'c0-terminfo', 'c0-host-io'):
+                   'list-listening-ports', 'c0-toolchain', 'c0-terminfo', 'c0-host-io', 'c0-credentials'):
         shutil.copy2(ROOT / 'bin' / script, directory / 'bin' / script)
     # Same content in both workspaces; also gives all derived test artifacts a
     # label that must match before cleanup is allowed.
@@ -248,7 +248,7 @@ class SharingDocker(unittest.TestCase):
         return dict(os.environ, HOME=str(self.home), DOCKER_CONFIG=self.docker_config,
                     PATH=str(self.wrapper) + os.pathsep + os.environ['PATH'], C0_MODE=mode,
                     C0_SSH_AGENT='0', C0_SECCOMP_NOTIFY='0',
-                    C0_SECURITY='permissive', TERM='xterm-256color')
+                    C0_SECURITY='guest-admin', TERM='xterm-256color')
 
     def cli(self, directory, *args, mode=''):
         return subprocess.run(['/bin/bash', str(directory / 'bin/c0'), *args],

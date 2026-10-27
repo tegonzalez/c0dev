@@ -5,6 +5,7 @@
 import os
 from pathlib import Path
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -118,37 +119,144 @@ def write_config(parent, name, data=None, mode=0o644, require_absent=False):
             pass
 
 
-def prepare_ssh(parent, instance):
-    info = os.fstat(parent)
-    if info.st_uid != os.geteuid():
-        raise ValueError('SSH directory has another owner')
-    for name in ('id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key',
-                 'ssh_host_ed25519_key.pub', 'authorized_keys', 'sshd_config', 'known_hosts'):
-        current(parent, name)
-    os.fchmod(parent, 0o700)
-    for name, comment in (('id_ed25519', 'c0dev@'), ('ssh_host_ed25519_key', 'c0dev-sshd@')):
-        if current(parent, name) is not None:
-            continue
+def file_bytes(parent, name):
+    descriptor = open_regular(parent, name, os.O_RDONLY)
+    try:
+        info = os.fstat(descriptor)
+        with os.fdopen(descriptor, 'rb', closefd=False) as source:
+            return source.read(), (info.st_dev, info.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def key_pair(parent, name, comment, reconcile=False):
+    if current(parent, name) is None:
         if current(parent, name + '.pub') is not None:
             raise ValueError('public key exists without its private key')
         with tempfile.TemporaryDirectory(prefix='c0-ssh-keygen-') as temp:
             key = Path(temp) / 'key'
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-a', '100',
-                            '-f', str(key), '-N', '', '-C', comment + instance],
+                            '-f', str(key), '-N', '', '-C', comment],
                            check=True, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             write_config(parent, name, key.read_bytes(), 0o600, require_absent=True)
             write_config(parent, name + '.pub', key.with_suffix('.pub').read_bytes(),
                          0o644, require_absent=True)
-    auth = current(parent, 'authorized_keys')
-    if auth is None or auth.st_size == 0:
-        descriptor = open_regular(parent, 'id_ed25519.pub', os.O_RDONLY)
+    elif current(parent, name + '.pub') is None:
+        private, _identity = file_bytes(parent, name)
+        public = private_public(private)
+        write_config(parent, name + '.pub', public + b'\n', 0o644, require_absent=True)
+    if reconcile:
+        private, _identity = file_bytes(parent, name)
+        public = private_public(private)
+        cached, _identity = file_bytes(parent, name + '.pub')
+        if b' '.join(cached.strip().split()[:2]) != public:
+            write_config(parent, name + '.pub', public + b' ' + comment.encode('utf-8') + b'\n', 0o644)
+        descriptor = open_regular(parent, name, os.O_RDONLY)
         try:
-            with os.fdopen(descriptor, 'rb', closefd=False) as public:
-                data = public.read()
-            write_config(parent, 'authorized_keys', data, 0o600)
+            os.fchmod(descriptor, 0o600)
         finally:
             os.close(descriptor)
+
+
+def private_public(private):
+    # Derive legacy identity from held private bytes, never a guest-editable .pub.
+    with tempfile.TemporaryDirectory(prefix='c0-ssh-public-') as temp:
+        key = Path(temp) / 'key'
+        descriptor = os.open(str(key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'wb') as output:
+            output.write(private)
+        result = subprocess.run(['ssh-keygen', '-y', '-P', '', '-f', str(key)], check=True,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        public = result.stdout.strip().split()
+        if len(public) < 2:
+            raise ValueError('cannot identify legacy client key')
+        return b' '.join(public[:2])
+
+
+def authorized_identity(line, public):
+    try:
+        text = line.decode('utf-8', 'surrogateescape')
+        if text.lstrip().startswith('#'):
+            return False
+        fields = shlex.shlex(text, posix=True)
+        fields.whitespace_split = True
+        fields.commenters = ''
+        identity = public.decode('ascii').split()[:2]
+        if len(identity) != 2:
+            return False
+        first = fields.get_token()
+        if first == identity[0]:
+            return fields.get_token() == identity[1]
+        # Only one optional options field can precede the actual key. Stop at
+        # its blob: free-form comments need not contain balanced shell quotes.
+        return fields.get_token() == identity[0] and fields.get_token() == identity[1]
+    except (ValueError, UnicodeError):
+        return False
+
+
+def prepare_ssh(parent, client, instance):
+    for directory in (parent, client):
+        if os.fstat(directory).st_uid != os.geteuid():
+            raise ValueError('SSH directory has another owner')
+    for name in ('id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key',
+                 'ssh_host_ed25519_key.pub', 'authorized_keys', 'sshd_config', 'known_hosts'):
+        current(parent, name)
+    for name in ('id_ed25519', 'id_ed25519.pub', 'known_hosts'):
+        current(client, name)
+    legacy = None
+    if current(parent, 'id_ed25519') is not None:
+        private, identity = file_bytes(parent, 'id_ed25519')
+        public = private_public(private)
+        legacy = (private, identity, public)
+    for directory in (parent, client):
+        os.fchmod(directory, 0o700)
+    key_pair(client, 'id_ed25519', 'c0dev-client@' + instance, reconcile=True)
+    key_pair(parent, 'ssh_host_ed25519_key', 'c0dev-sshd@' + instance)
+    client_public, _identity = file_bytes(client, 'id_ed25519.pub')
+    active_public = b' '.join(client_public.strip().split()[:2])
+    if not active_public:
+        raise ValueError('missing active client public key')
+    original = b'' if current(parent, 'authorized_keys') is None else file_bytes(parent, 'authorized_keys')[0]
+    lines = original.splitlines(keepends=True)
+    if legacy is not None:
+        lines = [line for line in lines if not authorized_identity(line, legacy[2])]
+    authorized = b''.join(lines)
+    if not any(authorized_identity(line, active_public) for line in lines):
+        if authorized and not authorized.endswith(b'\n'):
+            authorized += b'\n'
+        authorized += client_public.strip() + b'\n'
+    if authorized != original:
+        write_config(parent, 'authorized_keys', authorized, 0o600)
+    if legacy is not None:
+        try:
+            os.mkdir('legacy-keys', 0o700, dir_fd=client)
+        except FileExistsError:
+            pass
+        archive = os.open('legacy-keys', DIR_FLAGS, dir_fd=client)
+        try:
+            if os.fstat(archive).st_uid != os.geteuid():
+                raise ValueError('legacy archive has another owner')
+            os.fchmod(archive, 0o700)
+            token = secrets.token_hex(16)
+            write_config(archive, token + '-id_ed25519', legacy[0], 0o600, require_absent=True)
+            if current(parent, 'id_ed25519.pub') is not None:
+                old_public, pub_identity = file_bytes(parent, 'id_ed25519.pub')
+                write_config(archive, token + '-id_ed25519.pub', old_public, 0o644, require_absent=True)
+            else:
+                pub_identity = None
+            info = current(parent, 'id_ed25519')
+            if info is None or (info.st_dev, info.st_ino) != legacy[1]:
+                raise ValueError('legacy key changed during retirement')
+            os.unlink('id_ed25519', dir_fd=parent)
+            if pub_identity is not None:
+                info = current(parent, 'id_ed25519.pub')
+                if info is None or (info.st_dev, info.st_ino) != pub_identity:
+                    raise ValueError('legacy public key changed during retirement')
+                os.unlink('id_ed25519.pub', dir_fd=parent)
+        finally:
+            os.close(archive)
 
 
 def read_log(descriptor, wait=False):
@@ -186,20 +294,29 @@ def read_log(descriptor, wait=False):
 
 
 def main(argv):
-    if len(argv) not in (4, 5) or argv[2] not in ('write-config', 'reset-log', 'read-log', 'wait-log', 'prepare-ssh') or (len(argv) == 5) != (argv[2] == 'prepare-ssh'):
-        print('usage: c0-host-io ROOT OP PATH [INSTANCE]', file=sys.stderr)
+    if len(argv) < 3 or (argv[2] == 'prepare-ssh' and len(argv) not in (5, 6)) or (argv[2] != 'prepare-ssh' and (len(argv) != 4 or argv[2] not in ('write-config', 'reset-log', 'read-log', 'wait-log'))):
+        print('usage: c0-host-io ROOT OP PATH [INSTANCE [CLIENT_DIR]]', file=sys.stderr)
         return 2
     operation = argv[2]
     parent = descriptor = None
     try:
         try:
-            parent, name = parent_fd(argv[1], os.path.join(argv[3], '.c0-ssh-entry') if operation == 'prepare-ssh' else argv[3], operation == 'reset-log')
+            parent, name = parent_fd(argv[1], os.path.join(argv[3], '.c0-ssh-entry') if operation == 'prepare-ssh' else argv[3], operation in ('reset-log', 'prepare-ssh'))
         except FileNotFoundError:
             if operation == 'read-log':
                 return 0
             raise
         if operation == 'prepare-ssh':
-            prepare_ssh(parent, argv[4])
+            client_path = argv[5] if len(argv) == 6 else os.path.join(argv[1], 'auth/ssh-client')
+            guest_path = os.path.abspath(argv[3])
+            client_path = os.path.abspath(client_path)
+            if os.path.commonpath((guest_path, client_path)) in (guest_path, client_path):
+                raise ValueError('host client and guest auth directories overlap')
+            client, _name = parent_fd(argv[1], os.path.join(client_path, '.client-entry'), True)
+            try:
+                prepare_ssh(parent, client, argv[4])
+            finally:
+                os.close(client)
             return 0
         if operation == 'write-config':
             write_config(parent, name)

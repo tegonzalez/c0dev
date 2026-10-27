@@ -171,12 +171,13 @@ Not shown as nodes: `c0 root` is an exec lane inside `runtime`; `c0 tools accept
 
 **Status (fact):** Alpha — validated on the author's workstation only.
 
-| Requirement | Version or note                           |
-| ----------- | ----------------------------------------- |
-| macOS       | Apple M-series, Tahoe v26.6.2             |
-| OrbStack    | orbctl 2.2.3 (20963)                      |
-| Terminal    | Ghostty v1.3.1                            |
-| Xcode       | Required for `infocmp` during image build |
+| Requirement | Version or note                                                      |
+| ----------- | -------------------------------------------------------------------- |
+| macOS       | Apple M-series, Tahoe v26.6.2                                        |
+| OrbStack    | orbctl 2.2.3 (20963)                                                 |
+| Terminal    | Ghostty v1.3.1                                                       |
+| Xcode       | Required for `infocmp` during image build                            |
+| Python      | 3.9+ at `/usr/bin/python3` for host helpers and credential transport |
 
 ## Image summary
 
@@ -231,10 +232,10 @@ A successful final command opens the guest shell as `dev` (UID 1000); `c0 sh` au
 | Command                                          | Purpose                                                                                     |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `c0 build [-f]`                                  | Build or reuse validated shared tools, base, and runtime artifacts; publish through Docker. |
-| `c0 start [--cap-drop-all]`                      | Reuse the matching build/workspace container, or create it from the published shared image. |
+| `c0 start [--least-privilege]`                   | Reuse the matching build/workspace container, or create it from the published shared image. |
 | `c0 stop`                                        | Stop and remove this workspace's runtimes; retain bind mounts and named volumes.            |
-| `c0 restart [--cap-drop-all]`                    | Run stop, then start with the supplied start arguments.                                     |
-| `c0 sh` / `c0 root` / `c0 ssh [-Y] [command...]` | Attach as dev, root, or dev over SSH. `ssh --keygen` regenerates SSH keys.                  |
+| `c0 restart [--least-privilege]`                 | Run stop, then start with the supplied start arguments.                                     |
+| `c0 sh` / `c0 root` / `c0 ssh [-Y] [command...]` | Attach as dev, root, or dev over SSH. `ssh --keygen` prepares SSH keys.                     |
 | `c0 status` / `c0 logs [svc]`                    | Inspect this instance or view service logs.                                                 |
 | `c0 tools [--detail\|accept\|restore]`           | Inspect, publish, or discard the writable tools stage; see the tools behavior below.        |
 | `c0 orca [start\|stop\|status]`                  | Check or manage the guest Orca service.                                                     |
@@ -264,9 +265,9 @@ c0 tools                  # Summarize the writable tools stage
 c0 tools --detail         # List every staged path
 c0 tools accept           # Seal the stage as a new immutable snapshot
 c0 tools restore          # Discard the stage and restore the selected snapshot
-c0 ssh                    # SSH as dev (loopback only; keys in auth/ssh/)
+c0 ssh                    # SSH as dev; client keys stay in host-only auth/ssh-client/
 c0 ssh -Y                 # SSH with trusted X11 forwarding (host X server required)
-c0 ssh --keygen           # Regenerate auth/ssh keys
+c0 ssh --keygen           # Prepare separate host client and guest server/auth keys
 ```
 
 Use `c0 build -f` to force tool re-extraction.
@@ -284,9 +285,15 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 
 - Guest `sshd` listens on port `2222`; the host publishes **`127.0.0.1:<port>` only** (not LAN-wide).
 - Range: `2222–2322` (same gap-fill rule as web ports). Shown on `c0 start`, `c0 restart`, and `c0 status`.
-- Keys and host key live under gitignored `auth/ssh/` (created on first `c0 start` or `c0 build`). Pubkey auth only.
+- Guest server keys and public authorization live in gitignored `auth/ssh/`; management client keys and host `known_hosts` live in host-only `auth/ssh-client/`, which is never mounted in the guest. Key preparation occurs on normal setup or `c0 ssh --keygen`; it preserves the server key, retains legacy management keys in the private client archive, and preserves unrelated authorizations. Pubkey auth only.
 - Connect: `c0 ssh` (same project-path behavior as `c0 sh`). Override: `C0DEV_SSH_PORT=2223 c0 start`.
 - Trusted X11: start a host X server, ensure `DISPLAY` is set, then connect with `c0 ssh -Y`. The image includes `xauth`, and c0 enables `X11Forwarding` in its generated guest `sshd_config`.
+
+### Per-session credential environment
+
+Optional gitignored `auth/.env` supplies literal `NAME='value'`, `NAME="value"`, or `export NAME=...` assignments. Shell, guest-root, SSH, and service-launch sessions receive those values in the guest environment without putting values in transport arguments or changing host controls. Empty values, quoted punctuation, Unicode, and later duplicate assignments are preserved. Names starting `C0_SESSION_ENV` are reserved for the private handoff. Interactive input, exit statuses, project navigation, and trusted X11 remain available.
+
+The management client directory is private to the host; existing guest configuration/data mounts and the optional guest SSH-agent relay remain separate. Key preparation updates files only when invoked, and does not restart or recreate a running guest. Existing client/server keys are retained or archived; private material must stay out of Git and logs.
 
 ## Authenticate assistants
 
@@ -310,21 +317,21 @@ Use `c0 sh` or `c0 ssh` for interactive shells. The container daemon keeps runni
 
 Persistent host ↔ guest paths for credentials, tooling, and projects: see `./docker/volumes-folders.yaml`, eg:
 
-| Host path       | Guest path                | Role                                                                              |
-| --------------- | ------------------------- | --------------------------------------------------------------------------------- |
-| `.claude/`      | `/home/dev/.claude`       | Assistant state                                                                   |
-| `.cache/`       | `/home/dev/.cache`        | Mutable tool caches (cargo registry, uv); `c0` never purges                       |
-| `.config/`      | `/home/dev/.config`       | Application config                                                                |
-| `.codex/`       | `/home/dev/.codex`        | Assistant state                                                                   |
-| `.local/`       | `/home/dev/.local-rw`     | Host-visible XDG data and state                                                   |
-| `rules/`        | `/home/dev/rules`         | Project rules                                                                     |
-| `projects/`     | `/home/dev/projects`      | Sources and build outputs                                                         |
-| `bin/`          | `/run/c0/host-bin:ro`     | Host launcher/helper lower; writable guest view at `/home/dev/bin` uses OverlayFS |
-| `auth/ssh/`     | `/home/dev/.ssh`          | SSH keys and `sshd` config (gitignored)                                           |
-| `.claude.json`  | `/home/dev/.claude.json`  | Assistant credentials file                                                        |
-| `~/.gitconfig`  | `/home/dev/.gitconfig:ro` | Host Git identity and settings; guest cannot change the host file                 |
-| `tools-shared`  | `/tools/current:ro`       | Shared immutable payload selected from Docker artifact metadata                   |
-| `home-overlays` | `/run/c0/overlay-state`   | Workspace writable tool stage, launcher upper, and OverlayFS work data            |
+| Host path       | Guest path                | Role                                                                                         |
+| --------------- | ------------------------- | -------------------------------------------------------------------------------------------- |
+| `.claude/`      | `/home/dev/.claude`       | Assistant state                                                                              |
+| `.cache/`       | `/home/dev/.cache`        | Mutable tool caches (cargo registry, uv); `c0` never purges                                  |
+| `.config/`      | `/home/dev/.config`       | Application config                                                                           |
+| `.codex/`       | `/home/dev/.codex`        | Assistant state                                                                              |
+| `.local/`       | `/home/dev/.local-rw`     | Host-visible XDG data and state                                                              |
+| `rules/`        | `/home/dev/rules`         | Project rules                                                                                |
+| `projects/`     | `/home/dev/projects`      | Sources and build outputs                                                                    |
+| `bin/`          | `/run/c0/host-bin:ro`     | Host launcher/helper lower; writable guest view at `/home/dev/bin` uses OverlayFS            |
+| `auth/ssh/`     | `/home/dev/.ssh`          | Guest server/auth and durable SSH state; host management client keys stay outside this mount |
+| `.claude.json`  | `/home/dev/.claude.json`  | Assistant credentials file                                                                   |
+| `~/.gitconfig`  | `/home/dev/.gitconfig:ro` | Host Git identity and settings; guest cannot change the host file                            |
+| `tools-shared`  | `/tools/current:ro`       | Shared immutable payload selected from Docker artifact metadata                              |
+| `home-overlays` | `/run/c0/overlay-state`   | Workspace writable tool stage, launcher upper, and OverlayFS work data                       |
 
 The guest `/home/dev/bin` overlays the read-only host `bin/` lower. Guest edits persist in a separate launcher upper across restarts and do not change host scripts. The launcher upper is excluded from `c0 tools accept` and `c0 tools restore`; host updates remain visible for paths the guest has not overridden.
 
@@ -421,7 +428,7 @@ c0dev is a **single-user local development container**, not a multi-tenant sandb
 
 ### Capability handling
 
-Runtime containers are **not privileged**. On `c0 start`, compose applies the security overlay (`docker-compose.security-permissive.yaml`):
+Runtime containers are **not Docker privileged** in either policy. `C0_SECURITY` accepts `guest-admin` (the default) or `least-privilege`; both use the Moby default seccomp profile and `no-new-privileges:true`. The `guest-admin` overlay (`docker-compose.security-guest-admin.yaml`) drops all capabilities, then restores `DAC_OVERRIDE`, `CHOWN`, and `FOWNER` for guest administration. The `least-privilege` overlay (`docker-compose.security-least-privilege.yaml`) drops all capabilities and restores none. Select it with `C0_SECURITY=least-privilege` or `c0 start --least-privilege`.
 
 | Control              | Setting                                                                                           |
 | -------------------- | ------------------------------------------------------------------------------------------------- |
@@ -430,7 +437,7 @@ Runtime containers are **not privileged**. On `c0 start`, compose applies the se
 | Privilege escalation | `no-new-privileges:true`                                                                          |
 | Syscalls             | Moby default seccomp profile (vendored under `docker/seccomp/`, checksum-verified at start/build) |
 
-`DAC_OVERRIDE`, `CHOWN`, and `FOWNER` let `c0 root` and package installs work inside the guest without running `sshd` setuid or granting broad Linux capabilities. They are **guest-admin helpers**, not host-root equivalents.
+`DAC_OVERRIDE`, `CHOWN`, and `FOWNER` support `c0 root` and package installs inside the guest without running `sshd` setuid or granting broad Linux capabilities. They are **guest-admin helpers**, not host-root equivalents. The UID 1000 `c0 sh` process does not receive them as effective capabilities; it runs under the same seccomp and no-new-privileges policy.
 
 `sshd` listens on guest port `2222` and runs as the `dev` user (no setuid). The host publishes **`127.0.0.1:<port>` only**.
 
@@ -443,7 +450,7 @@ Native upgrades run inside the existing restricted runtime and can write only it
 | Immutable accepted tools  | Runtime mounts only `/tools/opt/<TOOLS_ID>` at `/tools/current:ro`; other shared snapshots are not visible                                |
 | Explicit publication      | Runtime writes remain in its upper until the host operator runs `c0 tools accept`; runtime processes never receive volume-write authority |
 | Restore boundary          | `c0 tools restore` discards configured tool uppers and resumes the same container; launcher state is retained                             |
-| Loopback SSH              | Pubkey-only inbound login; keys in gitignored `auth/ssh/`                                                                                 |
+| Loopback SSH              | Pubkey-only inbound login; guest auth in `auth/ssh/`, host client/trust in unmounted `auth/ssh-client/`                                   |
 | SSH agent relay           | OrbStack relay bound at `/run/host-services/ssh-auth.sock`; SSH sessions receive the same guest `SSH_AUTH_SOCK` path                      |
 | Seccomp integrity         | Tampered or missing vendored profiles block `c0 start` / `c0 build`; run `c0 seccomp-upgrade` to adopt newer Moby profiles deliberately   |
 
@@ -474,7 +481,7 @@ c0dev intentionally shares selected host data with guest tools and applies a con
 **Operational guidance**
 
 - Treat the guest like a **powerful local shell**, not an untrusted multi-tenant VM.
-- Keep secrets in gitignored paths; never commit `auth/ssh/` or assistant token files.
+- Keep secrets in gitignored paths; never commit `auth/`, including host client archives, or assistant token files.
 - Use a dedicated checkout and `projects/` tree for untrusted repos.
 - Disable SSH agent forwarding when not needed: `C0_SSH_AGENT=0`.
 - For secretless or brokered API access, see `c0-aegis`.

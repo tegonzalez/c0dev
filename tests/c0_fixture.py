@@ -3,6 +3,7 @@
 """Run the actual c0 CLI against a stateful Docker double and an isolated checkout."""
 import hashlib
 import json
+from functools import lru_cache
 import re
 import os
 from pathlib import Path
@@ -12,6 +13,22 @@ import sys
 import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+@lru_cache(maxsize=2)
+def synthetic_ssh_pair(role):
+    """Generate disposable synthetic keys once; never embed key bytes in Git."""
+    with tempfile.TemporaryDirectory(prefix='c0-fixture-key-') as temporary:
+        key = Path(temporary) / 'key'
+        result = subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
+                                 '-C', 'c0-fixture-'+role, '-f', str(key)],
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=10)
+        if result.returncode:
+            raise AssertionError('synthetic fixture key generation failed')
+        return key.read_bytes(), key.with_suffix('.pub').read_bytes()
+
+
 DOCKER = r'''
 import copy, fcntl, hashlib, json, os, re, sys
 from pathlib import Path
@@ -31,7 +48,7 @@ def labels(c):
     result = copy.deepcopy(c.get('config', {}).get('Labels') or {})
     result.update({'c0dev.instance': c['instance'], 'c0dev.tools_hash': c['tools'],
                  'c0dev.tools_volume': c.get('volume', 'c0dev-tools-shared'),
-                 'c0dev.security_mode': c.get('security', 'permissive'),
+                 'c0dev.security_mode': c.get('security', 'guest-admin'),
                  'com.docker.compose.project': c['instance'],
                  'com.docker.compose.service': 'c0dev'})
     result.update(c.get('labels', {}))
@@ -195,7 +212,7 @@ if op == 'compose':
         if os.environ.get('TOOLS_ID'): c['tools'] = os.environ['TOOLS_ID']
         if os.environ.get('C0_RUNTIME_IMAGE'): c['image'] = os.environ['C0_RUNTIME_IMAGE']
         c['state'] = state.get('started_state', 'running')
-        c['security'] = os.environ.get('C0_SECURITY', 'permissive')
+        c['security'] = os.environ.get('C0_SECURITY', 'guest-admin')
         state['containers'].append(c)
         finish()
     if 'logs' in args or 'ps' in args:
@@ -254,6 +271,14 @@ if op == 'run':
                     del data[key]
     finish()
 if op == 'exec':
+    if '--env-file' in args:
+        import base64
+        with open(args[args.index('--env-file')+1], 'rb') as envfile:
+            fields = dict(line.decode().split('=', 1) for line in envfile.read().splitlines())
+        count = int(fields['C0_SESSION_ENV'].split(':')[1])
+        encoded = ''.join(fields['C0_SESSION_ENV_%04d' % i] for i in range(count))
+        values = json.loads(base64.b64decode(encoded))['values']
+        state['exec_env_sha256'] = {k: hashlib.sha256(v.encode()).hexdigest() for k, v in values.items()}
     cid = next((a for a in args[1:] if any(c['id'] == a for c in state['containers'])), None)
     c = next((c for c in state['containers'] if c['id'] == cid), None)
     if not c or c['state'] != 'running': finish(1)
@@ -279,7 +304,7 @@ class Fixture:
         shutil.copytree(REPO/'docker', self.checkout/'docker', ignore=shutil.ignore_patterns('.terminfo', '.Dockerfile*', '.compose.*'))
         for name in ('c0', 'docker-hash', 'dockerfile-concat', 'activate', 'list-listening-ports'):
             shutil.copy2(REPO/'bin'/name, self.checkout/'bin'/name)
-        for name in ('c0-terminfo', 'c0-toolchain', 'c0-host-io'):
+        for name in ('c0-terminfo', 'c0-toolchain', 'c0-host-io', 'c0-credentials'):
             if (REPO/'bin'/name).exists():
                 shutil.copy2(REPO/'bin'/name, self.checkout/'bin'/name)
         self.home = self.root/'home'
@@ -288,8 +313,17 @@ class Fixture:
         for name in ('.claude', '.cache', '.codex', '.kimi-code', '.config', '.local', 'rules', 'projects', 'bin', 'auth/ssh'):
             (self.checkout/name).mkdir(parents=True, exist_ok=True)
         (self.checkout/'.claude.json').write_text('{}')
-        for name in ('authorized_keys', 'id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key'):
-            (self.checkout/'auth/ssh'/name).write_text('fixture\n')
+        client_private, client_public = synthetic_ssh_pair('client')
+        server_private, server_public = synthetic_ssh_pair('server')
+        for name, content in (('authorized_keys', client_public),
+                              ('ssh_host_ed25519_key', server_private),
+                              ('ssh_host_ed25519_key.pub', server_public)):
+            (self.checkout/'auth/ssh'/name).write_bytes(content)
+            (self.checkout/'auth/ssh'/name).chmod(0o600)
+        (self.checkout/'auth/ssh-client').mkdir(mode=0o700)
+        for name, content in (('id_ed25519', client_private), ('id_ed25519.pub', client_public)):
+            (self.checkout/'auth/ssh-client'/name).write_bytes(content)
+            (self.checkout/'auth/ssh-client'/name).chmod(0o600)
         self.tools = subprocess.check_output(
             [str(self.checkout/'bin/docker-hash'), 'docker/Dockerfile.base',
              'docker/Dockerfile.tools'], cwd=self.checkout, text=True).strip()
@@ -374,7 +408,7 @@ class Fixture:
 
     def legacy_container(self, cid='a'*64, state='running'):
         container = self.container(cid, oneoff=False, state=state)
-        container['security'] = 'permissive'
+        container['security'] = 'guest-admin'
         for mount in container['mounts']:
             if mount['target'] == '/run/c0/host-bin':
                 mount.update(target='/home/dev/bin', rw=True)

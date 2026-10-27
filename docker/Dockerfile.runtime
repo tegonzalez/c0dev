@@ -24,7 +24,7 @@ RUN apt install -y \
     tmux vim neovim \
     wget bat btop tree \
     pandoc poppler-utils \
-    openssh-server xauth \
+    openssh-server xauth python3 \
     1password-cli \
     file xvfb dbus dbus-x11 zlib1g-dev ca-certificates \
     libgtk-3-0t64 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libgbm1 libasound2t64 \

@@ -29,7 +29,7 @@ class Lifecycle(unittest.TestCase):
         self.assertIn(['stop', 'oneoff-runtime'], calls)
         self.assertIn(['rm', 'oneoff-runtime'], calls)
         self.assertTrue(any(c[0] == 'compose' and 'run' in c for c in calls))
-        self.assertTrue(any(c[0] == 'exec' and 'new-runtime' in c and 'bash' in c for c in calls))
+        self.assertTrue(any(c[0] == 'exec' and 'new-runtime' in c and '/bin/bash' in c for c in calls))
         self.assertFalse(any(c[0] == 'start' for c in calls))
         self.assertFalse(any(c[0] == 'rm' and ('-v' in c or '--volumes' in c) for c in calls))
 

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 # Service management script for c0dev environment
-# Usage: ./c0 [start [--cap-drop-all]|stop|restart [--cap-drop-all]|...|help]
+# Usage: ./c0 [start [--least-privilege]|stop|restart [--least-privilege]|...|help]
 
 set -e
 
@@ -44,12 +44,13 @@ REQUIRED_FILES=(
     "$C0ROOT/docker/c0-publish-tools"
     "$C0ROOT/bin/docker-hash"
     "$C0ROOT/bin/c0-host-io"
+    "$C0ROOT/bin/c0-credentials"
     "$C0ROOT/bin/dockerfile-concat"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.json"
     "$C0ROOT/docker/seccomp/moby-default-seccomp.sha256"
     "$C0ROOT/docker/seccomp/moby-seccomp.tag"
-    "$C0ROOT/docker/docker-compose.security-permissive.yaml"
-    "$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
+    "$C0ROOT/docker/docker-compose.security-guest-admin.yaml"
+    "$C0ROOT/docker/docker-compose.security-least-privilege.yaml"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -80,6 +81,7 @@ C0DEV_SSH_PORT_MIN=2222
 C0DEV_SSH_PORT_MAX=2322
 C0DEV_ORCA_GUEST_PORT=6768
 C0_SSH_DIR="$C0ROOT/auth/ssh"
+C0_SSH_CLIENT_DIR="$C0ROOT/auth/ssh-client"
 C0_AUTH_ENV_FILE="$C0ROOT/auth/.env"
 
 # C0_MODE validation: only "" (prod) or "dev" allowed
@@ -243,8 +245,8 @@ c0_resolve_toolchain() {
 # =============================================================================
 
 COMPOSE_PUBLIC_FILE="$C0ROOT/docker/docker-compose.public.yaml"
-COMPOSE_SECURITY_PERMISSIVE="$C0ROOT/docker/docker-compose.security-permissive.yaml"
-COMPOSE_SECURITY_CAP_DROP_ALL="$C0ROOT/docker/docker-compose.security-cap-drop-all.yaml"
+COMPOSE_SECURITY_GUEST_ADMIN="$C0ROOT/docker/docker-compose.security-guest-admin.yaml"
+COMPOSE_SECURITY_LEAST_PRIVILEGE="$C0ROOT/docker/docker-compose.security-least-privilege.yaml"
 # OrbStack / Docker Desktop agent relay path inside the Linux VM (not a macOS socket).
 C0_SSH_AUTH_SOCK_PATH="/run/host-services/ssh-auth.sock"
 VOLUMES_FOLDERS_FILE="$C0ROOT/docker/volumes-folders.yaml"
@@ -518,14 +520,14 @@ cmd_seccomp_upgrade() {
 }
 
 # =============================================================================
-# C0_SECURITY: permissive (default) | cap-drop-all — env or start/restart --cap-drop-all
+# C0_SECURITY: guest-admin (default) | least-privilege — env or start/restart --least-privilege
 # =============================================================================
 
 validate_c0_security_value() {
     case "$1" in
-        permissive|cap-drop-all) return 0 ;;
+        guest-admin|least-privilege) return 0 ;;
         *)
-            echo "error: C0_SECURITY must be 'permissive' or 'cap-drop-all', got: '$1'" >&2
+            echo "error: C0_SECURITY must be 'guest-admin' or 'least-privilege', got: '$1'" >&2
             return 1
             ;;
     esac
@@ -533,8 +535,8 @@ validate_c0_security_value() {
 
 c0_security_compose_file() {
     case "$C0_SECURITY" in
-        permissive) echo "$COMPOSE_SECURITY_PERMISSIVE" ;;
-        cap-drop-all) echo "$COMPOSE_SECURITY_CAP_DROP_ALL" ;;
+        guest-admin) echo "$COMPOSE_SECURITY_GUEST_ADMIN" ;;
+        least-privilege) echo "$COMPOSE_SECURITY_LEAST_PRIVILEGE" ;;
         *)
             echo "error: internal: unknown C0_SECURITY=$C0_SECURITY" >&2
             return 1
@@ -656,7 +658,7 @@ get_running_container_security_mode() {
     get_c0_container_security_mode "$cid"
 }
 
-# For dc and display when not starting: match running container, else env, else permissive.
+# For dc and display when not starting: match running container, else env, else guest-admin.
 ensure_c0_security_resolved() {
     if [[ -n "${C0_SECURITY_RESOLVED:-}" ]]; then
         return 0
@@ -665,42 +667,48 @@ ensure_c0_security_resolved() {
     local from_container
     from_container="$(get_running_container_security_mode)"
     if [[ -n "$from_container" ]]; then
-        if ! validate_c0_security_value "$from_container"; then
-            return 1
-        fi
-        C0_SECURITY="$from_container"
+        # Older labels used these names for the guest-admin capability set.
+        case "$from_container" in
+            permissive|cap-drop-all) C0_SECURITY="guest-admin" ;;
+            *)
+                if ! validate_c0_security_value "$from_container"; then
+                    return 1
+                fi
+                C0_SECURITY="$from_container"
+                ;;
+        esac
     elif [[ -n "${C0_SECURITY:-}" ]]; then
         if ! validate_c0_security_value "$C0_SECURITY"; then
             return 1
         fi
     else
-        C0_SECURITY="permissive"
+        C0_SECURITY="guest-admin"
     fi
     export C0_SECURITY
 }
 
-# start/restart only: --cap-drop-all overrides env; default permissive.
+# start/restart only: --least-privilege overrides env; default guest-admin.
 resolve_c0_security_for_start() {
-    local cli_cap_drop_all=false
+    local cli_least_privilege=false
     local arg
     for arg in "$@"; do
         case "$arg" in
-            --cap-drop-all) cli_cap_drop_all=true ;;
+            --least-privilege) cli_least_privilege=true ;;
             *)
-                echo "error: unknown option: $arg (try --cap-drop-all)" >&2
+                echo "error: unknown option: $arg (try --least-privilege)" >&2
                 return 1
                 ;;
         esac
     done
 
-    if [[ "$cli_cap_drop_all" == true ]]; then
-        C0_SECURITY="cap-drop-all"
+    if [[ "$cli_least_privilege" == true ]]; then
+        C0_SECURITY="least-privilege"
     elif [[ -n "${C0_SECURITY:-}" ]]; then
         if ! validate_c0_security_value "$C0_SECURITY"; then
             return 1
         fi
     else
-        C0_SECURITY="permissive"
+        C0_SECURITY="guest-admin"
     fi
     export C0_SECURITY
     export C0_SECURITY_RESOLVED=1
@@ -1196,9 +1204,13 @@ c0_host_io() {
     /usr/bin/python3 -I "${C0_HOST_IO:-$C0ROOT/bin/c0-host-io}" "$C0ROOT" "$@"
 }
 
+c0_credentials() {
+    /usr/bin/python3 -I "$C0ROOT/bin/c0-credentials" "$C0ROOT" "$@"
+}
+
 c0_ssh_write_sshd_config() {
     local ssh_dir="$C0_SSH_DIR"
-    # AcceptEnv * : allowlist only. Values arrive per-attach via client SendEnv.
+    # Only the private framed environment and ordinary locale are accepted.
     # Written on keygen/start (bind-mounted auth/ssh/); not rewritten on c0 ssh attach.
     c0_host_io write-config "$ssh_dir/sshd_config" <<EOF
 Port 2222
@@ -1213,14 +1225,14 @@ HostKey /home/dev/.ssh/ssh_host_ed25519_key
 PidFile /home/dev/.ssh/sshd.pid
 UsePAM no
 LogLevel INFO
-AcceptEnv *
+AcceptEnv C0_SESSION_ENV* LANG LC_*
 SetEnv SSH_AUTH_SOCK=${C0_SSH_AUTH_SOCK_PATH}
 X11Forwarding yes
 EOF
 }
 
 c0_ssh_keygen() {
-    c0_host_io prepare-ssh "$C0_SSH_DIR" "$C0_INSTANCE_ID" || return 1
+    c0_host_io prepare-ssh "$C0_SSH_DIR" "$C0_INSTANCE_ID" "${C0_SSH_CLIENT_DIR:-$C0ROOT/auth/ssh-client}" || return 1
     c0_ssh_write_sshd_config
 }
 
@@ -1228,9 +1240,14 @@ c0_ssh_ensure_keys() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
         return 0
     fi
-    if [[ ! -f "$C0_SSH_DIR/authorized_keys" ]]; then
-        c0_ssh_keygen
+    # Presence alone cannot prove the selected client is still authorized.
+    # Reconcile held key material and authorization without rotating keys or
+    # changing the running daemon. Existing server configuration stays intact.
+    c0_host_io prepare-ssh "$C0_SSH_DIR" "$C0_INSTANCE_ID" "$C0_SSH_CLIENT_DIR" || return 1
+    if [[ ! -f "$C0_SSH_DIR/sshd_config" ]]; then
+        c0_ssh_write_sshd_config || return 1
     fi
+    return 0
 }
 
 c0_container_log_tail() {
@@ -1725,7 +1742,7 @@ cmd_ssh() {
 
     if [[ "${1:-}" == "--keygen" ]]; then
         c0_ssh_keygen
-        echo -e "✅ SSH keys: ${GREEN}auth/ssh/${NC}"
+        echo -e "✅ SSH keys: ${GREEN}auth/ssh/ (guest), auth/ssh-client/ (host)${NC}"
         return 0
     fi
 
@@ -1741,9 +1758,6 @@ cmd_ssh() {
     c0_ssh_ensure_keys
     c0_require_container_running || exit 1
     "$C0ROOT/bin/c0-terminfo" sync "$C0_RUNTIME_CID" || return 1
-    # Attach: host auth/.env → this session via SendEnv (no sshd_config mutate, no HUP).
-    c0_auth_env_load_exec_args
-    c0_auth_env_export_for_sendenv
 
     local port project_path
     port="$(get_current_ssh_port || true)"
@@ -1754,23 +1768,12 @@ cmd_ssh() {
 
     project_path=$(get_project_path)
 
-    local -a ssh_args=(
-        -i "$C0_SSH_DIR/id_ed25519"
-        -o "StrictHostKeyChecking=accept-new"
-        -o "UserKnownHostsFile=$C0_SSH_DIR/known_hosts"
-        -p "$port"
-    )
+    local x11=0
     if [[ "$trusted_x11" == true ]]; then
-        ssh_args+=(-Y)
+        x11=1
         if [[ -z "${DISPLAY:-}" ]]; then
             echo "warning: DISPLAY is unset; start an X server on the host before using c0 ssh -Y" >&2
         fi
-    fi
-    local _sendenv_name
-    if [[ ${#C0_AUTH_ENV_NAMES[@]} -gt 0 ]]; then
-        for _sendenv_name in "${C0_AUTH_ENV_NAMES[@]}"; do
-            ssh_args+=(-o "SendEnv=${_sendenv_name}")
-        done
     fi
     # OpenSSH joins remote argv with spaces before the user shell runs
     # them. Pass a *single* remote-command string so `cd … && …` is not
@@ -1791,15 +1794,15 @@ cmd_ssh() {
         else
             remote_script="${user_cmd}"
         fi
-        exec ssh "${ssh_args[@]}" dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
+        c0_credentials ssh "$C0_AUTH_ENV_FILE" "$C0_SSH_CLIENT_DIR" "$port" "$x11" 0 "$remote_script"
     elif [[ -n "$project_path" ]]; then
         print_web_port_mapping
         echo -e "🔐 SSH: ${CYAN}$MAIN_SERVICE${NC} (dev) @ ${YELLOW}projects/$project_path${NC}"
         remote_script="cd $(printf '%q' "$CONTAINER_DEV_HOME/projects/$project_path") && exec bash -l"
-        exec ssh "${ssh_args[@]}" -t dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
+        c0_credentials ssh "$C0_AUTH_ENV_FILE" "$C0_SSH_CLIENT_DIR" "$port" "$x11" 1 "$remote_script"
     else
         remote_script="exec bash -l"
-        exec ssh "${ssh_args[@]}" -t dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
+        c0_credentials ssh "$C0_AUTH_ENV_FILE" "$C0_SSH_CLIENT_DIR" "$port" "$x11" 1 "$remote_script"
     fi
 }
 
@@ -1841,24 +1844,13 @@ c0_orca_ssh() {
         return 1
     fi
 
-    local -a ssh_args=(
-        -i "$C0_SSH_DIR/id_ed25519"
-        -o "StrictHostKeyChecking=accept-new"
-        -o "UserKnownHostsFile=$C0_SSH_DIR/known_hosts"
-        -o "BatchMode=yes"
-        -p "$ssh_port"
-    )
-    local _sendenv_name
-    if [[ ${#C0_AUTH_ENV_NAMES[@]} -gt 0 ]]; then
-        for _sendenv_name in "${C0_AUTH_ENV_NAMES[@]}"; do
-            ssh_args+=(-o "SendEnv=${_sendenv_name}")
-        done
-    fi
-    ssh "${ssh_args[@]}" dev@127.0.0.1 "/bin/bash -lc $(printf '%q' "$remote_script")"
+    local auth="$C0_AUTH_ENV_FILE"
+    [[ "${2:-}" != none ]] || auth=""
+    c0_credentials ssh-batch "$auth" "$C0_SSH_CLIENT_DIR" "$ssh_port" 0 0 "$remote_script"
 }
 
 c0_orca_guest_listening() {
-    c0_orca_ssh "nc -z -w 1 127.0.0.1 ${C0DEV_ORCA_GUEST_PORT}" >/dev/null 2>&1
+    c0_orca_ssh "nc -z -w 1 127.0.0.1 ${C0DEV_ORCA_GUEST_PORT}" none >/dev/null 2>&1
 }
 
 c0_orca_print_serve_output() {
@@ -1888,8 +1880,6 @@ cmd_orca_status() {
 cmd_orca_start() {
     c0_ssh_ensure_keys
     c0_require_container_running || exit 1
-    c0_auth_env_load_exec_args
-    c0_auth_env_export_for_sendenv
 
     local ip extra remote_script
     ip="$(get_c0_container_ip)"
@@ -1942,8 +1932,6 @@ EOF
 cmd_orca_stop() {
     c0_ssh_ensure_keys
     c0_require_container_running || exit 1
-    c0_auth_env_load_exec_args
-    c0_auth_env_export_for_sendenv
 
     local remote_script
     remote_script="$(cat <<EOF
@@ -1969,7 +1957,7 @@ exit 0
 EOF
 )"
 
-    c0_orca_ssh "$remote_script" || true
+    c0_orca_ssh "$remote_script" none || true
 
     local n=0
     while c0_orca_guest_listening; do
@@ -2414,103 +2402,6 @@ get_project_path() {
     fi
 }
 
-# Decode one bash-style exported value without evaluation.
-# Supports: "..." (bash-like \\ \" \$ \` only), '...' (literal), or unquoted (no metacharacters).
-c0_auth_env_decode_value() {
-    local raw="$1"
-    raw="${raw%$'\r'}"
-    local len=${#raw}
-    local first last
-    first="${raw:0:1}"
-    last="${raw:$((len - 1)):1}"
-    if (( len >= 2 )) && [[ "$first" == '"' && "$last" == '"' ]]; then
-        local inner="${raw:1:$((len - 2))}" out="" i=0
-        local c n
-        while (( i < ${#inner} )); do
-            c="${inner:i:1}"
-            if [[ "$c" == '\' ]] && (( i + 1 < ${#inner} )); then
-                n="${inner:$((i + 1)):1}"
-                case "$n" in
-                    \\|\"|\$|\`)
-                        out+="$n"
-                        i=$((i + 2))
-                        ;;
-                    *)
-                        # bash keeps the backslash for other escapes
-                        out+='\'
-                        i=$((i + 1))
-                        ;;
-                esac
-            else
-                out+="$c"
-                i=$((i + 1))
-            fi
-        done
-        printf '%s' "$out"
-        return 0
-    fi
-    if (( len >= 2 )) && [[ "$first" == "'" && "$last" == "'" ]]; then
-        local inner="${raw:1:$((len - 2))}"
-        if [[ "$inner" == *"'"* ]]; then
-            return 1
-        fi
-        printf '%s' "$inner"
-        return 0
-    fi
-    if [[ "$raw" =~ [[:space:]\$\`\;\&\|\<\>\(\)] ]]; then
-        return 1
-    fi
-    printf '%s' "$raw"
-}
-
-# Fill C0_AUTH_ENV_EXEC_ARGS (-e for docker exec) and parallel name/value arrays
-# for c0 ssh SendEnv. Parsed from auth/.env (never sourced into a script string).
-# Expected line form: export NAME="value" or NAME="value"
-c0_auth_env_load_exec_args() {
-    C0_AUTH_ENV_EXEC_ARGS=()
-    C0_AUTH_ENV_NAMES=()
-    C0_AUTH_ENV_VALUES=()
-    local file="$C0_AUTH_ENV_FILE"
-    [[ -f "$file" ]] || return 0
-    if [[ ! -r "$file" ]]; then
-        echo "warning: auth/.env exists but is not readable" >&2
-        return 0
-    fi
-
-    local line lineno=0 name raw value
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        lineno=$((lineno + 1))
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" == \#* ]] && continue
-
-        if [[ ! "$line" =~ ^(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-            echo "warning: auth/.env:${lineno}: skipped (expected: NAME=... or export NAME=...)" >&2
-            continue
-        fi
-        name="${BASH_REMATCH[2]}"
-        raw="${BASH_REMATCH[3]}"
-        if ! value="$(c0_auth_env_decode_value "$raw")"; then
-            echo "warning: auth/.env:${lineno}: skipped (unsafe or invalid value for ${name})" >&2
-            continue
-        fi
-        C0_AUTH_ENV_EXEC_ARGS+=(-e "${name}=${value}")
-        C0_AUTH_ENV_NAMES+=("$name")
-        C0_AUTH_ENV_VALUES+=("$value")
-    done <"$file"
-}
-
-# Put auth/.env values into this process environ so OpenSSH SendEnv can forward them.
-c0_auth_env_export_for_sendenv() {
-    local i
-    if [[ ${#C0_AUTH_ENV_NAMES[@]} -eq 0 ]]; then
-        return 0
-    fi
-    for i in "${!C0_AUTH_ENV_NAMES[@]}"; do
-        export "${C0_AUTH_ENV_NAMES[i]}=${C0_AUTH_ENV_VALUES[i]}"
-    done
-}
-
 # Host-only guard
 require_host() {
     if [[ "$IN_CONTAINER" == "true" ]]; then
@@ -2889,9 +2780,10 @@ cmd_start() {
     cid="$(get_c0_container_id_any)" || return 1
     if [[ -n "$cid" ]]; then
         for arg in "$@"; do
-            [[ "$arg" == --cap-drop-all ]] || { echo "error: unknown option: $arg" >&2; return 1; }
+            [[ "$arg" == --least-privilege ]] || { echo "error: unknown option: $arg" >&2; return 1; }
         done
         c0_validate_container_mounts "$cid" false true || return 1
+        c0_ssh_ensure_keys || return 1
         set_tools_id "$C0_CONTAINER_TOOLS_ID" || return 1
         state="$(get_c0_container_state "$cid")" || return 1
         name="$(docker inspect -f '{{.Name}}' "$cid")" || return 1
@@ -3047,8 +2939,8 @@ cmd_status() {
         echo -e "  🔒 ${YELLOW}${running_security}${NC} (${RED}${container_state}${NC})"
     else
         ensure_c0_security_resolved || true
-        configured_security="${C0_SECURITY:-permissive}"
-        echo -e "  🔒 ${YELLOW}${configured_security}${NC} (next start; default permissive)"
+        configured_security="${C0_SECURITY:-guest-admin}"
+        echo -e "  🔒 ${YELLOW}${configured_security}${NC} (next start; default guest-admin)"
     fi
     echo ""
 
@@ -3423,24 +3315,22 @@ c0_host_umask() {
 # Execute against the resolved ID, never Compose's independent service selector.
 c0_exec_shell() {
     local user="$1" login="$2" cid="$C0_RUNTIME_CID" project_path host_umask command
-    c0_auth_env_load_exec_args
     host_umask="$(c0_host_umask)" || return 1
     project_path="$(get_project_path)"
     command="umask $host_umask && "
     if [[ -n "$project_path" ]]; then
         command+="cd $(printf '%q' "$CONTAINER_DEV_HOME/projects/$project_path") && "
     fi
-    command+="exec bash$login"
-    local -a terminal=(-i)
-    local -a terminal_env=()
+    command+="exec /bin/bash$login"
+    local tty=0 term=""
     if [[ -t 0 && -t 1 ]]; then
-        terminal+=(-t)
-        [[ -z "${TERM:-}" ]] || terminal_env=(-e "TERM=$TERM")
+        tty=1
+        term="${TERM:-}"
         "$C0ROOT/bin/c0-terminfo" sync "$cid" || return 1
     fi
     print_web_port_mapping
     echo -e "🐚 Shell: ${CYAN}$cid${NC} (uid $user)"
-    docker exec "${terminal[@]}" -u "$user" "${C0_AUTH_ENV_EXEC_ARGS[@]}" "${terminal_env[@]}" "$cid" bash -c "$command"
+    c0_credentials docker "$C0_AUTH_ENV_FILE" "$cid" "$user" "$tty" "$term" /bin/bash -c "$command"
 }
 
 cmd_sh() {
@@ -3680,7 +3570,7 @@ EOF
 Usage: c0 {start|stop|restart|logs|status|tools|sh|root|ssh|orca|cp-term|build|clean|seccomp-upgrade|help}
 
 Commands:
-  start [--cap-drop-all]
+  start [--least-privilege]
                 Resume an existing instance, or create one using the built
                 image and selected tools when absent. Stop removes the runtime.
   stop          Stop and remove this runtime; retain bind mounts and volumes.
@@ -3693,9 +3583,9 @@ Commands:
   sh            Shell as dev user (uid 1000); loads auth/.env if present
   root          Shell as root (uid 0); loads auth/.env if present
   ssh [-Y] [command...] | ssh --keygen
-                SSH as dev (127.0.0.1). Each attach forwards auth/.env via SendEnv.
-                -Y enables trusted X11 forwarding; --keygen regenerates SSH keys.
-                sshd_config AcceptEnv * is written on c0 start (bind-mounted).
+                SSH as dev (127.0.0.1). Each attach restores literal auth/.env values in the guest.
+                -Y enables trusted X11 forwarding; --keygen prepares SSH keys.
+                Only the private environment envelope and locale are forwarded; client keys stay host-only.
   orca [start|stop|status]
                 Guest orca serve. Bare \`c0 orca\` is status, not start.
                 start backgrounds serve with --pairing-address <compose-ipv4>
@@ -3716,7 +3606,7 @@ Commands:
 
 Environment:
   C0_MODE       Set to 'dev' for dev mode (default: production)
-  C0_SECURITY   permissive (default) or cap-drop-all; overridden by start --cap-drop-all
+  C0_SECURITY   guest-admin (default) or least-privilege; overridden by start --least-privilege
   C0_SECCOMP_NOTIFY=0  Skip upstream seccomp "newer available" notices on build/start
   MOBY_PROFILES_GIT_URL  Override moby/profiles.git URL (default https://github.com/moby/profiles.git)
 
@@ -3730,11 +3620,11 @@ Notes:
   - Home OverlayFS mounts use a one-shot capability-scoped helper that joins only the container
     mount namespace, mounts read-only tool lowers over per-instance writable state, then exits
   - Runtime: cap_drop ALL then guest-admin caps (DAC_OVERRIDE, CHOWN, FOWNER); not host root
-  - permissive vs cap-drop-all: same caps; label only (Codex/Cursor strict mode)
+  - least-privilege drops all guest capabilities; guest-admin adds CHOWN, DAC_OVERRIDE, FOWNER
   - Moby seccomp updates: notices on build/start if upstream tag is newer; run seccomp-upgrade to apply
   - SSH agent: compose fragment binds OrbStack /run/host-services/ssh-auth.sock at the same
     guest path and sets SSH_AUTH_SOCK. Requires host \$SSH_AUTH_SOCK. C0_SSH_AGENT=0 disables.
-  - SSH login: host -> dev via 127.0.0.1:<port> (auto 2222-2322 -> guest:2222). Keys in auth/ssh/.
+  - SSH login: host -> dev via 127.0.0.1:<port> (auto 2222-2322 -> guest:2222). Server auth in auth/ssh/; host client keys in auth/ssh-client/.
     sshd runs as dev; loopback publish only. Override: C0DEV_SSH_PORT.
   - X11: c0 ssh -Y tunnels trusted X11 to the host DISPLAY; requires a running host X server.
   - Orca: c0 orca is status. c0 orca start backgrounds guest serve at
@@ -3742,9 +3632,9 @@ Notes:
     /home/dev/projects). No SSH -L and no host localhost port. Pairing,
     advertised, and web URLs are Orca's own stdout.
   - auth/.env (optional, gitignored): NAME="value" or export NAME="value" per line; host-only.
-    c0 sh / c0 root: docker exec -e. c0 ssh: on each attach, load into host c0 environ and
-    forward via OpenSSH SendEnv (values not on remote argv). auth/ssh/sshd_config (bind-mounted)
-    uses AcceptEnv *; c0 start writes that config before sshd launches.
+    c0 sh / c0 root: private pipe-backed env-file. c0 ssh: framed SendEnv envelope only.
+    Values never become transport argv or host control variables; a fixed guest bootstrap
+    restores the requested environment. auth/ssh-client is never mounted into the guest.
   - Tools: selected immutable snapshot at /tools/current:ro. Mutable caches (cargo
     registry, uv) live in host ./.cache/; c0 never purges them — remove manually if needed.
 EOF

@@ -29,7 +29,7 @@ elif args[0] == 'ps':
 elif args[0] == 'inspect':
     fmt = args[args.index('-f')+1] if '-f' in args else args[args.index('--format')+1]
     if 'c0dev.tools_hash' in fmt: print('a'*64)
-    elif 'c0dev.security_mode' in fmt: print('permissive')
+    elif 'c0dev.security_mode' in fmt: print('guest-admin')
     elif '.State.Status' in fmt: print(state)
     elif '.Name' in fmt: print('/test-runtime')
     elif '3000/tcp' in fmt: print('3001')
@@ -55,7 +55,7 @@ class Status(unittest.TestCase):
             env = dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'],
                        TEST_DOCKER_LOG=str(log), TEST_CONTAINER_STATE=state,
                        TEST_VOLUME_EXISTS='1' if volume else '0',
-                       C0_MODE='', C0_SECURITY='permissive', C0_SSH_AGENT='0')
+                       C0_MODE='', C0_SECURITY='guest-admin', C0_SSH_AGENT='0')
             args = ['/bin/bash', str(C0)] + ([command] if command else [])
             result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)

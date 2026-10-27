@@ -86,8 +86,8 @@ TOOLS_PREFIX=/tools/current
 VOLUMES_FOLDERS_FILE="$TEST_ROOT/volumes-folders.yaml"
 VOLUMES_FILES_FILE="$TEST_ROOT/volumes-files.yaml"
 COMPOSE_PUBLIC_FILE="$TEST_ROOT/docker-compose.public.yaml"
-COMPOSE_SECURITY_PERMISSIVE="$TEST_ROOT/security-permissive.yaml"
-COMPOSE_SECURITY_CAP_DROP_ALL="$TEST_ROOT/security-cap-drop-all.yaml"
+COMPOSE_SECURITY_GUEST_ADMIN="$TEST_ROOT/security-guest-admin.yaml"
+COMPOSE_SECURITY_LEAST_PRIVILEGE="$TEST_ROOT/security-least-privilege.yaml"
 COMPOSE_SSH_AUTH_FILE="$TEST_ROOT/ssh-fragment.yaml"
 IN_CONTAINER=false
 C0_MODE=""
@@ -164,8 +164,8 @@ cmd_build "$@"
             self.assertEqual(build[build.index('-p')+1], 'c0dev-build-prod-'+'b'*64)
             self.assertIn('--pull', build)
             self.assertTrue(any(arg.endswith('/runtime-image.yaml') for arg in build))
-            self.assertNotIn(str(root/'security-permissive.yaml'), build)
-            self.assertNotIn(str(root/'security-cap-drop-all.yaml'), build)
+            self.assertNotIn(str(root/'security-guest-admin.yaml'), build)
+            self.assertNotIn(str(root/'security-least-privilege.yaml'), build)
             self.assertNotIn(str(fragment), build)
             published = [call for call in calls if call[:2] == ['image', 'tag'] and call[-1].startswith('c0dev-runtime-')]
             if result.returncode == 0:
@@ -226,7 +226,7 @@ cmd_build "$@"
         self.assertNotIn('Build complete', result.stdout)
 
     def test_runtime_environment_does_not_gate_image_construction(self):
-        for security in ('seccomp', 'cap-drop-all', 'permissive'):
+        for security in ('seccomp', 'least-privilege', 'guest-admin'):
             with self.subTest(security=security):
                 result, _ = self.build(security=security, existing=False)
                 self.assertEqual(result.returncode, 0, result.stderr)

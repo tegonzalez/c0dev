@@ -1,0 +1,10 @@
+# Least-privilege runtime: drop all capabilities, retain the shared seccomp and NNP policy.
+# Docker privileged mode remains disabled.
+services:
+  c0dev:
+    privileged: false
+    security_opt:
+      - seccomp:seccomp/moby-default-seccomp.json
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

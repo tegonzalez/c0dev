@@ -38,4 +38,4 @@ services:
       c0dev.build: ${C0_BUILD_ID:-legacy}
       c0dev.recipe: ${C0_RECIPE_ID}
       c0dev.mode: ${C0_MODE_KEY}
-      c0dev.security_mode: ${C0_SECURITY:-permissive}
+      c0dev.security_mode: ${C0_SECURITY:-guest-admin}

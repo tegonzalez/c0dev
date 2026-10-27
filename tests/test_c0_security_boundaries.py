@@ -12,6 +12,7 @@ from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from c0_fixture import synthetic_ssh_pair
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,6 +52,8 @@ class HostPaths(unittest.TestCase):
         self.workspace = self.root / 'checkout ; literal $ name'
         self.ssh = self.workspace / 'auth/ssh'
         self.ssh.mkdir(parents=True)
+        self.client = self.workspace / 'auth/ssh-client'
+        self.client.mkdir()
         self.log = self.workspace / '.local-rw/orca-serve.log'
         self.log.parent.mkdir()
         self.neighbor = self.root / 'unrelated-private-file'
@@ -57,7 +61,7 @@ class HostPaths(unittest.TestCase):
         self.neighbor.chmod(0o600)
         self.original = self.neighbor.read_bytes()
         self.env = dict(os.environ, C0ROOT=str(self.workspace), C0_HOST_IO=str(ROOT / 'bin/c0-host-io'),
-                        C0_SSH_DIR=str(self.ssh),
+                        C0_SSH_DIR=str(self.ssh), C0_SSH_CLIENT_DIR=str(self.client),
                         C0_ORCA_LOG_HOST=str(self.log), C0_SSH_AUTH_SOCK_PATH='/tmp/c0-agent.sock',
                         C0DEV_ORCA_GUEST_PORT='4555', CONTAINER_DEV_HOME='/home/dev',
                         C0_ORCA_LOG_GUEST='/home/dev/.local-rw/orca-serve.log',
@@ -123,7 +127,8 @@ sleep() { :; }
         result = self.call('c0_ssh_write_sshd_config')
         self.assertEqual(result.returncode, 0, result.stderr)
         content = (self.ssh / 'sshd_config').read_text()
-        for line in ('Port 2222', 'PasswordAuthentication no', 'AcceptEnv *',
+        for line in ('Port 2222', 'PasswordAuthentication no',
+                     'AcceptEnv C0_SESSION_ENV* LANG LC_*',
                      'SetEnv SSH_AUTH_SOCK=/tmp/c0-agent.sock'):
             self.assertIn(line + '\n', content)
         self.assertEqual((self.ssh / 'sshd_config').stat().st_mode & 0o777, 0o644)
@@ -131,17 +136,30 @@ sleep() { :; }
 
     def seed_existing_ssh_material(self):
         self.ssh.chmod(0o755)
-        material = {}
-        for name in ('id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key',
-                     'ssh_host_ed25519_key.pub', 'authorized_keys'):
-            content = 'synthetic existing ' + name + '\n'
-            (self.ssh / name).write_text(content)
-            (self.ssh / name).chmod(0o600)
-            material[name] = content
+        self.client.chmod(0o755)
+        # Derivation may validate the held signing identity; generation must
+        # still be refused for a retained pair. Key bytes are temporary fixtures.
+        real_keygen = shutil.which('ssh-keygen')
+        if not real_keygen:
+            self.skipTest('local ssh-keygen required for temporary fixture keys')
+        client_private, client_public = synthetic_ssh_pair('client')
+        server_private, server_public = synthetic_ssh_pair('server')
+        public = client_public.decode('ascii')
+        material = {
+            self.client / 'id_ed25519': client_private.decode('ascii'),
+            self.client / 'id_ed25519.pub': public,
+            self.ssh / 'ssh_host_ed25519_key': server_private.decode('ascii'),
+            self.ssh / 'ssh_host_ed25519_key.pub': server_public.decode('ascii'),
+            self.ssh / 'authorized_keys': '# retained unrelated comment\n'+public,
+        }
+        for path, content in material.items():
+            path.write_text(content)
+            path.chmod(0o600)
         peer_bin = self.root / 'ssh-peers'
         peer_bin.mkdir(exist_ok=True)
         (peer_bin / 'ssh-keygen').write_text(
-            '#!/bin/sh\necho unexpected-keygen >>"$TEST_TRACE"\nexit 91\n')
+            '#!/bin/sh\nif [ "$1" = -y ]; then exec '+shlex.quote(real_keygen)+' "$@"; fi\n'
+            'echo unexpected-keygen >>"$TEST_TRACE"\nexit 91\n')
         (peer_bin / 'ssh-keygen').chmod(0o755)
         self.env['PATH'] = str(peer_bin) + os.pathsep + os.environ['PATH']
         return material
@@ -150,8 +168,9 @@ sleep() { :; }
         material = self.seed_existing_ssh_material()
         result = self.call('c0_ssh_keygen')
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name, content in material.items():
-            self.assertEqual((self.ssh / name).read_text(), content)
+        for path, content in material.items():
+            self.assertEqual(path.read_text(), content)
+        self.assertFalse((self.ssh / 'id_ed25519').exists())
         self.assertFalse((self.root / 'trace').exists())
         self.preserved(result)
 
@@ -160,22 +179,26 @@ sleep() { :; }
             self.skipTest('local ssh-keygen required for temporary fixture keys')
         result = self.call('c0_ssh_keygen')
         self.assertEqual(result.returncode, 0, result.stderr)
-        names = ('id_ed25519', 'id_ed25519.pub', 'ssh_host_ed25519_key',
-                 'ssh_host_ed25519_key.pub', 'authorized_keys')
+        paths = {'id_ed25519': self.client / 'id_ed25519',
+                 'id_ed25519.pub': self.client / 'id_ed25519.pub',
+                 'ssh_host_ed25519_key': self.ssh / 'ssh_host_ed25519_key',
+                 'ssh_host_ed25519_key.pub': self.ssh / 'ssh_host_ed25519_key.pub',
+                 'authorized_keys': self.ssh / 'authorized_keys'}
         digests = {}
-        for name in names:
-            path = self.ssh / name
+        for name, path in paths.items():
             self.assertTrue(path.is_file())
             self.assertGreater(path.stat().st_size, 0)
             digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         self.assertEqual(digests['authorized_keys'], digests['id_ed25519.pub'])
+        self.assertFalse((self.ssh / 'id_ed25519').exists())
         self.assertEqual(self.ssh.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.client.stat().st_mode & 0o777, 0o700)
         for name in ('id_ed25519', 'ssh_host_ed25519_key', 'authorized_keys'):
-            self.assertEqual((self.ssh / name).stat().st_mode & 0o777, 0o600)
+            self.assertEqual(paths[name].stat().st_mode & 0o777, 0o600)
         repeated = self.call('c0_ssh_keygen')
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         for name, digest in digests.items():
-            self.assertEqual(hashlib.sha256((self.ssh / name).read_bytes()).hexdigest(), digest)
+            self.assertEqual(hashlib.sha256(paths[name].read_bytes()).hexdigest(), digest)
         self.preserved(result)
         self.preserved(repeated)
 
@@ -185,8 +208,11 @@ sleep() { :; }
                 with self.subTest(name=name, kind=kind):
                     self.seed_existing_ssh_material()
                     if name == 'id_ed25519.pub':
-                        # Exercise the real missing-authorization copy path:
-                        # redirected public material must never populate it.
+                        # Legacy guest public material is still a refused input
+                        # when redirected, before private-key derivation or any
+                        # generation can run. The inert peer records either.
+                        (self.ssh / 'id_ed25519').write_text('synthetic legacy private\n')
+                        (self.ssh / 'id_ed25519.pub').write_text('synthetic legacy public\n')
                         (self.ssh / 'authorized_keys').write_text('')
                     target = self.ssh / name
                     target.unlink()
@@ -204,6 +230,8 @@ sleep() { :; }
                         self.preserved(result)
                     finally:
                         self.cleanup_redirect(target, redirected)
+                        if name == 'id_ed25519.pub':
+                            (self.ssh / 'id_ed25519').unlink(missing_ok=True)
 
     def test_config_redirect_cannot_overwrite_neighbor(self):
         for kind in ('leaf', 'ancestor', 'hardlink'):

@@ -1,4 +1,5 @@
-# Default runtime: drop host-relevant caps; restore guest-admin caps for c0 root / apt.
+# Guest-admin runtime: allow guest administration with a narrow capability set.
+# Docker privileged mode remains disabled.
 # Moby seccomp + no-new-privileges. sshd on 2222 as dev (no setuid).
 services:
   c0dev:

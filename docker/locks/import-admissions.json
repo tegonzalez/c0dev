@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "purpose": "Separately approved exact imported inputs and bounded verification strategies. Approval applies only to the identities and scopes recorded here.",
+  "admissions": [
+    {
+      "id": "key-1password",
+      "status": "approved",
+      "path": "docker/1password.asc",
+      "sha256": "f39e7dd9dedc581ced85732832f217e0de5860a3b80279b5af4bc7c6d8157bae",
+      "primary_fingerprint": "3FEF9748469ADBE15DA7CA80AC2D62742012EA22",
+      "publisher_url": "https://downloads.1password.com/linux/keys/1password.asc",
+      "evidence": "Retrieved publisher bytes exactly equal checked-in bytes; retained repository signature verifies under this candidate key.",
+      "strategy": "Admit only this exact file/fingerprint for signed-by verification of the named 1Password APT repository; refuse other bytes or scope.",
+      "approval": {
+        "authority": "user",
+        "date": "2026-10-28",
+        "scope": "Exact file, identity and bounded verification strategy in this entry; separately approved from lock choices."
+      }
+    },
+    {
+      "id": "key-google",
+      "status": "approved",
+      "path": "docker/cloud.google.gpg",
+      "sha256": "a22e1a7885381e4005b61884a5205892c39d15f5c262555e38b4fe5402ca8895",
+      "primary_fingerprint": "35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3",
+      "publisher_url": "https://packages.cloud.google.com/apt/doc/apt-key.gpg",
+      "evidence": "Dearmored publisher bytes exactly equal checked-in keyring; retained repository signature verifies under this candidate key.",
+      "strategy": "Admit only this exact file/fingerprint for signed-by verification of cloud-sdk metadata. No SDK installation is added.",
+      "approval": {
+        "authority": "user",
+        "date": "2026-10-28",
+        "scope": "Exact file, identity and bounded verification strategy in this entry; separately approved from lock choices."
+      }
+    },
+    {
+      "id": "system-python-transform",
+      "status": "approved",
+      "path": "docker/c0-security.py",
+      "sha256": "5b79048071ae0c40da1b86ac0a7906282d13abb8a31f465c330e0ae4f6a63e61",
+      "upstream_url": "https://github.com/python/cpython/commit/7a6bbf8ceb64aa4ffd12243f8ffbf0aad43e584b",
+      "input_package": {
+        "name": "libpython3.13-stdlib",
+        "version": "3.13.5-2+deb13u5",
+        "sha256": "d1178d24e4d143cc6c577d9dc0f26dd982efccc2e600d25ce86361f168a22be0"
+      },
+      "input_path": "/usr/lib/python3.13/tarfile.py",
+      "input_sha256": "3bc638fc12b52be6eb4ca1931b36f8c7ad9b4765233445b8fdd1183373362527",
+      "output_sha256": "73cf1fe0f6aefb976d725d62e8cebfc6810a364f6bd47a3a1baa73856f909a9e",
+      "evidence": "Static literal insertion into the verified native package module produces the exact observed runtime module digest. Neither helper nor candidate module was executed during this research.",
+      "strategy": "Admit the exact helper/known package input and expected output only, retain ordinary/destination-link behavior checks, and refuse unknown inputs or output mismatch.",
+      "approval": {
+        "authority": "user",
+        "date": "2026-10-28",
+        "scope": "Exact file, identity and bounded verification strategy in this entry; separately approved from lock choices."
+      }
+    }
+  ],
+  "unresolved_release_inputs": [
+    {
+      "id": "cursor",
+      "status": "publisher-evidence-missing",
+      "version": "2026.10.22-27dcf5f",
+      "url": "https://downloads.cursor.com/lab/2026.10.22-27dcf5f/linux/arm64/agent-cli-package.tar.gz",
+      "observed_sha256": "22a36df9720830668ccd4d707e5190204ab9c8a0efb2f068cc914895f804d3ec",
+      "observed_size": 182799294,
+      "observed_digest_is_not_trusted": true,
+      "evidence_limit": "Documented curl transport retrieves the archive. No published SHA-256 was established in inspected installer/docs, candidate sidecar or response headers; sidecar returns HTTP 403.",
+      "recommended_strategy": "Obtain publisher confirmation/checksum for these exact bytes, then compare and admit that expected digest. A different first-acquisition trust strategy requires explicit separate human definition and approval; none is inferred.",
+      "current_capability": "Cursor remains in the required tool set and its existing installed payload is untouched."
+    }
+  ]
+}

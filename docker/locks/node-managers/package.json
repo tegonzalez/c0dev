@@ -1,0 +1,9 @@
+{
+  "name": "c0dev-node-managers",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "npm": "12.2.1",
+    "pnpm": "12.15.0"
+  }
+}

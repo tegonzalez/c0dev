@@ -1,0 +1,454 @@
+{
+  "schema": 1,
+  "platform": {
+    "os": "linux",
+    "architecture": "arm64",
+    "tool_abi": "aarch64-unknown-linux-gnu"
+  },
+  "images": {
+    "bun": {
+      "reference": "docker.io/oven/bun@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d",
+      "platform": "linux/arm64",
+      "version": "1.4.4"
+    },
+    "helper": {
+      "reference": "docker.io/library/alpine@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "platform": "linux/arm64"
+    }
+  },
+  "packages": {
+    "uv": {
+      "version": "0.13.6",
+      "artifact": "release:uv"
+    },
+    "fnm": {
+      "version": "1.39.0",
+      "artifact": "release:fnm"
+    },
+    "python": {
+      "version": "3.15.2",
+      "artifact": "release:python"
+    },
+    "node": {
+      "version": "22.23.4",
+      "artifact": "release:node"
+    },
+    "devin": {
+      "version": "3000.11.228",
+      "artifact": "release:devin"
+    },
+    "orca": {
+      "version": "1.4.239",
+      "artifact": "release:orca"
+    },
+    "rustup": {
+      "version": "1.29.2",
+      "artifact": "release:rustup"
+    },
+    "droid": {
+      "version": "0.250.0",
+      "artifact": "release:droid"
+    },
+    "@anthropic-ai/claude-code": {
+      "version": "2.1.311",
+      "native_lock": "docker/locks/bun-global/bun.lock"
+    },
+    "@kaitranntt/ccs": {
+      "version": "8.10.0",
+      "native_lock": "docker/locks/bun-global/bun.lock"
+    },
+    "@openai/codex": {
+      "version": "0.164.0",
+      "native_lock": "docker/locks/bun-global/bun.lock"
+    },
+    "opencode-ai": {
+      "version": "1.19.4",
+      "native_lock": "docker/locks/bun-global/bun.lock"
+    },
+    "npm": {
+      "version": "12.2.1",
+      "native_lock": "docker/locks/node-managers/package-lock.json"
+    },
+    "pnpm": {
+      "version": "12.15.0",
+      "native_lock": "docker/locks/node-managers/package-lock.json"
+    },
+    "semgrep": {
+      "version": "1.182.1",
+      "native_lock": "docker/locks/python/semgrep.requirements.txt",
+      "python": "3.15.2"
+    },
+    "pip": {
+      "version": "26.2.2",
+      "native_lock": "docker/locks/python/pip.requirements.txt"
+    },
+    "fd-find": {
+      "version": "10.5.0",
+      "artifact": "crate:fd-find",
+      "native_lock": "docker/locks/cargo/fd-find/Cargo.lock"
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "artifact": "crate:ripgrep",
+      "native_lock": "docker/locks/cargo/ripgrep/Cargo.lock"
+    },
+    "ast-grep": {
+      "version": "0.51.0",
+      "artifact": "crate:ast-grep",
+      "native_lock": "docker/locks/cargo/ast-grep/Cargo.lock"
+    },
+    "zellij": {
+      "version": "0.45.1",
+      "artifact": "crate:zellij",
+      "native_lock": "docker/locks/cargo/zellij/Cargo.lock",
+      "installation_mode": "cargo-install-locked-path-with-reviewed-lock"
+    },
+    "nu": {
+      "version": "0.116.1",
+      "artifact": "crate:nu",
+      "native_lock": "docker/locks/cargo/nu/Cargo.lock",
+      "installation_mode": "cargo-install-locked-path-with-reviewed-lock"
+    },
+    "cargo-cache": {
+      "version": "0.8.3",
+      "artifact": "crate:cargo-cache",
+      "native_lock": "docker/locks/cargo/cargo-cache/Cargo.lock"
+    },
+    "rust": {
+      "version": "1.99.1",
+      "native_manifest": "docker/locks/rust/channel-rust-1.99.1.toml",
+      "date": "2026-10-15",
+      "manifest_url": "https://static.rust-lang.org/dist/2026-10-15/channel-rust-stable.toml",
+      "manifest_sha256": "fb152be80975c194aa5fc684b2aec3a6e14e2b855efe2faa4e5f8ae6e590f463",
+      "publisher_evidence": "https://static.rust-lang.org/dist/2026-10-15/channel-rust-stable.toml.sha256",
+      "profile": "default",
+      "components": [
+        "clippy-preview-aarch64-unknown-linux-gnu",
+        "cargo-aarch64-unknown-linux-gnu",
+        "rust-docs-aarch64-unknown-linux-gnu",
+        "rust-std-aarch64-unknown-linux-gnu",
+        "rustfmt-preview-aarch64-unknown-linux-gnu",
+        "rustc-aarch64-unknown-linux-gnu",
+        "rust-std-wasm32-unknown-unknown"
+      ]
+    },
+    "1password-cli": {
+      "version": "2.41.1-1",
+      "native_lock": "docker/locks/apt/packages.lock.json",
+      "key_file": "key-1password"
+    },
+    "bun": {
+      "version": "1.4.4",
+      "image": "bun"
+    },
+    "cursor": {
+      "version": "2026.10.22-27dcf5f",
+      "pending_input": "cursor"
+    }
+  },
+  "artifacts": {
+    "release:uv": {
+      "version": "0.13.6",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.13.6/uv-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "229e194255c7958d86d56e8790d969a6f74736592133f0dfd0076f754c642c1d",
+      "size": 15794886,
+      "publisher_evidence": "https://github.com/astral-sh/uv/releases/download/0.13.6/uv-aarch64-unknown-linux-gnu.tar.gz.sha256",
+      "verification": "sha256"
+    },
+    "release:fnm": {
+      "version": "1.39.0",
+      "url": "https://github.com/Schniz/fnm/releases/download/v1.39.0/fnm-arm64.zip",
+      "sha256": "4eaff58b2c5bf30d0934027572dd0b5bbb60d2a1af309230b53662d4b1d45599",
+      "size": 3685524,
+      "publisher_evidence": "https://api.github.com/repos/Schniz/fnm/releases/tags/v1.39.0",
+      "verification": "sha256"
+    },
+    "release:python": {
+      "version": "3.15.2+20261026",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.15.2%2B20261026-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "0f23351c03b39beb880de668976074fcc3c082d9c3b03d0b43185632b2b270a0",
+      "size": 31775172,
+      "publisher_evidence": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/SHA256SUMS",
+      "verification": "sha256"
+    },
+    "release:node": {
+      "version": "22.23.4",
+      "url": "https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-arm64.tar.xz",
+      "sha256": "6287aa46b6c375d816e63ae66d024fbbfd70404825aabdfdf898a970871d2f4b",
+      "size": 30201396,
+      "publisher_evidence": "https://nodejs.org/dist/v22.23.4/SHASUMS256.txt",
+      "verification": "sha256"
+    },
+    "release:orca": {
+      "version": "1.4.239",
+      "url": "https://github.com/stablyai/orca/releases/download/v1.4.239/orca-ide_1.4.239_arm64.deb",
+      "sha256": "ecf5c891dd2a6275ec1e2a7d4ef60b4119f9a47c1dfa1ff3afd8f5c7bfab1965",
+      "size": 177505064,
+      "publisher_evidence": "https://api.github.com/repos/stablyai/orca/releases/tags/v1.4.239",
+      "verification": "sha256"
+    },
+    "release:devin": {
+      "version": "3000.11.228",
+      "url": "https://static.devin.ai/cli/3000.11.228/devin-3000.11.228-aarch64-unknown-linux.tar.gz",
+      "sha256": "d4df503f81e01ffdc37ef706ed1d3a0369d1b071f5a746de79e7895637beabf5",
+      "size": 68541155,
+      "publisher_evidence": "https://static.devin.ai/cli/3000.11.228/manifest.json",
+      "verification": "sha256"
+    },
+    "release:rustup": {
+      "version": "1.29.2",
+      "url": "https://static.rust-lang.org/rustup/archive/1.29.2/aarch64-unknown-linux-gnu/rustup-init",
+      "sha256": "a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697",
+      "publisher_evidence": "https://static.rust-lang.org/rustup/archive/1.29.2/aarch64-unknown-linux-gnu/rustup-init.sha256",
+      "verification": "sha256"
+    },
+    "release:droid": {
+      "version": "0.250.0",
+      "url": "https://downloads.factory.ai/factory-cli/releases/0.250.0/linux/arm64/droid",
+      "sha256": "d1e21b135f6a85634e10dc0a7cde91d31690a6a2b8125cdac66b7dbcaa150a4b",
+      "publisher_evidence": "https://downloads.factory.ai/factory-cli/releases/0.250.0/linux/arm64/droid.sha256",
+      "verification": "sha256"
+    },
+    "crate:fd-find": {
+      "version": "10.5.0",
+      "url": "https://static.crates.io/crates/fd-find/fd-find-10.5.0.crate",
+      "sha256": "f35becce49c551724fd26d9824ec01d6578868cecbcc4e3d060658f9f8ad1e4d",
+      "publisher_evidence": "https://crates.io/api/v1/crates/fd-find/10.5.0",
+      "native_lock": "docker/locks/cargo/fd-find/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    },
+    "crate:ripgrep": {
+      "version": "15.2.0",
+      "url": "https://static.crates.io/crates/ripgrep/ripgrep-15.2.0.crate",
+      "sha256": "a30750b6d0743bfdd2656ebbaf4555aa278c43144b84bc389bcbfa399485ec71",
+      "publisher_evidence": "https://crates.io/api/v1/crates/ripgrep/15.2.0",
+      "native_lock": "docker/locks/cargo/ripgrep/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    },
+    "crate:ast-grep": {
+      "version": "0.51.0",
+      "url": "https://static.crates.io/crates/ast-grep/ast-grep-0.51.0.crate",
+      "sha256": "8861bc525af00c832dfed16cf68b36895bb62b5ed47dc2b6bd862237059ef138",
+      "publisher_evidence": "https://crates.io/api/v1/crates/ast-grep/0.51.0",
+      "native_lock": "docker/locks/cargo/ast-grep/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    },
+    "crate:zellij": {
+      "version": "0.45.1",
+      "url": "https://static.crates.io/crates/zellij/zellij-0.45.1.crate",
+      "sha256": "1b94f6ee863a08e2cea2e66b79fa960d32e5b0049362e0f5aeef2088a5f88d82",
+      "publisher_evidence": "https://crates.io/api/v1/crates/zellij/0.45.1",
+      "native_lock": "docker/locks/cargo/zellij/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    },
+    "crate:nu": {
+      "version": "0.116.1",
+      "url": "https://static.crates.io/crates/nu/nu-0.116.1.crate",
+      "sha256": "62e21f2d6a14430ae2701a4e6f11be42d40a11204c204bef32a8b9879f79e767",
+      "publisher_evidence": "https://crates.io/api/v1/crates/nu/0.116.1",
+      "native_lock": "docker/locks/cargo/nu/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    },
+    "crate:cargo-cache": {
+      "version": "0.8.3",
+      "url": "https://static.crates.io/crates/cargo-cache/cargo-cache-0.8.3.crate",
+      "sha256": "dda8ccd9c073a39ccab7624ef6603b7bbf1bba22eb74921760b4379beacf2fc1",
+      "publisher_evidence": "https://crates.io/api/v1/crates/cargo-cache/0.8.3",
+      "native_lock": "docker/locks/cargo/cargo-cache/Cargo.lock",
+      "verification": "cargo-registry-sha256"
+    }
+  },
+  "native_inputs": [
+    {
+      "path": "docker/locks/bun-global/package.json",
+      "sha256": "8ad5ade51dad3c4155f5a0073e8629479bd6d970331f0de484be7c88a871f9c9",
+      "size": 184
+    },
+    {
+      "path": "docker/locks/bun-global/bun.lock",
+      "sha256": "3f11bd14d9e6f798293a6ec41b45db9c39034c79abb879d4dbd7d6e690ee2d6e",
+      "size": 44041
+    },
+    {
+      "path": "docker/locks/node-managers/package.json",
+      "sha256": "52d7b6513a71ada97e7d110779d9364d88255ece3e5780b409e1664a37e11a3d",
+      "size": 145
+    },
+    {
+      "path": "docker/locks/node-managers/package-lock.json",
+      "sha256": "fae186969cd0e526e37e99ed9e36f0c3b824eea6e3f3fd936d08338de1c46ae3",
+      "size": 55825
+    },
+    {
+      "path": "docker/locks/python/semgrep.requirements.txt",
+      "sha256": "33ab2da8c4ee84c2ee5d2a79a20b62b3611968d4d7d9ff2568328587dc1bfdf1",
+      "size": 16102
+    },
+    {
+      "path": "docker/locks/python/pip.requirements.txt",
+      "sha256": "9b7d54f52ade2a293ff48408b103773105c591df663911bfd37bb108a0d06a2b",
+      "size": 220
+    },
+    {
+      "path": "docker/locks/python/build.requirements.txt",
+      "sha256": "20b7562fbcda207777b2cc46751831f3636a9a408c499fb671edc64dc800d6b4",
+      "size": 688
+    },
+    {
+      "path": "docker/locks/python/distributions.lock.json",
+      "sha256": "3a5ddcf62cf4786d04642cda6594b52a260422f5547d764a83c38439417d65c9",
+      "size": 40093
+    },
+    {
+      "path": "docker/locks/cargo/fd-find/Cargo.lock",
+      "sha256": "8c22b09b075dd5b1a2016ec657ca9d47dec0215f04a6fa201dbd43dadf5247ea",
+      "size": 30885
+    },
+    {
+      "path": "docker/locks/cargo/ripgrep/Cargo.lock",
+      "sha256": "700162a1d3e2231f5a8b26aeea9dda305b063963473177265eb6b5ea6be17d23",
+      "size": 12689
+    },
+    {
+      "path": "docker/locks/cargo/ast-grep/Cargo.lock",
+      "sha256": "a80b562536bf115e419e0301545710e1d9fc02156e169f9559d7b6d854cd2494",
+      "size": 63077
+    },
+    {
+      "path": "docker/locks/cargo/zellij/Cargo.lock",
+      "sha256": "5c7dd3ed4cae720983f2c64f22361aef8eadbbb20b0ea97bd73ecdb6e02e3e3b",
+      "size": 115380
+    },
+    {
+      "path": "docker/locks/cargo/nu/Cargo.lock",
+      "sha256": "8b5ed1e71bc8ff95bcd619230e0cd750ef509198f33dd0cce5a54026a2d8beaa",
+      "size": 202458
+    },
+    {
+      "path": "docker/locks/cargo/cargo-cache/Cargo.lock",
+      "sha256": "7a565f473a53f0b643a1b78c13a266f58ad098ae9a56ab5fa29747ab68b2ddd3",
+      "size": 24952
+    },
+    {
+      "path": "docker/locks/rust/channel-rust-1.99.1.toml",
+      "sha256": "fb152be80975c194aa5fc684b2aec3a6e14e2b855efe2faa4e5f8ae6e590f463",
+      "size": 943486
+    },
+    {
+      "path": "docker/locks/apt/packages.lock.json",
+      "sha256": "71ed965954b62f7ee8dd0c0884edc3e8008eecb0004f00a7c986d32dcb8d1278",
+      "size": 302311
+    }
+  ],
+  "files": {
+    "key-1password": {
+      "path": "docker/1password.asc",
+      "sha256": "f39e7dd9dedc581ced85732832f217e0de5860a3b80279b5af4bc7c6d8157bae",
+      "primary_fingerprint": "3FEF9748469ADBE15DA7CA80AC2D62742012EA22",
+      "publisher_url": "https://downloads.1password.com/linux/keys/1password.asc",
+      "verification": "sha256",
+      "repository_scope": "1password"
+    },
+    "key-google": {
+      "path": "docker/cloud.google.gpg",
+      "sha256": "a22e1a7885381e4005b61884a5205892c39d15f5c262555e38b4fe5402ca8895",
+      "primary_fingerprint": "35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3",
+      "publisher_url": "https://packages.cloud.google.com/apt/doc/apt-key.gpg",
+      "verification": "sha256",
+      "repository_scope": "cloud-sdk"
+    },
+    "system-python-transform": {
+      "path": "docker/c0-security.py",
+      "sha256": "5b79048071ae0c40da1b86ac0a7906282d13abb8a31f465c330e0ae4f6a63e61",
+      "upstream_url": "https://github.com/python/cpython/commit/7a6bbf8ceb64aa4ffd12243f8ffbf0aad43e584b",
+      "input_package": {
+        "name": "libpython3.13-stdlib",
+        "version": "3.13.5-2+deb13u5",
+        "sha256": "d1178d24e4d143cc6c577d9dc0f26dd982efccc2e600d25ce86361f168a22be0"
+      },
+      "input_path": "/usr/lib/python3.13/tarfile.py",
+      "input_sha256": "3bc638fc12b52be6eb4ca1931b36f8c7ad9b4765233445b8fdd1183373362527",
+      "output_sha256": "73cf1fe0f6aefb976d725d62e8cebfc6810a364f6bd47a3a1baa73856f909a9e",
+      "verification": "sha256"
+    },
+    "moby-seccomp": {
+      "path": "docker/seccomp/moby-default-seccomp.json",
+      "sha256": "536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74",
+      "verification": "sha256",
+      "git_source": "moby-seccomp"
+    }
+  },
+  "git_sources": {
+    "moby-seccomp": {
+      "repository": "https://github.com/moby/profiles.git",
+      "commit": "836ae4d37ef2ec995c77c99fc55f5b5f3af3a897",
+      "path": "seccomp/default.json",
+      "file": "moby-seccomp"
+    }
+  },
+  "native_verification": {
+    "apt": {
+      "manager": "APT inherited from locked Bun image",
+      "package_set": "docker/locks/apt/packages.lock.json",
+      "signature_checks": true,
+      "locked_new_package_sha256_checks": true,
+      "inherited_package_contents": "covered by parent image/package",
+      "verification": "trusted archive OpenPGP signature -> SHA-256 package index -> SHA-256 deb",
+      "key_files": [
+        "key-1password",
+        "key-google"
+      ]
+    },
+    "assistant_packages": {
+      "manager": "Bun 1.4.4 from locked image",
+      "registry": "https://registry.npmjs.org",
+      "manifest": "docker/locks/bun-global/package.json",
+      "lockfile": "docker/locks/bun-global/bun.lock",
+      "mode": "frozen-lockfile",
+      "integrity_checks": true,
+      "external_hook_fetches": "require frozen verified native acquisition; no unfrozen npm fallback",
+      "integrity": "Bun native lock SHA-512 SRI"
+    },
+    "node_managers": {
+      "bootstrap": "npm 10.9.9 bundled inside verified Node 22.23.4 archive",
+      "registry": "https://registry.npmjs.org",
+      "manifest": "docker/locks/node-managers/package.json",
+      "lockfile": "docker/locks/node-managers/package-lock.json",
+      "mode": "npm-ci",
+      "audit": false,
+      "update_notifier": false,
+      "bundled_dependencies": "covered by parent package integrity",
+      "integrity": "npm native package-lock SHA-512 SRI"
+    },
+    "python": {
+      "manager_component": "uv",
+      "index": "https://pypi.org/simple",
+      "mode": "require-hashes",
+      "implicit_python_downloads": false,
+      "runtime_requirements": "docker/locks/python/semgrep.requirements.txt",
+      "pip_requirements": "docker/locks/python/pip.requirements.txt",
+      "source_build_requirements": "docker/locks/python/build.requirements.txt",
+      "source_build": "pre-acquire frozen build requirements with enforced SHA-256 values; separately fetched build inputs require a verified route"
+    },
+    "cargo": {
+      "manager": "Cargo provided by locked Rust distribution",
+      "registry": "crates.io",
+      "mode": "exact root version with packaged or reviewed native Cargo.lock; frozen path installation for refreshed locks",
+      "new_external_build_script_fetches": "require frozen native or explicit signature-file binding before use",
+      "integrity": "Cargo native registry SHA-256"
+    },
+    "rustup": {
+      "manager_component": "rustup",
+      "channel_manifest": "docker/locks/rust/channel-rust-1.99.1.toml",
+      "mode": "exact numbered/dated toolchain and components using the SHA-256-bound native manifest and its component SHA-256 values"
+    }
+  },
+  "pending_inputs": [
+    {
+      "id": "cursor",
+      "version": "2026.10.22-27dcf5f",
+      "url": "https://downloads.cursor.com/lab/2026.10.22-27dcf5f/linux/arm64/agent-cli-package.tar.gz",
+      "missing": "Publisher-established expected SHA-256 digest or separately admitted alternative verification strategy."
+    }
+  ]
+}

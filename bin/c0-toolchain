@@ -212,14 +212,14 @@ def _latest_node(data):
 
 
 def python_download(source, selected):
-    """Validate the exact official standard Linux arm64 asset and checksum."""
+    """Validate asset identity and SHA-256 digest; publisher authentication is separate."""
     match = re.fullmatch(
         r'https://github\.com/astral-sh/python-build-standalone/releases/download/'
         r'(?P<build>[0-9]{8})/cpython-(?P<version>3\.15\.[0-9]+)%2B(?P=build)'
         r'-aarch64-unknown-linux-gnu-install_only_stripped\.tar\.gz'
         r'#sha256=(?P<sha256>[0-9a-f]{64})', source) if isinstance(source, str) else None
     if match is None or match['version'] != selected:
-        raise ResolutionError('python: missing trusted download URL or checksum for selected release')
+        raise ResolutionError('python: missing asset URL or SHA-256 digest for selected release')
     return source.split('#', 1)[0], match['sha256'], match['build']
 
 
@@ -253,7 +253,7 @@ def _latest_python(data, downloads):
         location = assets[0].get('browser_download_url')
         digest = assets[0].get('digest')
         if not isinstance(digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or not isinstance(location, str):
-            raise ResolutionError('python: missing trusted download URL or checksum')
+            raise ResolutionError('python: missing asset URL or SHA-256 digest')
         source = location + '#sha256=' + digest[len('sha256:'):]
         _, _, source_build = python_download(source, candidate)
         if source_build != build:

@@ -20,13 +20,13 @@ Run `bash ./env.sh c0 help` for available commands and options; implementations 
 
 ## Features
 
-| Feature              | Purpose                                                                                     |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| Reproducible guest   | Build a Linux development container with assistant CLIs and toolchains.                     |
-| Persistent workspace | Keep configured credentials, caches, projects, and user state on host mounts.               |
-| Workspace runtime    | Isolate containers by build and working folder while sharing build artifacts.               |
-| Staged tool updates  | Inspect tool changes, accept them as immutable snapshots, or restore the selected snapshot. |
-| Runtime restrictions | Apply capability limits, no-new-privileges, and the vendored Moby seccomp profile.          |
+| Feature              | Purpose                                                                                                                            |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Reproducible guest   | Build a Linux development container with assistant CLIs and toolchains; complete locked input verification is not yet implemented. |
+| Persistent workspace | Keep configured credentials, caches, projects, and user state on host mounts.                                                      |
+| Workspace runtime    | Isolate containers by build and working folder while sharing build artifacts.                                                      |
+| Staged tool updates  | Inspect tool changes, accept them as immutable snapshots, or restore the selected snapshot.                                        |
+| Runtime restrictions | Apply capability limits, no-new-privileges, and the vendored Moby seccomp profile.                                                 |
 
 ### Command-oriented architecture
 
@@ -355,27 +355,30 @@ Canonical executables and resources come from the selected read-only tools snaps
 
 ## Build pipeline
 
-On `c0 build`:
+The [documentation index](docs/index.md) routes the locked-construction requirements, acquisition design, and current verification limits. The pipeline below describes the intended locked baseline; the current launcher and Dockerfiles still use live release/dependency selection and do not yet enforce it.
+
+In the locked baseline, `c0 build`:
 
 1. Validates the declared host mount paths.
-1. Resolves current stable releases from official upstream metadata, keeping Node on 22 and Python on 3.15, and produces a canonical release manifest.
+1. Validates `docker/signatures.json` and its SHA-256-bound native inputs offline, then derives the canonical release manifest, keeping the supported Node 22 and Python 3.15 lines.
+1. Acquires exact locked inputs and verifies them before extraction, hooks, installation, or execution, using Docker, native package verification, the stored SHA-256 digest or the declared OpenPGP signature route.
 1. Derives path-independent recipe, build, and tools identities. Working-folder paths do not enter shared artifact identities.
 1. Builds or reuses the mode/build base image and mode-scoped tools payload. Tools extraction writes a completeness marker only after the payload is complete.
 1. Prepares the portable `xterm-256color` image definition. Caller terminal definitions are synchronized when attaching.
 1. Builds or reuses the mode/build runtime image. New images pass a networkless UID-1000 launch check before publication.
 1. Publishes the completed runtime image under its shared build tag and recipe alias. Docker image labels identify its build, mode, recipe, tools payload, and base image.
 
-Every `c0 build` resolves the latest stable Bun, uv, fnm, Node 22 patch, pip, and Semgrep. Python selects the newest published final 3.15 patch with an official Linux arm64 GNU standalone asset, at or above 3.15.2. Its exact download URL and SHA-256 are bound into the manifest; a scoped uv catalog installs that fixed artifact even when uv’s bundled catalog predates it. npm and pnpm select the newest stable versions compatible with the selected Node 22 release. Prereleases, releases below the security floors, malformed metadata, and upstream lookup failures stop the build; failed builds leave the previously published shared runtime image intact.
+Ordinary and forced builds consume the same reviewed set. They do not discover releases, consult vulnerability data, or adjust versions. Missing or mismatched input evidence stops dependent candidate construction and leaves previously published artifacts intact. The [input signature file](docker/signatures.json) is the single construction-input authority for base/helper images, APT state, installer payloads, subordinate native package locks, Rust selections and every shipped tool. `c0 build`, Dockerfiles and acquisition scripts must use it before consuming fetched data. Contents already inside a verified image/package/archive inherit its trust. Newly fetched inputs require their own supported verification; a final-version check alone does not supply it.
 
-The canonical manifest and Dockerfile recipe determine shared artifact identities. A new resolved release changes the build and tools identities even when the Dockerfiles are unchanged. Identical mode/recipe/release inputs in different working folders reuse the same completed tools, base, and runtime artifacts. Containers add the working-folder identity. A running container keeps its fixed image and tools mount until stopped; the next start uses the current published shared image. The exact versions are passed to both image builds and verified during installation; the manifest is retained in `/tools/current/.c0dev-toolchain.json` and `/tools/current/.local/share/c0/toolchain.json` for inspection.
+The complete signature file, canonical manifest, and verification-relevant Docker recipes determine new shared artifact identities. Identical mode/recipe/signature inputs in different working folders reuse the same completed artifacts. Containers add the working-folder identity. A running container keeps its fixed image and tools mount until stopped; the next start uses the current published shared image. The toolchain manifest remains available in `/tools/current/.c0dev-toolchain.json` and `/tools/current/.local/share/c0/toolchain.json`. Retained manifests remain validatable offline for stage and cache handling; recognition is not new pre-use verification proof.
 
-`c0 build -f` bypasses completed-artifact reuse, pulls the selected base, and bypasses Docker layer caching. Image builds that are needed use `--pull`. This release resolver is not a CVE scanner: same-version distro package changes, independently vendored application runtimes, Rust transitive changes, and existing project environments still need their own security review or a forced rebuild.
+`c0 build -f` bypasses completed-artifact reuse and Docker layer caching while retaining exact locked input identities. Acquiring a missing locked artifact remains permitted; fetching it cannot authorize replacement content. Version suitability research and update proposals stay outside this repository. Only a separately reviewed signature-file change alters what a later build installs.
 
-Normal `c0 sh` and `c0 ssh` select the mounted snapshot's Node/Python, package-manager and uv defaults, even when a persistent home overlay contains older generic launchers or fnm defaults. Selection uses private cache shims without deleting staged files or rewriting custom fnm aliases. Node/Python versions remain available for explicit per-session selection. Login, status, start, and SSH do not resolve toolchain releases or install tools; `c0 build` resolves toolchain releases.
+Normal `c0 sh` and `c0 ssh` select the mounted snapshot's Node/Python, package-manager and uv defaults, even when a persistent home overlay contains older generic launchers or fnm defaults. Selection uses private cache shims without deleting staged files or rewriting custom fnm aliases. Node/Python versions remain available for explicit per-session selection. Login, status, start, and SSH do not resolve toolchain releases or install tools. Deliberate native runtime updates do not change the reviewed construction signature file.
 
-Debian's `/usr/bin/python3` remains available for system-package shebangs and dependencies; replacing or removing it would break those consumers. Image construction backports the destination-link rejection in its `tarfile.tar_filter` and rechecks it after runtime package installation. Existing project virtual environments keep their own interpreter and packages. Pip is resolved independently of Python, so a pip security release can refresh the tools snapshot without a CPython release. CPython's embedded `ensurepip` wheel remains the vendor-supplied wheel and is checked against the certificate-security floor rather than rewritten.
+Debian's `/usr/bin/python3` remains available for system-package shebangs and dependencies; replacing or removing it would break those consumers. The system-Python transformation is bound to its exact helper, known package input and expected output through the signature file; the current recipe does not yet enforce those recorded input/output identities. Existing project virtual environments keep their own interpreter and packages. Managed pip and Python have separate exact identities in the signature file. CPython's bundled `ensurepip` inherits the verified Python archive's trust.
 
-The base upgrades inherited Debian packages, requires the eMudhra fixed CA package, and checks that the affected root and cross-sign trust paths are absent. Bun, Node, uv and Electron use their corresponding patched releases; the reviewed Orca package is 1.4.239 with Electron 43.8.1. Zellij and Nushell resolve updated compatible Rust dependencies, and build checks inspect their actual compiled certificate-verifier/root-store versions. Guest activation supplies system trust defaults for Python/OpenSSL, Requests and uv, including SSH sessions. Explicit application trust overrides and old virtual environments still need their own review.
+The locked baseline trusts image contents through Docker's recorded OCI digest, package contents through trusted native tools, and direct downloads through stored publisher-confirmed SHA-256 digests. APT follows trusted archive keys → signed release metadata → SHA-256 package indexes → SHA-256 `.deb` files; package contents inherit that chain. Frozen selection and actual pre-use verification are separate checks. Native locks keep newly fetched package selections fixed; SHA-512 remains only where a native package solution uses that integrity format. Guest activation retains system trust defaults for Python/OpenSSL, Requests and uv, including SSH sessions. Explicit application trust overrides and old virtual environments still need their own review. Input integrity and functional success do not establish release-security clearance.
 
 Existing writable tool overlays survive a rebuild. Review `c0 tools --detail` to inspect native changes; there is no need to discard the complete stage to pick up newly built default toolchains.
 
@@ -437,7 +440,7 @@ Runtime containers are **not Docker privileged** in either policy. `C0_SECURITY`
 | Privileged           | `false`                                                                                           |
 | Capabilities         | `cap_drop: ALL`, then add `DAC_OVERRIDE`, `CHOWN`, `FOWNER`                                       |
 | Privilege escalation | `no-new-privileges:true`                                                                          |
-| Syscalls             | Moby default seccomp profile (vendored under `docker/seccomp/`, checksum-verified at start/build) |
+| Syscalls             | Moby default seccomp profile (vendored under `docker/seccomp/`, SHA-256 verified at start/build)  |
 
 `DAC_OVERRIDE`, `CHOWN`, and `FOWNER` support `c0 root` and package installs inside the guest without running `sshd` setuid or granting broad Linux capabilities. They are **guest-admin helpers**, not host-root equivalents. The UID 1000 `c0 sh` process does not receive them as effective capabilities; it runs under the same seccomp and no-new-privileges policy.
 
@@ -466,7 +469,7 @@ Native upgrades run inside the existing restricted runtime and can write only it
 | Capability + seccomp baseline | Drops Linux caps and restricts syscalls vs a bare host shell              |
 | Immutable `/tools`            | Reduces in-session tampering of prebuilt CLIs                             |
 | Scoped networking defaults    | Web and SSH ports are explicit; SSH is loopback-only                      |
-| Reproducible toolchain        | Same Rust, uv, and assistant CLIs across machines and rebuilds            |
+| Selected payload identity     | Retained immutable payloads keep their exact prebuilt content             |
 
 **Residual agent authority (by design)**
 

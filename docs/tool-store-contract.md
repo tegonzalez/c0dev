@@ -11,17 +11,18 @@ doc-graph: "When there is an intention to amend this document, first Adhere to [
 
 ## Purpose
 
-Fix the immutable tools-storage, identity, selection, stage, publication, restoration, and collection seam owned by the tools-store module in [design](design.md#module-inventory). This contract describes the current Docker-derived selection model; it does not create a package manager or a persistent checkout selector.
+Fix the immutable tools-storage, identity, selection, stage, publication, restoration, and collection seam owned by the tools-store module in [design](design.md#module-inventory). The locked construction identity and transition below govern the intended build baseline; their enforcement is not yet realized. Retained identities and Docker-derived runtime selection remain current storage contracts. This contract does not create a package manager or a persistent checkout selector.
 
 ## Terminology
 
-| Term                | Meaning                                                                                 |
-| ------------------- | --------------------------------------------------------------------------------------- |
-| Tools recipe        | Base/tools Docker recipe identity bound to the exact security-helper bytes.             |
-| Release manifest    | Canonical resolved toolchain JSON captured for a build.                                 |
-| Complete payload    | Tools directory with its completeness marker written after payload and provenance.      |
-| Published reference | Docker image labels binding mode, recipe, runtime build, tools payload, and base image. |
-| Tools stage         | Configured tool-home upper and work directories; launcher upper is separate.            |
+| Term                 | Meaning                                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------- |
+| Tools recipe         | Base/tools Docker recipe identity bound to the exact security-helper bytes.                        |
+| Release manifest     | Canonical toolchain JSON derived from the input signature file, or retained legacy build metadata. |
+| Input signature file | `docker/signatures.json`, the single construction-input authority described by the specification.  |
+| Complete payload     | Tools directory with its completeness marker written after payload and provenance.                 |
+| Published reference  | Docker image labels binding mode, recipe, runtime build, tools payload, and base image.            |
+| Tools stage          | Configured tool-home upper and work directories; launcher upper is separate.                       |
 
 ## Store Grammar
 
@@ -39,7 +40,7 @@ Fix the immutable tools-storage, identity, selection, stage, publication, restor
   tmp/<tools-id>.next
 ```
 
-`tools-id` is exactly 64 lowercase hexadecimal digits. A marker establishes completion, not authenticity or vulnerability clearance. Build reuse additionally requires valid provenance matching the resolved recipe and release manifest. Accepted payloads retain their parent and stage digest. Legacy and unknown content remains subject to conservative retention.
+`tools-id` is exactly 64 lowercase hexadecimal digits. A marker establishes completion, not pre-use signature verification or vulnerability clearance. New build reuse additionally requires valid provenance matching the recipe, complete input-signature-file SHA-256 digest, and derived release manifest. Accepted payloads retain their parent and stage digest. Legacy and unknown content remains subject to conservative retention; existing store entries need no in-place migration.
 
 There is no persistent `pins/` or `state/` selector directory. The runtime receives only `opt/<tools-id>` at `/tools/current:ro`; other payloads and store metadata are absent from its mount view.
 
@@ -51,13 +52,22 @@ Let `docker-recipe-sha256` be the existing logical-name/content hash of `Dockerf
 tools-recipe-id = sha256("c0-tools-recipe-v2\n" + docker-recipe-sha256 + "\n" + security-helper-sha256 + "\n")
 ```
 
-Let `manifest-sha256` be SHA-256 of the exact canonical release-manifest bytes. Schema 1 retains its nine version and source keys; its Python source is the exact official standalone asset URL followed by `#sha256=` and 64 lowercase hexadecimal checksum digits. The build tools identity is:
+Let `manifest-sha256` be SHA-256 of the exact canonical release-manifest bytes. Schema 1 retains its nine version and source keys; its Python source is the exact official standalone asset URL followed by `#sha256=` and 64 lowercase hexadecimal SHA-256 digest digits. A tracked offline validator must preserve validation of this shape without release discovery, changing version floors, or requiring the current signature file. The legacy build tools identity remains:
 
 ```text
 sha256("c0-toolchain-build-v1\n" + tools-recipe-id + "\n" + manifest-sha256 + "\n")
 ```
 
-The runtime recipe also includes its runtime Dockerfile and copied build inputs; its build identity is distinct from the tools identity. Absolute working-folder paths do not participate in shared recipe/build identity. Mode partitions published artifacts and storage; mode/build/real-working-folder identifies a runtime, and mode/real-working-folder identifies persistent workspace storage.
+For locked construction, let `lock-sha256` be SHA-256 of the exact UTF-8 bytes of validated, source-managed `docker/signatures.json`. The identity variable `lock-sha256` names that one file's SHA-256 digest. Formatting changes therefore invalidate reuse. Let `locked-tools-recipe-id` and `locked-runtime-recipe-id` bind each image's complete Docker recipe and copied construction inputs, including loader/verifier code, native dependency locks and admitted imported keyrings or transformations. The input signature file binds those subordinate inputs by SHA-256; they supply no alternative construction authority. The runtime recipe retains its dependency on the tools recipe, and its identity additionally binds `locked-tools-id` so a tools change cannot reuse a runtime naming an older payload. New identities are:
+
+```text
+locked-tools-id = sha256("c0-tools-locked-v1\n" + locked-tools-recipe-id + "\n" + lock-sha256 + "\n" + manifest-sha256 + "\n")
+locked-runtime-id = sha256("c0-runtime-locked-v1\n" + locked-runtime-recipe-id + "\n" + locked-tools-id + "\n" + lock-sha256 + "\n" + manifest-sha256 + "\n")
+```
+
+The copied input signature file occupies `/home/dev/.local/share/c0/signatures.json` in constructed tools content, so it is retained beneath the existing `.local/` root. Signature-bound cache validation checks its digest and the derived manifest before reuse. Offline recognition of a legacy identity grants no new integrity claim and never converts its payload in place. Accepted children retain their parent's construction signature file as lineage; native staged changes remain captured-stage evidence rather than source-verified construction inputs.
+
+The runtime recipe includes its runtime Dockerfile and copied build inputs; its build identity is distinct from the tools identity. Absolute working-folder paths do not participate in shared recipe/build identity. Mode partitions published artifacts and storage; mode/build/real-working-folder identifies a runtime, and mode/real-working-folder identifies persistent workspace storage.
 
 For acceptance, hash the ordered archive-digest stream to obtain `stage-sha256`; the payload identity is:
 
@@ -131,7 +141,9 @@ Current restore starts from the mounted tools identity. When its initial recipe-
 
 ## Build Transition
 
-Construction resolves the release manifest, verifies declared version/security floors, builds and validates tools and runtime artifacts, and publishes the completed runtime image. Extraction copies the stopped constructed image into private host staging and uses fixed base-image code for candidate publication; constructed-image programs receive no writable store. Admitted root directories and the provenance path reject symlink redirection, while nested payload links remain literal copied links. Source-container cleanup requires the exact issued operation label and never-started state and uses its captured CID; no fixed-name container is removed as legacy cleanup. Payload and provenance are prepared under `.partial`; completeness precedes publication. A forced rebuild still referenced by a container remains under `.next` until safe promotion. Incomplete or mismatched staged provenance is not promotion authority. A failed build neither publishes its candidate runtime nor triggers success-path collection.
+Locked construction validates `docker/signatures.json` offline, verifies the SHA-256-bound subordinate input files, derives the release manifest, verifies new acquisitions through their declared Docker, native-manager, SHA-256 or Git route, installs the frozen package set, builds and validates tools and runtime artifacts, and publishes the completed runtime image. Any selected OpenPGP route verifies its signature under the recorded trusted key. Force rebuild consumes the same signature file. Missing or mismatched input evidence refuses the dependent candidate while preserving existing publications and verified inputs. No build step discovers releases or adjusts versions using advisory data. The signature file is the sole construction authority consumed by `c0 build`, Dockerfiles and acquisition scripts before newly fetched data is extracted, installed or executed; its presence alone is not evidence of that enforcement.
+
+Extraction copies the stopped constructed image into private host staging and uses fixed base-image code for candidate publication; constructed-image programs receive no writable store. Admitted root directories and the provenance path reject symlink redirection, while nested payload links remain literal copied links. Source-container cleanup requires the exact issued operation label and never-started state and uses its captured CID; no fixed-name container is removed as legacy cleanup. Payload and provenance are prepared under `.partial`; completeness precedes publication. A forced rebuild still referenced by a container remains under `.next` until safe promotion. Incomplete or mismatched staged provenance is not promotion authority. A failed build neither publishes its candidate runtime nor triggers success-path collection.
 
 ## Selection And Protection
 

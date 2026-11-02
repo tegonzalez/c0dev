@@ -218,6 +218,15 @@ esac
         self.assertFalse((self.home / '.cache/c0/toolchain-defaults').exists())
         self.assertFalse((self.home / 'fnm-calls').exists())
 
+    def test_missing_immutable_python_refuses_before_session_changes(self):
+        self.immutable_python.unlink()
+        result = self.source('/bin/bash', 'echo should-not-run')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('should-not-run', result.stdout)
+        self.assertNotIn('legacy-python', result.stdout)
+        self.assertFalse((self.home / '.cache/c0/toolchain-defaults').exists())
+        self.assertFalse((self.home / 'fnm-calls').exists())
+
     def test_legacy_snapshot_without_manifest_retains_existing_behavior(self):
         self.manifest.unlink()
         result = self.source('/bin/bash')

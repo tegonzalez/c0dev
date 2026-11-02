@@ -56,23 +56,23 @@ exit "$status"
                 self.assertNotIn('🐚 Shell:', result.stdout)
         self.assertFalse(any(c[0] == 'exec' and 'bash' in c for c in self.f.read()['calls']))
 
-    def test_missing_rules_bind_mount(self):
+    def test_retained_data_mount_roster_is_not_replaced_by_current_defaults(self):
         state = self.f.read()
         state['containers'][0]['mounts'] = [m for m in state['containers'][0]['mounts'] if m['target'] != '/home/dev/rules']
         self.f.write(state)
-        self.rejected('/home/dev/rules')
-        self.assertFalse(any(c[0] == 'run' for c in self.f.read()['calls']))
+        result = self.f.run('sh')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c[0] in ('run', 'compose') for c in self.f.read()['calls']))
 
     def test_bind_from_a_different_fork(self):
         other = self.f.root/'another-fork'; other.mkdir()
         state = self.f.read()
-        next(m for m in state['containers'][0]['mounts'] if m['target'] == '/home/dev/projects')['source'] = str(other)
+        next(m for m in state['containers'][0]['mounts'] if m['target'] == '/run/c0/host-bin')['source'] = str(other)
         self.f.write(state)
-        self.rejected('/home/dev/projects')
+        self.rejected('/run/c0/host-bin')
 
     def test_wrong_mount_permissions_and_volume_names(self):
         for target, field, value in (
-            ('/home/dev/rules', 'rw', False),
             ('/home/dev/.gitconfig', 'rw', True),
             ('/run/c0/host-bin', 'rw', True),
             ('/usr/local/bin/docker-entrypoint.sh', 'rw', True),
@@ -179,7 +179,7 @@ exit "$status"
                              for call in self.f.read()['calls']))
 
     def test_legacy_contract_still_requires_this_checkout_and_all_mounts(self):
-        for issue in ('other_bin', 'other_gitconfig', 'missing_rules', 'wrong_tools_subpath'):
+        for issue in ('other_bin', 'other_gitconfig', 'missing_entrypoint', 'wrong_tools_subpath'):
             with self.subTest(issue=issue):
                 state = self.f.read()
                 state['containers'] = [self.f.container()]
@@ -194,8 +194,8 @@ exit "$status"
                     other = self.f.root / 'other-gitconfig'
                     other.write_text('[user]\n')
                     next(m for m in mounts if m['target'] == '/home/dev/.gitconfig')['source'] = str(other)
-                elif issue == 'missing_rules':
-                    state['containers'][0]['mounts'] = [m for m in mounts if m['target'] != '/home/dev/rules']
+                elif issue == 'missing_entrypoint':
+                    state['containers'][0]['mounts'] = [m for m in mounts if m['target'] != '/usr/local/bin/docker-entrypoint.sh']
                 else:
                     state['containers'][0]['subpath'] = 'opt/another-snapshot'
                 self.f.write(state)

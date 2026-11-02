@@ -23,7 +23,10 @@ prepare() {
             echo 'warning: invalid caller TERM; skipping its build definition' >&2
             continue
         fi
-        if infocmp -xa "$terminal" >"$temporary" 2>/dev/null && [[ -s "$temporary" ]]; then
+        # infocmp's diagnostic source pathname is not terminal capability data.
+        # Omit it from the captured input so equivalent host databases share.
+        if infocmp -xa "$terminal" 2>/dev/null |
+            sed '/^#[[:space:]]*Reconstructed via infocmp from file:/d' >"$temporary" && [[ -s "$temporary" ]]; then
             mv "$temporary" "$directory/$terminal"
             temporary="$(mktemp "$directory/.terminfo.XXXXXX")"
         elif [[ "$terminal" == xterm-256color ]]; then

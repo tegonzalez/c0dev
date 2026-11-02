@@ -26,7 +26,7 @@ class BuildContext(unittest.TestCase):
             shutil.copyfile(ROOT/'bin/dockerfile-concat', root/'bin/dockerfile-concat')
             (root/'bin/dockerfile-concat').chmod(0o755)
             inputs = ('1password.asc', 'cloud.google.gpg', 'install-orca.sh',
-                      'docker-entrypoint.sh', 'home-overlays.conf', 'c0-overlay-check', 'c0-security.py')
+                      'docker-entrypoint.sh', 'c0-security.py')
             for name in inputs: (root/'docker'/name).write_text('canonical '+name+'\n')
             for name in ('base', 'tools', 'runtime'):
                 (root/'docker'/('Dockerfile.'+name)).write_text('# canonical '+name+'\n')

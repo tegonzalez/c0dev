@@ -29,29 +29,16 @@ NC='\033[0m' # No Color
 # Instance id hashes this realpath tree; symlinks/cwd must not fork a second id.
 C0_BIN="$(realpath "${BASH_SOURCE[0]}")"
 C0ROOT="$(realpath "$(dirname "$C0_BIN")/..")"
+C0_TERMINFO_SHA256=""
+C0_BASE_BUILD_ID=""
+C0_BASE_RECIPE_ID=""
 
 # Required files - exit non-zero if any are missing
 REQUIRED_FILES=(
-    "$C0ROOT/docker/docker-compose.public.yaml"
-    "$C0ROOT/docker/volumes-folders.yaml"
-    "$C0ROOT/docker/volumes-files.yaml"
-    "$C0ROOT/docker/Dockerfile.runtime"
-    "$C0ROOT/docker/Dockerfile.base"
-    "$C0ROOT/docker/Dockerfile.tools"
-    "$C0ROOT/docker/install-orca.sh"
     "$C0ROOT/docker/home-overlays.conf"
     "$C0ROOT/docker/c0-overlay-check"
-    "$C0ROOT/docker/c0-publish-tools"
-    "$C0ROOT/docker/c0-security.py"
-    "$C0ROOT/bin/docker-hash"
     "$C0ROOT/bin/c0-host-io"
     "$C0ROOT/bin/c0-credentials"
-    "$C0ROOT/bin/dockerfile-concat"
-    "$C0ROOT/docker/seccomp/moby-default-seccomp.json"
-    "$C0ROOT/docker/seccomp/moby-default-seccomp.sha256"
-    "$C0ROOT/docker/seccomp/moby-seccomp.tag"
-    "$C0ROOT/docker/docker-compose.security-guest-admin.yaml"
-    "$C0ROOT/docker/docker-compose.security-least-privilege.yaml"
 )
 
 for f in "${REQUIRED_FILES[@]}"; do
@@ -132,21 +119,36 @@ c0_tools_recipe_hash() {
     printf 'c0-tools-recipe-v2\n%s\n%s\n' "$recipe" "${helper:0:64}" | shasum -a 256 | awk '{print $1}'
 }
 
+c0_base_recipe_hash() {
+    local recipe helper
+    recipe="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" docker/Dockerfile.base)" || return 1
+    helper="$(shasum -a 256 <"$C0ROOT/docker/c0-security.py")" || return 1
+    printf 'c0-base-recipe-v1\n%s\n%s\n' "$recipe" "${helper:0:64}" | shasum -a 256 | awk '{print $1}'
+}
+
 c0_recipe_hash() {
     local input digest values
     digest="$(cd "$C0ROOT" && "$C0ROOT/bin/docker-hash" \
         docker/Dockerfile.base docker/Dockerfile.tools docker/Dockerfile.runtime)" || return 1
     values="c0-recipe-v1"$'\n'"$digest"
     for input in 1password.asc cloud.google.gpg install-orca.sh docker-entrypoint.sh \
-        home-overlays.conf c0-overlay-check c0-security.py; do
+        c0-security.py; do
         digest="$(shasum -a 256 <"$C0ROOT/docker/$input")" || return 1
         values+=$'\n'"docker/$input:${digest:0:64}"
     done
     printf '%s\n' "$values" | shasum -a 256 | awk '{print $1}'
 }
 
-TOOLS_RECIPE_ID="$(c0_tools_recipe_hash)"
-C0_RECIPE_ID="$(c0_recipe_hash)"
+if ! TOOLS_RECIPE_ID="$(c0_tools_recipe_hash 2>/dev/null)" ||
+   ! C0_RECIPE_ID="$(c0_recipe_hash 2>/dev/null)"; then
+    # Retained runtime operations consume Docker state, not draft recipes.
+    if [[ "${1:-}" == build ]]; then
+        echo 'error: required image-construction inputs are missing or unreadable' >&2
+        exit 1
+    fi
+    TOOLS_RECIPE_ID=""
+    C0_RECIPE_ID=""
+fi
 TOOLS_BUILD_ID="$TOOLS_RECIPE_ID"
 TOOLS_ID="$TOOLS_BUILD_ID"
 TOOLS_PREFIX="/tools/current"
@@ -162,7 +164,7 @@ c0_set_build_identity() {
     }
     C0_BUILD_ID="$build"
     C0_RUNTIME_IMAGE="c0dev-runtime-${C0_MODE_KEY}:$build"
-    C0_BASE_IMAGE="c0dev-base-${C0_MODE_KEY}:$build"
+    C0_BASE_IMAGE="c0dev-base-${C0_MODE_KEY}:${C0_BASE_BUILD_ID:-$build}"
     C0_TOOLS_BUILDER_IMAGE="c0dev-tools-builder-${C0_MODE_KEY}:$TOOLS_BUILD_ID"
     C0_INSTANCE_ID="$(c0_instance_id_for "$C0ROOT" "$C0_MODE" "$build")" || return 1
     export C0_BUILD_ID C0_RUNTIME_IMAGE C0_BASE_IMAGE C0_INSTANCE_ID C0_WORKSPACE_ID
@@ -171,8 +173,28 @@ c0_set_build_identity() {
 # The shared recipe tag is Docker's publication of the current completed build.
 # Its labels supply the exact payload; no checkout-side selector is consulted.
 c0_resolve_shared_build() {
-    local reference metadata image build mode recipe tools volume base
+    local reference metadata image build mode recipe tools volume base candidates
     reference="$(c0_runtime_recipe_ref)" || return 1
+    if ! docker image inspect "$reference" >/dev/null 2>&1; then
+        reference="c0dev-runtime-${C0_MODE_KEY}:current"
+        if ! docker image inspect "$reference" >/dev/null 2>&1; then
+            # Compatibility with completed publications predating :current.
+            # Never pick a staging image or select among old builds by age.
+            candidates="$(docker image ls -aq \
+                --filter "reference=c0dev-runtime-${C0_MODE_KEY}:recipe-*" \
+                --filter "label=c0dev.mode=$C0_MODE_KEY" \
+                --filter "label=c0dev.tools_volume=$SHARED_TOOLS_VOLUME" | LC_ALL=C sort -u)" || return 1
+            if [[ -z "$candidates" ]]; then
+                echo "error: no completed shared image for this mode; run 'c0 build'" >&2
+                return 1
+            fi
+            if [[ "$candidates" == *$'\n'* ]]; then
+                echo "error: ambiguous completed images without a current publication; run 'c0 build' to publish one" >&2
+                return 1
+            fi
+            reference="$candidates"
+        fi
+    fi
     metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s" .Id (index .Config.Labels "c0dev.build") (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.tools_hash") (index .Config.Labels "c0dev.tools_volume") (index .Config.Labels "c0dev.base_image")}}' "$reference")" || {
         echo "error: no completed shared image for this mode and recipe; run 'c0 build'" >&2
         return 1
@@ -180,18 +202,20 @@ c0_resolve_shared_build() {
     IFS=$'\t' read -r image build mode recipe tools volume base <<<"$metadata"
     if [[ ! "$image" =~ ^sha256:[0-9a-f]{64}$ || ! "$build" =~ ^[0-9a-f]{64}$ ||
           ! "$tools" =~ ^[0-9a-f]{64}$ || "$mode" != "$C0_MODE_KEY" ||
-          "$recipe" != "$C0_RECIPE_ID" || "$volume" != "$SHARED_TOOLS_VOLUME" ||
-          "$base" != "c0dev-base-${C0_MODE_KEY}:$build" ]]; then
-        echo 'error: shared image metadata does not match this mode and recipe' >&2
+          ! "$recipe" =~ ^[0-9a-f]{64}$ || "$volume" != "$SHARED_TOOLS_VOLUME" ||
+          ! "$base" =~ ^c0dev-base-${C0_MODE_KEY}:[0-9a-f]{64}$ ]]; then
+        echo 'error: shared image metadata does not match this mode and construction identity' >&2
         return 1
     fi
     c0_set_build_identity "$build" || return 1
+    C0_RECIPE_ID="$recipe"
     set_tools_id "$tools" || return 1
     TOOLS_BUILD_ID="$tools"
     # Creation uses the inspected immutable image, even if a build retags the
     # shared recipe while this invocation is preparing its mounts.
     C0_RUNTIME_IMAGE="$image"
-    export C0_RUNTIME_IMAGE
+    C0_BASE_IMAGE="$base"
+    export C0_RUNTIME_IMAGE C0_BASE_IMAGE
 }
 
 DOCKERFILE_BASE="$C0ROOT/docker/Dockerfile.base"
@@ -204,7 +228,7 @@ c0_prepare_build_context() {
     mkdir -p "$C0_BUILD_CONTEXT/.terminfo" || return 1
     local input
     for input in 1password.asc cloud.google.gpg install-orca.sh docker-entrypoint.sh \
-        home-overlays.conf c0-overlay-check c0-security.py; do
+        c0-security.py; do
         cp "$C0ROOT/docker/$input" "$C0_BUILD_CONTEXT/$input" || return 1
     done
 }
@@ -220,11 +244,22 @@ c0_prepare_runtime_dockerfile() {
 }
 
 c0_prepare_terminfo() {
-    TERM=xterm-256color "$C0ROOT/bin/c0-terminfo" prepare "$C0_BUILD_CONTEXT/.terminfo"
+    local input digest values=c0-runtime-terminfo-v1 caller_term=""
+    local LC_ALL=C
+    # Bash synthesizes a non-exported TERM=dumb in a headless environment.
+    # Only an inherited caller value is a terminal selection for this build.
+    if [[ "$(declare -p TERM 2>/dev/null)" == 'declare -x '* ]]; then caller_term="${TERM-}"; fi
+    TERM="$caller_term" "$C0ROOT/bin/c0-terminfo" prepare "$C0_BUILD_CONTEXT/.terminfo" || return 1
+    for input in "$C0_BUILD_CONTEXT/.terminfo/"*; do
+        [[ -f "$input" && ! -L "$input" ]] || return 1
+        digest="$(shasum -a 256 <"$input")" || return 1
+        values+=$'\n'"${input##*/}:${digest:0:64}"
+    done
+    C0_TERMINFO_SHA256="$(printf '%s\n' "$values" | shasum -a 256 | awk '{print $1}')" || return 1
 }
 
 c0_resolve_toolchain() {
-    local manifest="$C0_BUILD_CONTEXT/c0-toolchain.json" manifest_sha line
+    local manifest="$C0_BUILD_CONTEXT/c0-toolchain.json" manifest_sha line bun_version=""
     local args_file="$C0_BUILD_CONTEXT/.toolchain-build-args"
     echo "🔎 Resolving current toolchain releases (Node 22, Python 3.15)..."
     "$C0ROOT/bin/c0-toolchain" --output "$manifest" || return 1
@@ -232,6 +267,7 @@ c0_resolve_toolchain() {
     C0_TOOLCHAIN_BUILD_ARGS=()
     while IFS= read -r line; do
         C0_TOOLCHAIN_BUILD_ARGS+=(--build-arg "$line")
+        case "$line" in BUN_VERSION=*) bun_version="${line#BUN_VERSION=}" ;; esac
     done <"$args_file"
     manifest_sha="$(shasum -a 256 "$manifest" | awk '{print $1}')" || return 1
     TOOLS_BUILD_ID="$(printf 'c0-toolchain-build-v1\n%s\n%s\n' \
@@ -240,6 +276,14 @@ c0_resolve_toolchain() {
     local build
     build="$(printf 'c0-runtime-build-v1\n%s\n%s\n' \
         "$C0_RECIPE_ID" "$manifest_sha" | shasum -a 256 | awk '{print $1}')" || return 1
+    if [[ -n "${C0_TERMINFO_SHA256:-}" ]]; then
+        build="$(printf 'c0-runtime-build-v2\n%s\n%s\n%s\n%s\n' \
+            "$C0_RECIPE_ID" "$manifest_sha" "$TOOLS_ID" "$C0_TERMINFO_SHA256" | shasum -a 256 | awk '{print $1}')" || return 1
+        [[ -n "$bun_version" ]] || { echo 'error: missing Bun selection for the base image' >&2; return 1; }
+        C0_BASE_RECIPE_ID="$(c0_base_recipe_hash)" || return 1
+        C0_BASE_BUILD_ID="$(printf 'c0-base-build-v1\n%s\n%s\n' \
+            "$C0_BASE_RECIPE_ID" "$bun_version" | shasum -a 256 | awk '{print $1}')" || return 1
+    fi
     c0_set_build_identity "$build" || return 1
     # The supervisor lives in another process. Publish the worker's actual ID
     # before it can create build artifacts so cancellation cleans the right one.
@@ -608,6 +652,9 @@ get_c0_container_id_any() {
     if [[ -z "$ids" && "${C0_WORKSPACE_ID:-$C0_INSTANCE_ID}" != "$C0_INSTANCE_ID" ]]; then
         ids="$(C0_INSTANCE_ID="$C0_WORKSPACE_ID" c0_list_instance_containers -aq)" || return 1
     fi
+    if [[ -z "$ids" ]]; then
+        ids="$(c0_list_workspace_containers -aq)" || return 1
+    fi
     while IFS= read -r cid; do
         [[ -n "$cid" ]] || continue
         if [[ -n "$selected" ]]; then
@@ -630,14 +677,33 @@ get_c0_container_state() {
 # missing published artifact never authorizes an empty replacement or a file
 # based selection. New creation still requires a completed shared image.
 c0_resolve_runtime_context() {
-    local cid
-    if c0_resolve_shared_build 2>/dev/null; then return 0; fi
-    C0_INSTANCE_ID="$C0_WORKSPACE_ID"
-    cid="$(get_c0_container_id_any)" || return 1
+    local cid ids instance build mode recipe tools
+    ids="$(c0_list_workspace_containers -aq)" || return 1
+    if [[ "$ids" == *$'\n'* ]]; then
+        ids="$(c0_list_workspace_containers -q)" || return 1
+        if [[ -z "$ids" || "$ids" == *$'\n'* ]]; then
+            echo 'error: multiple retained workspace containers; no container was selected or changed' >&2
+            return 1
+        fi
+    fi
+    cid="$ids"
     if [[ -n "$cid" ]]; then
+        instance="$(docker inspect -f '{{ index .Config.Labels "c0dev.instance" }}' "$cid")" || return 1
+        mode="$(docker inspect -f '{{ index .Config.Labels "c0dev.mode" }}' "$cid")" || return 1
+        case "$mode" in ''|'<no value>') ;; *) [[ "$mode" == "$C0_MODE_KEY" ]] || return 1 ;; esac
+        [[ "$instance" =~ ^c0dev(-dev)?-[0-9a-f]{8}$ ]] || return 1
+        C0_INSTANCE_ID="$instance"
+        build="$(docker inspect -f '{{ index .Config.Labels "c0dev.build" }}' "$cid")" || return 1
+        if [[ "$build" =~ ^[0-9a-f]{64}$ ]]; then C0_BUILD_ID="$build"; fi
+        recipe="$(docker inspect -f '{{ index .Config.Labels "c0dev.recipe" }}' "$cid")" || return 1
+        if [[ "$recipe" =~ ^[0-9a-f]{64}$ ]]; then C0_RECIPE_ID="$recipe"; fi
         C0_RUNTIME_IMAGE="$(docker inspect -f '{{.Image}}' "$cid")" || return 1
-        set_tools_id "$(get_tools_hash_label "$cid")" || return 1
-        export C0_INSTANCE_ID C0_RUNTIME_IMAGE
+        tools="$(get_tools_hash_label "$cid")" || return 1
+        [[ "$tools" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "error: container $cid has no valid tools snapshot identity; existing data was retained" >&2; return 1;
+        }
+        set_tools_id "$tools" || return 1
+        export C0_INSTANCE_ID C0_RUNTIME_IMAGE C0_BUILD_ID
         return 0
     fi
     c0_resolve_shared_build
@@ -828,9 +894,6 @@ dc_build() {
     # Compose adds its project to image labels, so this project must have the
     # shared build identity rather than the working-folder runtime identity.
     c0_command_environment run docker compose -p "c0dev-build-${C0_MODE_KEY}-${C0_BUILD_ID}" \
-        -f "$VOLUMES_FOLDERS_FILE" \
-        -f "$VOLUMES_FILES_FILE" \
-        -f "$COMPOSE_PUBLIC_FILE" \
         -f "$C0_BUILD_CONTEXT/runtime-image.yaml" \
         build "$@"
 }
@@ -838,7 +901,7 @@ dc_build() {
 c0_base_image_matches() {
     local metadata
     metadata="$(docker image inspect --format '{{printf "%s\t%s\t%s" (index .Config.Labels "c0dev.mode") (index .Config.Labels "c0dev.recipe") (index .Config.Labels "c0dev.build")}}' "$C0_BASE_IMAGE" 2>/dev/null)" || return 1
-    [[ "$metadata" == "$C0_MODE_KEY"$'\t'"$C0_RECIPE_ID"$'\t'"$C0_BUILD_ID" ]]
+    [[ "$metadata" == "$C0_MODE_KEY"$'\t'"${C0_BASE_RECIPE_ID:-$C0_RECIPE_ID}"$'\t'"${C0_BASE_BUILD_ID:-$C0_BUILD_ID}" ]]
 }
 
 c0_validate_base_image() {
@@ -857,7 +920,7 @@ c0_build_base_image() {
     echo '🏗️  Building shared base image...'
     if ! docker build --pull $nocache "${C0_TOOLCHAIN_BUILD_ARGS[@]}" \
         --target base --label "c0dev.mode=$C0_MODE_KEY" \
-        --label "c0dev.recipe=$C0_RECIPE_ID" --label "c0dev.build=$C0_BUILD_ID" \
+        --label "c0dev.recipe=${C0_BASE_RECIPE_ID:-$C0_RECIPE_ID}" --label "c0dev.build=${C0_BASE_BUILD_ID:-$C0_BUILD_ID}" \
         -f "$DOCKERFILE_BASE" -t "$staging" "$C0_BUILD_CONTEXT"; then
         docker image rm "$staging" >/dev/null 2>&1 || true
         return 1
@@ -877,7 +940,8 @@ c0_publish_runtime_image() {
     docker image tag "$image" "$C0_RUNTIME_IMAGE" || return 1
     # Updating the shared recipe tag publishes the completed image to every
     # working folder; Docker supplies the previous image until this succeeds.
-    docker image tag "$image" "$reference"
+    docker image tag "$image" "$reference" || return 1
+    docker image tag "$image" "c0dev-runtime-${C0_MODE_KEY}:current"
 }
 
 # Docker can retain a tag whose backing content has disappeared. Build privately
@@ -887,7 +951,15 @@ c0_docker_content_failure() {
 }
 
 c0_validate_runtime_image() {
-    local image reference="${1:-$C0_RUNTIME_BUILD_TAG}"
+    local image input reference="${1:-$C0_RUNTIME_BUILD_TAG}"
+    local -a terminals=(xterm-256color)
+    if [[ -d "${C0_BUILD_CONTEXT:-}/.terminfo" ]]; then
+        terminals=()
+        for input in "$C0_BUILD_CONTEXT/.terminfo/"*; do
+            [[ -f "$input" && ! -L "$input" ]] || return 1
+            terminals+=("${input##*/}")
+        done
+    fi
     image="$(docker image inspect --format '{{.Id}}' "$reference")" || return 1
     [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || {
         echo 'error: Docker returned an invalid built image identity' >&2; return 1;
@@ -903,8 +975,8 @@ c0_validate_runtime_image() {
             test -x /usr/sbin/sshd
             /usr/sbin/sshd -V
             bun --version
-            infocmp -x xterm-256color >/dev/null
-        ' || return 1
+            for terminal do infocmp -x "$terminal" >/dev/null; done
+        ' c0-runtime-check "${terminals[@]}" || return 1
     printf '%s\n' "$image" >"$C0_BUILD_CONTEXT/.runtime-image-id"
 }
 
@@ -916,7 +988,7 @@ c0_runtime_image_matches() {
 }
 
 c0_build_runtime_image() {
-    local nocache="${1:-}" attempt=0 status image log
+    local nocache="${1:-}" attempt=0 status image log context_yaml dockerfile_yaml
     local C0_RUNTIME_BUILD_TAG="c0dev-runtime-${C0_MODE_KEY}-build:$(basename "$(dirname "$C0_BUILD_CONTEXT")")"
     log="$C0_BUILD_CONTEXT/runtime-build.log"
     if [[ -z "$nocache" ]] && c0_runtime_image_matches && c0_validate_runtime_image "$C0_RUNTIME_IMAGE" >"$log" 2>&1; then
@@ -925,11 +997,17 @@ c0_build_runtime_image() {
         echo '📦 Image: valid'
         return 0
     fi
+    # Compose reads only this owned construction descriptor. Runtime mappings,
+    # ports and profiles are neither parsed nor allowed to override the build.
+    context_yaml="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].replace("$", "$$")))' "$C0_BUILD_CONTEXT")" || return 1
+    dockerfile_yaml="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].replace("$", "$$")))' "${DOCKERFILE_RUNTIME_BUILD:-$C0_BUILD_CONTEXT/Dockerfile.runtime.build}")" || return 1
     cat >"$C0_BUILD_CONTEXT/runtime-image.yaml" <<EOF
 services:
   $MAIN_SERVICE:
     image: $C0_RUNTIME_BUILD_TAG
     build:
+      context: $context_yaml
+      dockerfile: $dockerfile_yaml
       labels:
         c0dev.mode: "$C0_MODE_KEY"
         c0dev.recipe: "$C0_RECIPE_ID"
@@ -2128,8 +2206,9 @@ c0_validate_container_mounts() {
     local actual_type actual_source actual_target actual_rw actual_name seen_targets=$'\n'
     local old_bin=0 new_bin=0 old_git=0 old_bin_valid=false old_git_valid=false
     local expected_targets=$'\n' relay="${C0_SSH_AUTH_SOCK_PATH:-/run/host-services/ssh-auth.sock}"
-    local -a guest_checks=()
-    local expected_overlay
+    local -a guest_checks=() private_sources=() control_sources=()
+    local host_bin_source host_git_source
+    local expected_overlay contract host target kind display readonly protected source protected_source
     expected_overlay="$(c0_overlay_volume_for_container "$cid")" || return 1
     C0_CONTAINER_LAYOUT=""
     C0_CONTAINER_TOOLS_ID=""
@@ -2142,6 +2221,14 @@ c0_validate_container_mounts() {
 
     # Recognize the complete previous contract, not an arbitrary invalid mount
     # set. Sources are still checked against this checkout below.
+    for protected in "$C0ROOT/auth/ssh-client" "$C0ROOT/auth/.env"; do
+        private_sources+=("$protected" "$(realpath "$protected" 2>/dev/null || printf '%s' "$protected")")
+    done
+    for protected in "$C0ROOT/bin" "$C0ROOT/docker" "$HOME/.gitconfig"; do
+        control_sources+=("$protected" "$(realpath "$protected" 2>/dev/null || printf '%s' "$protected")")
+    done
+    host_bin_source="$(realpath "$C0ROOT/bin" 2>/dev/null || printf '%s' "$C0ROOT/bin")"
+    host_git_source="$(realpath "$HOME/.gitconfig" 2>/dev/null || printf '%s' "$HOME/.gitconfig")"
     while IFS=$'\t' read -r actual_type actual_source actual_target actual_rw actual_name; do
         [[ -n "$actual_target" ]] || continue
         if [[ "$seen_targets" == *$'\n'"$actual_target"$'\n'* ]]; then
@@ -2166,10 +2253,41 @@ c0_validate_container_mounts() {
         layout=legacy
     fi
 
+    # A harmless destination name does not make a host source harmless. Check
+    # every recorded bind for aliases/ancestors of protected host authority.
+    while IFS=$'\t' read -r actual_type actual_source actual_target actual_rw actual_name; do
+        [[ "$actual_type" == bind ]] || continue
+        source="$(realpath "$actual_source" 2>/dev/null || printf '%s' "$actual_source")"
+        for protected_source in "${private_sources[@]}"; do
+            if [[ "$source" == / || "$source" == "$protected_source" ||
+                  "$source" == "$protected_source/"* || "$protected_source" == "$source/"* ]]; then
+                echo "error: mount at $actual_target exposes host-only session or management data" >&2
+                errors=$((errors + 1))
+            fi
+        done
+        [[ "$actual_rw" == true ]] || continue
+        for protected_source in "${control_sources[@]}"; do
+            if [[ "$source" == / || "$source" == "$protected_source" ||
+                  "$source" == "$protected_source/"* || "$protected_source" == "$source/"* ]]; then
+                # Recognize only the two exact old protocol bindings. Extra
+                # writable aliases never inherit that legacy exception.
+                if [[ "$layout" == legacy && "$source" == "$protected_source" ]]; then
+                    if [[ "$source" == "$host_bin_source" && "$actual_target" == /home/dev/bin ]] ||
+                       [[ "$source" == "$host_git_source" && "$actual_target" == /home/dev/.gitconfig ]]; then
+                        continue
+                    fi
+                fi
+                echo "error: writable mount at $actual_target aliases protected host control files" >&2
+                errors=$((errors + 1))
+            fi
+        done
+    done <<<"$mounts"
+
     _c0_check_mount() {
         local host_path="$1" target="$2" kind="$3" display="$4" readonly="$5"
         local expected_type expected_source expected_rw=true found=false
         local actual_type actual_source actual_target actual_rw actual_name
+        while [[ "$target" != / && "$target" == */ ]]; do target="${target%/}"; done
         if [[ "$layout" == legacy ]]; then
             case "$target" in
                 /run/c0/host-bin) target=/home/dev/bin; readonly="" ;;
@@ -2220,14 +2338,52 @@ c0_validate_container_mounts() {
         fi
     }
 
-    parse_folder_mappings _c0_check_mount || return 1
-    parse_file_mappings _c0_check_mount || return 1
+    # These control bindings belong to the launcher protocol, not editable
+    # desired volume mappings. Existing guests retain their creation contract.
+    _c0_check_mount "$C0ROOT/bin" /run/c0/host-bin host-dir bin ro
+    _c0_check_mount "$HOME/.gitconfig" /home/dev/.gitconfig host-file gitconfig ro
+    _c0_check_mount "$C0ROOT/docker/docker-entrypoint.sh" /usr/local/bin/docker-entrypoint.sh host-file entrypoint ro
+    _c0_check_mount "$C0ROOT/docker/home-overlays.conf" /etc/c0dev/home-overlays.conf host-file overlays ro
+    _c0_check_mount "$C0ROOT/docker/c0-overlay-check" /usr/local/bin/c0-overlay-check host-file overlay-check ro
+    _c0_check_mount "" /tools/current docker-volume tools ro
+    _c0_check_mount "" /run/c0/overlay-state docker-volume overlays rw
+    contract="$(docker inspect -f '{{ index .Config.Labels "c0dev.mount_contract" }}' "$cid")" || return 1
+    case "$contract" in
+        c0-mount-contract-v1$'\n'*)
+            while IFS=$'\t' read -r host target kind display readonly; do
+                [[ -n "$target" ]] || continue
+                case "$kind" in host-dir|host-file|docker-volume) ;; *) return 1 ;; esac
+                _c0_check_mount "$host" "$target" "$kind" "$display" "$readonly"
+            done <<<"${contract#*$'\n'}"
+            ;;
+        ''|'<no value>')
+            # Old guests have no saved desired roster. Their immutable Docker
+            # data binds are authoritative; today's defaults cannot invent a
+            # missing mount or revoke a previously selected custom source.
+            ;;
+        *) echo 'error: invalid recorded container mount contract' >&2; return 1 ;;
+    esac
     while IFS=$'\t' read -r actual_type actual_source actual_target actual_rw actual_name; do
         [[ -n "$actual_target" ]] || continue
         [[ "$expected_targets" != *$'\n'"$actual_target"$'\n'* ]] || continue
         # This optional relay is generated separately from the volume files.
         if [[ "$actual_target" == "$relay" && "$actual_type" == bind && "$actual_source" == "$relay" ]]; then
             continue
+        fi
+        # Custom binds are immutable Docker creation metadata. Do not demand
+        # mappings newly added to YAML, or re-point a retained bind from it.
+        if [[ "$actual_type" == bind ]]; then
+            case "$actual_target" in
+                /|/home|/home/dev|/home/dev/bin|/home/dev/bin/*|/home/dev/.gitconfig/*|/home/dev/.ssh/*|/run|/run/*|/tools|/tools/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/var/run/*) ;;
+                *)
+                    kind=host-file
+                    [[ ! -d "$actual_source" ]] || kind=host-dir
+                    readonly=rw
+                    [[ "$actual_rw" != false ]] || readonly=ro
+                    _c0_check_mount "$actual_source" "$actual_target" "$kind" "$actual_source" "$readonly"
+                    continue
+                    ;;
+            esac
         fi
         echo "error: unexpected container mount at $actual_target" >&2
         errors=$((errors + 1))
@@ -2786,13 +2942,24 @@ build_tools_volume() {
 # =============================================================================
 
 c0_create_runtime() {
-    local name="$1" selection
+    local name="$1" selection contract
     local C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL
     selection="$(c0_discover_home_storage)" || return 1
     IFS=$'\t' read -r C0_HOME_OVERLAYS_VOLUME C0_HOME_OVERLAYS_EXTERNAL <<<"$selection"
     # These are computed Compose inputs, never caller-supplied options.
     # One-off creation leaves any retained containers with Compose labels intact.
-    dc run --no-deps -d --pull never --service-ports --name "$name" "$MAIN_SERVICE" >/dev/null
+    _c0_record_creation_mount() {
+        local host="$1" target="$2" kind="$3" display="$4" readonly="${5:-rw}"
+        # Empty columns cannot round-trip through Bash's whitespace IFS.
+        [[ -n "$host" ]] || host=-
+        [[ -n "$display" ]] || display=-
+        case "$host$target$display" in *$'\n'*|*$'\t'*) return 1 ;; esac
+        printf '%s\t%s\t%s\t%s\t%s\n' "$host" "$target" "$kind" "$display" "$readonly"
+    }
+    contract="$(printf 'c0-mount-contract-v1\n'; parse_folder_mappings _c0_record_creation_mount && parse_file_mappings _c0_record_creation_mount)" || return 1
+    unset -f _c0_record_creation_mount
+    dc run --no-deps -d --pull never --service-ports --name "$name" \
+        --label "c0dev.mount_contract=$contract" "$MAIN_SERVICE" >/dev/null
 }
 
 cmd_start() {
@@ -3132,7 +3299,7 @@ c0_accept_runtime_metadata() {
     IFS=$'\t' read -r image build mode recipe tools volume base <<<"$metadata"
     if [[ ! "$build" =~ ^[0-9a-f]{64}$ || "$mode" != "$C0_MODE_KEY" ||
           "$recipe" != "$C0_RECIPE_ID" || "$tools" != "$TOOLS_ID" ||
-          "$volume" != "$SHARED_TOOLS_VOLUME" || "$base" != "c0dev-base-${C0_MODE_KEY}:$build" ]]; then
+          "$volume" != "$SHARED_TOOLS_VOLUME" || ! "$base" =~ ^c0dev-base-${C0_MODE_KEY}:[0-9a-f]{64}$ ]]; then
         echo 'error: tools acceptance requires a runtime from the shared build for this mode and recipe; guest data was not changed' >&2
         return 1
     fi
@@ -3149,10 +3316,11 @@ c0_publish_accepted_runtime() {
         IFS=$'\t' read -r image parent mode recipe tools volume base <<<"$metadata"
         [[ "$image" =~ ^sha256:[0-9a-f]{64}$ && "$parent" =~ ^[0-9a-f]{64}$ &&
            "$mode" == "$C0_MODE_KEY" && "$recipe" == "$C0_RECIPE_ID" &&
-           "$volume" == "$SHARED_TOOLS_VOLUME" && "$base" == "c0dev-base-${C0_MODE_KEY}:$parent" ]] || exit 1
+           "$volume" == "$SHARED_TOOLS_VOLUME" && "$base" =~ ^c0dev-base-${C0_MODE_KEY}:[0-9a-f]{64}$ ]] || exit 1
         docker image inspect "$base" >/dev/null || exit 1
         build="$(printf 'c0-tools-accept-build-v1\n%s\n%s\n' "$parent" "$accepted" | shasum -a 256 | awk '{print $1}')" || exit 1
         c0_set_build_identity "$build" || exit 1
+        C0_BASE_IMAGE="$base"
         C0_BUILD_CONTEXT="$(mktemp -d "${TMPDIR:-/tmp}/c0-tools-image.XXXXXX")" || exit 1
         C0_RUNTIME_BUILD_TAG="c0dev-runtime-${C0_MODE_KEY}-build:$(basename "$C0_BUILD_CONTEXT")"
         source="$C0_RUNTIME_BUILD_TAG-source"
@@ -3166,7 +3334,6 @@ c0_publish_accepted_runtime() {
             -t "$C0_RUNTIME_BUILD_TAG" "$C0_BUILD_CONTEXT" || exit 1
         c0_validate_runtime_image || exit 1
         image_id="$(cat "$C0_BUILD_CONTEXT/.runtime-image-id")" || exit 1
-        docker image tag "$base" "$C0_BASE_IMAGE" || exit 1
         c0_publish_runtime_image "$image_id"
     )
 }
@@ -3504,12 +3671,9 @@ c0_build_steps() {
     fi
     maybe_notify_seccomp_update_available || true
     c0_ssh_ensure_keys
-    if ! validate_host_paths; then
-        echo "error: fix missing paths before building" >&2
-            exit 1
-        fi
-
     c0_prepare_build_context || exit 1
+    echo -e "📄 Preparing terminfo..."
+    c0_prepare_terminfo || exit 1
     # Release lookups are supervised and must succeed even when a tools snapshot
     # exists; stale metadata is never substituted after an upstream failure.
     c0_resolve_toolchain || exit 1
@@ -3524,10 +3688,6 @@ c0_build_steps() {
         echo "error: tools build failed" >&2
         exit 1
     fi
-
-    # Prepare terminfo
-    echo -e "📄 Preparing terminfo..."
-    c0_prepare_terminfo || exit 1
 
     # Build service image
     echo -e "🏗️  Building service image..."

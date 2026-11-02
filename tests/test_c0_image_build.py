@@ -163,7 +163,9 @@ cmd_build "$@"
             self.assertIn('build', build)
             self.assertEqual(build[build.index('-p')+1], 'c0dev-build-prod-'+'b'*64)
             self.assertIn('--pull', build)
-            self.assertTrue(any(arg.endswith('/runtime-image.yaml') for arg in build))
+            descriptors = [build[i+1] for i, arg in enumerate(build[:-1]) if arg == '-f']
+            self.assertEqual(len(descriptors), 1)
+            self.assertTrue(descriptors[0].endswith('/runtime-image.yaml'))
             self.assertNotIn(str(root/'security-guest-admin.yaml'), build)
             self.assertNotIn(str(root/'security-least-privilege.yaml'), build)
             self.assertNotIn(str(fragment), build)
@@ -171,7 +173,8 @@ cmd_build "$@"
             if result.returncode == 0:
                 self.assertEqual(published, [
                     ['image', 'tag', 'sha256:'+'a'*64, 'c0dev-runtime-prod:'+'b'*64],
-                    ['image', 'tag', 'sha256:'+'a'*64, 'c0dev-runtime-prod:recipe-'+'c'*64]])
+                    ['image', 'tag', 'sha256:'+'a'*64, 'c0dev-runtime-prod:recipe-'+'c'*64],
+                    ['image', 'tag', 'sha256:'+'a'*64, 'c0dev-runtime-prod:current']])
                 smoke = [call for call in calls if call[0] == 'run'][-1]
                 for required in ('--network', 'none', '--read-only', '--cap-drop', 'ALL',
                                  '--user', '1000:1000', 'sha256:'+'a'*64):
